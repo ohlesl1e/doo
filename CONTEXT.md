@@ -1,0 +1,196 @@
+# Security Testing Copilot
+
+The domain language of the black-box testing knowledge graph (the "ontology"). These terms are the contract between the deterministic pipeline and the LLM planner — the planner can only reason about concepts named here.
+
+## Language
+
+### The observation / inference split
+
+Every fact in the graph is either something we **observed** or something we **inferred** from observations. They are always separate node types, never merged, so an inference can be retracted without losing the underlying observation. The established pairs:
+
+| Observation (what literally appeared) | → | Inference (what we think it means) |
+| --- | --- | --- |
+| **RequestObservation** | → | **Endpoint** |
+| **Parameter** | → | **ParameterSemantic** |
+| **ResponseArtifact** | → | **Asset** |
+
+### Target surface
+
+**Host**:
+A network identity — a hostname or IP plus port, canonicalized for identity (lowercased, ToASCII for IDN, trailing dot stripped, default port stripped, non-default kept). IP literals are never resolved against hostnames; they are distinct Hosts.
+_Avoid_: Server, Origin, Domain (those are operational notions; `Host` is the canonical network-identity term).
+
+**Endpoint**:
+An inferred `(method, host, path-template)` the planner reasons about. The template is a revisable inference, not a value frozen at ingest.
+_Avoid_: Route, URL.
+
+**RequestObservation**:
+A single observed HTTP exchange — its concrete path, the AuthContext used, the source (Burp / agent / nuclei), and references to the request/response bodies. The observation layer for Endpoints.
+_Avoid_: Request, Hit.
+
+**path template**:
+A path with variable positions replaced by named parameters — `/orgs/{org_id}/projects`. An inferred, revisable property of an Endpoint.
+
+**concrete path**:
+The literal path exactly as observed — `/orgs/42/projects`. Stored on the RequestObservation; never re-templated.
+
+**self-reference value**:
+A path-parameter value such as `me`, `current`, or `self` that denotes "the current Principal" rather than an explicit id. Flagged because it is authz-relevant: `/users/me` vs `/users/123` is an IDOR signal.
+
+**Parameter**:
+A named input position to an `Endpoint` — its location (`path` / `query` / `header` / `body` / `cookie`), name, observed types, and observed value patterns. Observation layer; the counterpart of `ParameterSemantic`.
+_Avoid_: Argument, Input, Field.
+
+**ParameterSemantic**:
+An inferred meaning for a `Parameter` — e.g. "this `org_id` is probably a tenant identifier." Inference layer; created when extraction's enrichment recognizes a pattern, with `confidence` reflecting how sure. Distinct from `Parameter` because inference is separate from observation.
+_Avoid_: ParameterType, ParameterMeaning.
+
+**ResponseArtifact**:
+A raw thing observed in a response — an identifier, URL, error message, internal hostname, or technology fingerprint — recorded with provenance. The observation layer; the catch-all lives here.
+_Avoid_: Asset (that is the inferred entity, not the raw observation), Leak.
+
+**Asset**:
+An inferred backend resource that is referenced but not yet directly addressable — a leaked bucket name, an internal hostname, a database identifier — treated as a testing lead. The inference layer; created by a promotion step that carries confidence.
+_Avoid_: ResponseArtifact (that is the raw observation), Lead, Resource.
+
+**ObservedValue**:
+A *promoted* value found in observations — an identifier, URL, email, hostname, JWT, or secret-shaped string — tracked as a node so cross-context matches ("this value leaked in a response also appears as a request input to another `Endpoint`") become a single graph traversal. Inference layer; evidenced by the `ResponseArtifact`s and `RequestObservation`s that contained the value. Only **promoted** values become nodes (shape match, multiplicity ≥2, or LLM proposal); junk strings stay inline on the originating observation. For `kind ∈ {token, secret}`, the node stores **`value_hash` + length + first-N chars only** — never the full value. The graph is not a credential store.
+_Avoid_: Token, Value (unqualified — those are the inline observations; `ObservedValue` is the promoted entity).
+
+### Identity & access
+
+**Principal**:
+An identity the tester controls or observes — "test user A," "admin account," "anonymous." The actor, not the credential.
+_Avoid_: User, Account, Identity.
+
+**AuthContext**:
+A specific authenticated state belonging to a Principal — a bearer token, session cookie, or API key — with a validity window and observed capabilities.
+_Avoid_: Session, Credential, Token (those are kinds of AuthContext, not the concept).
+
+**Tenant**:
+An inferred multi-tenancy unit — an organisation, workspace, or account namespace — that a Principal belongs to. Evidenced by URL positions (`/orgs/{org_id}`), headers (`X-Org-Id`), JWT claims on the AuthContext, response-body fields. An inference-layer node like `Asset`/`TrustBoundary`, with `DERIVED_FROM` edges to its evidence and the standard cross-cutting fields.
+_Avoid_: Organization, Workspace, Account (those are domain-specific spellings; `Tenant` is the canonical abstract term).
+
+**TrustBoundary**:
+An inferred line across which authorization is expected to change; the planner proposes boundary-violation tests against it. A node (never an edge), in the inference layer. The `BETWEEN` endpoint is **polymorphic by `kind`**:
+- _identity boundary, `kind = tenant`_ — drawn between **Tenant**s.
+- _identity boundary, `kind = role` / `ownership`_ — drawn between **Principal**s.
+- _capability boundary_ — drawn between **AuthContext**s of the same Principal (OAuth scope, MFA step-up, token freshness).
+_Avoid_: Permission, Scope (Scope is the engagement boundary, a different concept).
+
+### Testing & policy
+
+**TestCase**:
+A proposed or executed test — a class (IDOR, SSRF, auth-bypass), a target (an Endpoint+Parameter or a TrustBoundary), a payload, and an expected-vs-observed outcome. Content-addressed and Engagement-scoped (ADR-0007); the same content commits to the same node.
+_Avoid_: Probe, Attack.
+
+**Engagement**:
+A specific testing campaign within a `Scope` — its own kill-switch, budget, time window, and audit boundary. A `TestCase` belongs to exactly one Engagement; the same logical test re-run in a different Engagement is a new `TestCase` node, not an additional edge.
+_Avoid_: Campaign, Run, Session.
+
+**Scope**:
+The boundary of an engagement — which `Host`s, methods, path patterns, payload classes, rate limits, and time windows are allowed. Rules live as properties on the Scope node and are the **single source of truth** from which OPA's `data` bundle is generated (ADR-0003, gap #1). An `Engagement` runs `UNDER_SCOPE` exactly one Scope.
+_Avoid_: Allowlist, Program, Boundary (those are subsets or sibling concepts).
+
+**Finding**:
+A confirmed vulnerability — severity, category, references to the `TestCase`(s) that demonstrated it (via `REFERENCES`), and the `Endpoint`(s) and/or `TrustBoundary` it affects (via `AFFECTS`, polymorphic, M:N — a single Finding can affect both). Inference layer.
+_Avoid_: Vulnerability, Issue, Bug (`Finding` is what the system has *confirmed*; "vulnerability" is the abstract category, tracked as a property).
+
+**PayloadClass**:
+The controlled-vocabulary category of a payload (`destructive-sql`, `ssrf-callback`, `benign-probe`...) that the ROE layer reasons about. Carried on every TestCase. A tag/enum, not a node — promoted to a node only if we ever need to reason about relationships *between* classes.
+_Avoid_: PayloadType, Category.
+
+**Payload**:
+The concrete input bytes sent in one TestCase — a property/reference on that test's execution (in object storage if large), always tagged with a PayloadClass. Not a shared, deduplicated graph node.
+_Avoid_: a node per payload string.
+
+**normalization discrepancy**:
+A signal raised when two concrete paths that canonicalize to the same Endpoint return materially different responses — evidence of case/slash/encoding-sensitive backend handling, and a candidate auth-bypass or path-traversal bug.
+_Avoid_: Duplicate, Collision.
+
+### Provenance, confidence, time
+
+These three concerns are recorded uniformly on *every* node and *every* edge (see ADR-0005 and `ONTOLOGY.md` Step 4).
+
+**provenance**:
+Where a fact came from — the tool/method that produced it (`source`) plus a within-source identifier (`source_id`) and the time we recorded it (`ingested_at`). Lets any node be navigated back to the original artifact.
+_Avoid_: Origin, Author.
+
+**confidence**:
+A `[0,1]` score on every fact. Observations sit at `1.0` *when parser validation was clean* (lower when the parser flagged ambiguity); inferences sit below. Consumers decay confidence by age at query time — it is **never re-written for decay** in storage.
+_Avoid_: Probability, Likelihood (those imply calibration we don't always have).
+
+**confidence method**:
+The *kind* of confidence — `heuristic`, `manual`, `llm-self-reported`, or `calibrated`. Carried alongside the number so queries can discount LLM scores in aggregate without sniffing source-name strings.
+_Avoid_: ConfidenceSource.
+
+**event time** (`first_seen` / `last_seen`):
+When the *fact* existed in the world — earliest and latest evidence. For an inference, the min/max over its contributing observations, not the time it was computed.
+
+**transaction time** (`ingested_at`):
+When *we* recorded the fact. Diverges from event time whenever older artifacts are uploaded (e.g., a HAR file from last week).
+
+**status**:
+`active` or `retracted`. Retraction is a flag, not a delete — orphaned nodes from a merge (Principal-merge, Asset-merge, Tenant-merge) are kept for audit and lineage. Planner queries filter to `status = "active"` by default; auditors / replay can see the retracted set explicitly.
+
+**DERIVED_FROM**:
+An explicit edge from every inference to each observation that fed it. Makes lineage a graph traversal, not a stored property.
+
+## Relationships
+
+- A **ResponseArtifact** may **evidence** one or more **Assets** (an Asset can be evidenced by several ResponseArtifacts).
+- A **RequestObservation** is grouped under an **Endpoint** by a revisable `HIT` inference — concrete path on the observation, template on the Endpoint. Re-templating re-groups these edges; it never moves observations.
+- An **AuthContext** belongs to exactly one **Principal**; a Principal has many AuthContexts.
+- A **Principal** **`OF_TENANT`** zero or more **Tenant**s; cardinality is **M:N** (multi-org membership is normal).
+- A `TrustBoundary` with `kind = tenant` is drawn between **Tenant**s; `role` / `ownership` between **Principal**s; capability-tier between **AuthContext**s of one Principal. The `BETWEEN` endpoint type is polymorphic by `kind` (refines ADR-0002 via ADR-0008).
+- A **TestCase** may target a **TrustBoundary**; a **Finding** may attach to the **TrustBoundary** it violated. (Both require TrustBoundary to be a node — a Neo4j relationship cannot be an endpoint of another relationship.)
+- A **TestCase** carries exactly one **PayloadClass** (the thing the ROE layer evaluates); its concrete **Payload** is a property/reference, not a shared node.
+- A **Finding** references the **TestCase**(s) that demonstrated it.
+- Every inference node (**Endpoint**, **Asset**, **ParameterSemantic**, **TrustBoundary**, …) has **`DERIVED_FROM`** edges back to each observation that fed it. Lineage is the traversal of those edges.
+- A **TestCase** **`EXECUTED_AS`** zero or more **RequestObservation**s (with `source = "agent"`). Cardinality 0..N — retries and parameter sweeps add edges, they do not create new TestCases. A TestCase with no `EXECUTED_AS` edge is proposed-but-not-executed; with ≥1, it has run.
+- A **TestCase** **`IN_ENGAGEMENT`** exactly one **Engagement**. Same content + same Engagement → same node; different Engagement → different node (the Engagement id is part of the TestCase identity hash).
+- An **AuthContext** **`OF_PRINCIPAL`** exactly one **Principal**; a Principal has zero or more AuthContexts.
+- A **RequestObservation** **`YIELDED`** zero or more **ResponseArtifact**s (one per identifier/URL/error message/fingerprint extracted from the response).
+- A **ResponseArtifact** **`CONTAINS_VALUE`** zero or more **ObservedValue**s.
+- A **RequestObservation** **`SENT_VALUE`** zero or more **ObservedValue**s; the edge property `parameter_name` records *which* parameter carried the value.
+- An **Asset** may **`SAME_VALUE_AS`** an **ObservedValue** when both refer to the same underlying string (ADR-0011). Optional, M:N, used for cross-pivot queries between lead-status and cross-context-value views.
+- An **Endpoint** **`HAS_PARAMETER`** zero or more **Parameter**s; each Parameter has exactly one Endpoint. Enables `ParameterSemantic -DERIVED_FROM-> Parameter`.
+- A **TestCase** has **exactly one** of `TARGETS_ENDPOINT` (to an Endpoint, route-level test), `TARGETS_PARAMETER` (to a Parameter node, parameter-level test), or `TARGETS_BOUNDARY` (to a TrustBoundary). Three-way XOR, matching the three-way XOR in the TestCase identity hash.
+- A **Finding** **`AFFECTS`** one or more **Endpoint**s and/or **TrustBoundary**s (polymorphic, M:N, **not** XOR — a single Finding can affect both, e.g. a cross-tenant data leak affecting specific Endpoints *and* the tenant boundary). Plus the existing `REFERENCES` to TestCase(s).
+- An **Asset** may be **promoted** to a **Host** or **Endpoint** once it becomes reachable.
+- Promotion is an inference: it carries provenance and confidence, and is retractable. The evidencing **ResponseArtifact**s survive retraction.
+- A technology fingerprint stays a **ResponseArtifact** forever — it is never promoted to an **Asset**.
+
+## Identity rules
+
+- **Endpoint identity = `(method, host, path-template)`.** The query string is excluded — query inputs are `Parameter`s (location=query), not part of path identity.
+- **Canonicalization before templating:** strip trailing slash; lowercase host and drop default port (keep non-default); RFC 3986 percent-encoding normalization; **preserve path case**. The raw concrete path is always kept on the `RequestObservation`.
+- **Normalization discrepancy:** two raw paths that canonicalize to the same Endpoint but return materially different responses raise a discrepancy signal — they are not silently merged, because the difference may be a vulnerability.
+- A path position becomes a **parameter** by **multiplicity** (≥2 distinct values with the rest of the path fixed), with a **value-shape prior** for the cold-start single-observation case and a **confidence** that rises as evidence accumulates.
+- **Version segments** (`v\d+`) stay literal even under multiplicity.
+- A position may be **both** a parameter and host literal sibling routes — `/users/{user_id}` and `/users/settings` coexist, and the **literal match wins** (router precedence).
+- **TestCase identity** is content-addressed: `key_hash = sha256(canonicalized(engagement_id, test_class, target_endpoint_id?, target_parameter_id?, target_trust_boundary_id?, payload_class, payload_hash, auth_context_id))`, unique-indexed. The target is a **three-way XOR**: exactly one of `target_endpoint_id` (route-level test), `target_parameter_id` (parameter-level test; the Parameter node carries its Endpoint via `HAS_PARAMETER`), or `target_trust_boundary_id` (boundary test). The other two normalize to null and fall out of the hash. `payload_hash` is over the concrete bytes the dispatcher will send (sentinel `sha256("")` for no-payload tests; never SQL null). Engagement is part of the identity, so cross-Engagement re-runs are distinct nodes.
+- **Principal identity** is **two-tier and revisable** (ADR-0010). *Declared* Principals (the ones we control) carry a manual label set at engagement setup, with `source = "manual"`, `confidence = 1.0`. *Discovered* Principals (actors observed in passive traffic) are identified by the strongest available stable signal — in priority order: JWT `sub` claim, observed user-id from `/me`/`/whoami` responses, stable `X-User-*` header, email tied to the AuthContext, or a synthetic fallback (low confidence, flagged `unmerged`). Declared and discovered **reconcile via the same priority list** — no phantom twins. Merging two synthetics later proven the same is `OF_PRINCIPAL` edge re-pointing, not node surgery; the orphan is marked retracted, not deleted. **Anonymous is a singleton per `Engagement`** — one anonymous `AuthContext`, one anonymous `Principal`.
+- **AuthContext identity** = `auth_hash = sha256(token_kind || ":" || token_value)`, where `token_kind ∈ {bearer, cookie, api_key, basic_auth, anonymous}`. The raw `token_value` is **never persisted** to the graph — only the hash, parsed claims, observed capabilities, and validity window (same secrets-handling discipline as ADR-0009). Token rotation = new AuthContext, same Principal.
+- **Host identity** = `(canonical_hostname, port)`. Canonicalization: lowercase hostname, ToASCII for IDN, strip trailing dot, strip default port (`:443` https / `:80` http), keep non-default ports. IP literals stay distinct from hostnames.
+- **Tenant identity** = `(kind, normalized_value)` with `kind ∈ {org_id, workspace, account_namespace, subdomain, …}`. When two Tenants are later proven the same (alternate identifiers — URL position *and* JWT claim — pointing at one tenant), **merge via `OF_TENANT` edge re-pointing**; orphan marked retracted (same mechanic as Principal-merge).
+- **Asset identity** = `(kind, normalized_value)` with `kind ∈ {internal_hostname, bucket_name, database_id, signed_url, internal_path, …}`. Distinct from `ObservedValue` (they coexist by ADR-0011) and linked by an optional `SAME_VALUE_AS` edge when both nodes refer to the same string.
+
+## Example dialogue
+
+> **Dev:** "`internal-billing-prod.corp.example` showed up in three different 500 bodies. Three nodes or one?"
+> **Domain expert:** "Three **ResponseArtifact**s — three real observations, each with its own provenance. One **Asset**, evidenced by all three, because we *infer* they point at the same backend resource. If we later reach it, that Asset gets promoted to a **Host**."
+
+## Flagged ambiguities
+
+- **"Asset" vs "ResponseArtifact"** — the original entity catalog let both claim "internal hostname in an error message." Resolved: **ResponseArtifact** is the observation layer (raw, catch-all, always created), **Asset** is the inference layer (curated lead, created only by a promotion step with confidence). This kills the "Asset becomes a dumping ground" risk — the dumping ground is ResponseArtifact, and that is fine.
+- **What a TrustBoundary is drawn between** — "Principal" alone made capability differences within one Principal (OAuth scope, MFA step-up) invisible, which the "auth state transitions not exercised" coverage query needs. Resolved: two tiers — _identity_ boundaries between **Principal**s, _capability_ boundaries between **AuthContext**s of the same Principal.
+- **How explicit Payloads should be** — the draft leaned "maximalist" (a node per payload string) on the belief that OPA evaluates graph state. It doesn't — OPA evaluates the proposed request (see ADR-0003). Resolved: the first-class concept is **PayloadClass** (a tag carried on the request); the **Payload** instance is a property/reference; a reusable payload library is deferred until we build one.
+- **The mixed path position** — `/users/123`, `/users/me`, `/users/settings` route off one position but are three things. Resolved: literal sub-routes (`settings`) are their own **Endpoint**s and win over the parameter; `me`/`current`/`self` are **self-reference values** of `{user_id}`, flagged for IDOR. Because **Endpoint** identity is a revisable inference (ADR-0004), early mis-templating self-corrects without node surgery.
+- **Decaying confidence** — the obvious move is to lower stored `confidence` as facts age. Resolved: confidence is set at creation and **never re-written for decay**; consumers compute effective confidence = f(stored, age) at query time. Keeps the graph append-mostly and the audit trail intact (ADR-0005).
+- **Inbound vs outbound traffic** — tempting to model agent-sent requests as a separate `Execution` entity. Resolved: both are `RequestObservation`s, distinguished only by `source` (ADR-0006). Coverage queries see one unified observation set; a `source` filter separates active from passive only when a query actually needs it.
+- **One TestCase per proposal, or per content?** A synthetic-id-per-proposal model would mean "one proposal = one node," but it leaves dedup as a separate equality-on-many-fields query and fills the graph with near-duplicates. Resolved: TestCases are content-addressed (ADR-0007). The LLM may re-propose the same test verbatim; commit is a no-op. The cross-Engagement reuse case ("the test we know how to run, regardless of run") is a deferred concept — `TestTemplate`, not the same as TestCase.
+- **Where tenant lives** — tempting to make `tenant_id` a flat property on `Principal`. Resolved: `Tenant` is a first-class **inference** node (ADR-0008), evidenced by URL positions, headers, JWT claims, and response fields; `Principal -OF_TENANT-> Tenant` is many-to-many. This refines ADR-0002 — `kind = tenant` `TrustBoundary`s are drawn between `Tenant`s, not `Principal`s.
+- **Value matching: inline or node?** Inline indexing is cheaper but leaves no place to attach provenance, confidence, or findings to a value. Resolved: promoted values become `ObservedValue` nodes (ADR-0009); shape-/multiplicity-filtered, with secrets stored as hash+length+preview only. Junk strings stay inline on the originating observation. Cross-context queries (C3, leak-to-input) are graph traversals through the value node.
+- **Declared vs discovered Principals as phantom twins** — naïve handling creates a separate "discovered" Principal whenever an AuthContext surfaces in traffic, even when that AuthContext is one we set up. Resolved: declared and discovered reconcile through the same identifier-priority list (ADR-0010); when a discovered signal matches a declared Principal's known signal, the AuthContext attaches to the declared node.
+- **Asset vs ObservedValue — unify or coexist?** Both can refer to the same underlying string (a leaked hostname is naturally either). Resolved: **coexist** (ADR-0011) with an optional `SAME_VALUE_AS` edge. They carry different semantic intent — `ObservedValue` = "seen across contexts" (C3); `Asset` = "lead worth testing" (C6) — and the queries that use them differ. Unification was rejected because it trades a node-type filter for a property filter without simplifying anything materially. A two-step `Asset PROMOTED_FROM ObservedValue` chain was also rejected as an unpaid-for hop.
