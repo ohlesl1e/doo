@@ -81,3 +81,39 @@ def redis_url() -> Iterator[str]:
         yield f"redis://{host}:{port}/0"
     finally:
         container.stop()
+
+
+@pytest.fixture
+def minio_config() -> Iterator[dict[str, str]]:
+    """Start a MinIO testcontainer and yield its boto3 connection config (T2).
+
+    Yields `{endpoint_url, access_key, secret_key}` for `BlobClient.from_config`.
+    Skips cleanly when docker / testcontainers[minio] is unavailable.
+    """
+
+    if os.getenv("DOO_SKIP_TESTCONTAINERS"):
+        pytest.skip("DOO_SKIP_TESTCONTAINERS set; skipping testcontainer-backed test")
+
+    try:
+        from testcontainers.minio import MinioContainer  # type: ignore[import-not-found]
+    except Exception:
+        pytest.skip(
+            "testcontainers[minio] not installed; skipping MinIO testcontainer test "
+            "(pip install 'testcontainers[minio]')"
+        )
+
+    container = MinioContainer("minio/minio:latest")
+    try:
+        container.start()
+    except Exception as exc:
+        pytest.skip(f"Could not start MinIO testcontainer: {exc!r}")
+
+    try:
+        cfg = container.get_config()
+        yield {
+            "endpoint_url": f"http://{cfg['endpoint']}",
+            "access_key": cfg["access_key"],
+            "secret_key": cfg["secret_key"],
+        }
+    finally:
+        container.stop()

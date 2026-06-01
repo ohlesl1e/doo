@@ -1,0 +1,272 @@
+"""L3 commit orchestrator (slice-1 T2).
+
+Consumes `L2Event`s and commits them to Neo4j, with:
+
+- **Semantic-key idempotency** (ADR-0016): a Redis `SETNX` on
+  `commit:{engagement_id}:{event_kind}:{source}:{source_id}`. The first commit of
+  a semantic key wins; re-delivered events (parser-replay, at-least-once stream
+  delivery) short-circuit to a no-op. This is distinct from L1's blob-hash key
+  and L2's per-emission `event_id`.
+- **Commit-time engagement-scoping gate** (ADR-0017): the inbound event's
+  `engagement_id` is the only engagement any node may be stamped with this
+  commit; entity resolution stamps exactly that id, and the resolvers never
+  create cross-engagement edges (every MATCH is engagement-scoped). The gate
+  here is a defensive assertion before any write.
+- **L3Event emission**: each commit pushes structural `NodeCreated` events onto
+  `l3-events` so consumers (planner/coverage/audit) can compose meaning.
+
+`trace_id` propagates unchanged from the envelope through L2 into the emitted
+L3 events (ADR-0018); this layer derives a child `span_id`.
+
+No LLM here — deterministic commit only (CLAUDE.md hard rule).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from typing import Protocol
+
+from doo.events.l2 import L2Event, ParseFailure, RequestObservation
+from doo.events.l3 import L3Event, NodeCreated
+from doo.ids import CommitId, EngagementId
+from doo.infra.neo4j_driver import Neo4jClient
+from doo.infra.streams import L3_EVENTS_STREAM, StreamClient
+from doo.observability.ids import new_span_id
+from doo.observability.logging import bind_correlation, get_logger
+from doo.ontology.resolve import (
+    commit_parse_failure,
+    commit_request_observation,
+    resolve_auth_context,
+    resolve_endpoint,
+    resolve_host,
+)
+
+log = get_logger(__name__)
+
+
+class IdempotencyStore(Protocol):
+    """Duck-type for the semantic-key store (Redis `SETNX`).
+
+    `claim` returns True if this process is the first to claim the key (the
+    commit should proceed) and False if the key already existed (no-op).
+    """
+
+    def claim(self, key: str) -> bool: ...
+
+
+class RedisSetNX:
+    """Redis-backed `IdempotencyStore` using `SET key 1 NX`.
+
+    Keys persist for the engagement's lifetime by default (no TTL) so a
+    parser-replay weeks later still no-ops; pass `ttl_seconds` to bound them.
+    """
+
+    def __init__(self, client: object, *, ttl_seconds: int | None = None) -> None:
+        self._client = client
+        self._ttl = ttl_seconds
+
+    def claim(self, key: str) -> bool:
+        # redis-py `set(..., nx=True)` returns True on set, None if it existed.
+        result = self._client.set(key, "1", nx=True, ex=self._ttl)  # type: ignore[attr-defined]
+        return bool(result)
+
+
+def semantic_key(engagement_id: EngagementId, event_kind: str, source: str, source_id: str) -> str:
+    """ADR-0016 semantic idempotency key: `commit:{eng}:{kind}:{source}:{source_id}`."""
+
+    return f"commit:{engagement_id}:{event_kind}:{source}:{source_id}"
+
+
+class EngagementScopeViolation(Exception):
+    """A commit attempted to stamp a node with a mismatched engagement_id."""
+
+
+@dataclass(frozen=True, slots=True)
+class CommitResult:
+    """Outcome of committing one `L2Event`."""
+
+    commit_id: CommitId
+    engagement_id: EngagementId
+    event_kind: str
+    source_id: str
+    idempotent_noop: bool
+    node_ids: tuple[str, ...] = ()
+    l3_events: tuple[L3Event, ...] = field(default_factory=tuple)
+
+
+class CommitOrchestrator:
+    """Commits `L2Event`s to the graph with idempotency + scope enforcement."""
+
+    def __init__(
+        self,
+        *,
+        neo4j: Neo4jClient,
+        idempotency: IdempotencyStore,
+        streams: StreamClient,
+        expected_engagement_id: EngagementId | None = None,
+    ) -> None:
+        self._neo4j = neo4j
+        self._idempotency = idempotency
+        self._streams = streams
+        # When set, every committed event must match this engagement (the
+        # commit-time scoping gate; ADR-0017). The worker sets it per-envelope.
+        self._expected_engagement_id = expected_engagement_id
+
+    def commit(self, event: L2Event) -> CommitResult:
+        """Commit one event; idempotent on its semantic key (ADR-0016)."""
+
+        commit_id = CommitId(new_span_id() + new_span_id())
+        span_id = new_span_id()
+        bind_correlation(
+            trace_id=event.trace_id, span_id=span_id, engagement_id=event.engagement_id
+        )
+
+        # --- Commit-time engagement-scoping gate (ADR-0017). ---
+        if (
+            self._expected_engagement_id is not None
+            and event.engagement_id != self._expected_engagement_id
+        ):
+            raise EngagementScopeViolation(
+                f"event engagement_id {event.engagement_id!r} != expected "
+                f"{self._expected_engagement_id!r}; cross-engagement commit refused"
+            )
+
+        key = semantic_key(
+            event.engagement_id, event.kind, event.source, event.source_id
+        )
+        if not self._idempotency.claim(key):
+            log.info("commit.idempotent_noop", semantic_key=key, kind=event.kind)
+            return CommitResult(
+                commit_id=commit_id,
+                engagement_id=event.engagement_id,
+                event_kind=event.kind,
+                source_id=event.source_id,
+                idempotent_noop=True,
+            )
+
+        if isinstance(event, RequestObservation):
+            result = self._commit_request_observation(event, commit_id, span_id)
+        elif isinstance(event, ParseFailure):
+            result = self._commit_parse_failure(event, commit_id, span_id)
+        else:
+            # ResponseArtifact arrives in T6; not produced by the slice-1 parser.
+            log.warning("commit.unsupported_event_kind", kind=event.kind)
+            return CommitResult(
+                commit_id=commit_id,
+                engagement_id=event.engagement_id,
+                event_kind=event.kind,
+                source_id=event.source_id,
+                idempotent_noop=False,
+            )
+
+        for l3_event in result.l3_events:
+            self._streams.publish(L3_EVENTS_STREAM, l3_event.model_dump(mode="json"))
+        log.info(
+            "commit.applied",
+            kind=event.kind,
+            commit_id=commit_id,
+            node_count=len(result.node_ids),
+        )
+        return result
+
+    def _commit_request_observation(
+        self, obs: RequestObservation, commit_id: CommitId, span_id: str
+    ) -> CommitResult:
+        host_node_id = resolve_host(
+            self._neo4j,
+            engagement_id=obs.engagement_id,
+            host=obs.host,
+            observed_at=obs.observed_at,
+            ingested_at=obs.ingested_at,
+        )
+        # Slice-1: concrete path AS path_template (templating arrives in T3).
+        endpoint_node_id = resolve_endpoint(
+            self._neo4j,
+            engagement_id=obs.engagement_id,
+            method=obs.method,
+            host_node_id=host_node_id,
+            path_template=obs.concrete_path,
+            observed_at=obs.observed_at,
+            ingested_at=obs.ingested_at,
+        )
+        anon = resolve_auth_context(
+            self._neo4j,
+            engagement_id=obs.engagement_id,
+            observed_at=obs.observed_at,
+            ingested_at=obs.ingested_at,
+        )
+        commit_request_observation(
+            self._neo4j,
+            obs=obs,
+            host_node_id=host_node_id,
+            endpoint_node_id=endpoint_node_id,
+            auth_context_node_id=anon.auth_context_id,
+        )
+        node_ids = (
+            host_node_id,
+            endpoint_node_id,
+            str(anon.auth_context_id),
+            str(anon.principal_id),
+            str(obs.observation_id),
+        )
+        l3_events = (
+            self._node_created("Host", host_node_id, obs, commit_id, span_id),
+            self._node_created("Endpoint", endpoint_node_id, obs, commit_id, span_id),
+            self._node_created(
+                "AuthContext", str(anon.auth_context_id), obs, commit_id, span_id
+            ),
+            self._node_created(
+                "Principal", str(anon.principal_id), obs, commit_id, span_id
+            ),
+            self._node_created(
+                "RequestObservation", str(obs.observation_id), obs, commit_id, span_id
+            ),
+        )
+        return CommitResult(
+            commit_id=commit_id,
+            engagement_id=obs.engagement_id,
+            event_kind=obs.kind,
+            source_id=obs.source_id,
+            idempotent_noop=False,
+            node_ids=node_ids,
+            l3_events=l3_events,
+        )
+
+    def _commit_parse_failure(
+        self, pf: ParseFailure, commit_id: CommitId, span_id: str
+    ) -> CommitResult:
+        commit_parse_failure(self._neo4j, pf=pf)
+        l3_events = (
+            self._node_created(
+                "ParseFailure", str(pf.observation_id), pf, commit_id, span_id
+            ),
+        )
+        return CommitResult(
+            commit_id=commit_id,
+            engagement_id=pf.engagement_id,
+            event_kind=pf.kind,
+            source_id=pf.source_id,
+            idempotent_noop=False,
+            node_ids=(str(pf.observation_id),),
+            l3_events=l3_events,
+        )
+
+    @staticmethod
+    def _node_created(
+        node_type: str,
+        node_id: str,
+        event: RequestObservation | ParseFailure,
+        commit_id: CommitId,
+        span_id: str,
+    ) -> NodeCreated:
+        return NodeCreated(
+            commit_id=commit_id,
+            trace_id=event.trace_id,
+            span_id=span_id,  # type: ignore[arg-type]
+            engagement_id=event.engagement_id,
+            emitted_at=datetime.now(UTC),
+            node_type=node_type,
+            node_id=node_id,
+            properties={"source_id": event.source_id},
+        )

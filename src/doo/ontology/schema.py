@@ -18,13 +18,24 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol
 
+from doo.observability.logging import get_logger
+
+log = get_logger(__name__)
+
 
 @dataclass(frozen=True, slots=True)
 class SchemaStatement:
-    """One Cypher schema statement plus a human label for logging."""
+    """One Cypher schema statement plus a human label for logging.
+
+    `enterprise_only` flags property-existence constraints, which require Neo4j
+    Enterprise. On Community the bootstrap skips these (see `apply_schema`); the
+    non-null guarantee is still enforced by the Pydantic models + the commit-time
+    scoping/validation gate.
+    """
 
     name: str
     cypher: str
+    enterprise_only: bool = False
 
 
 class _CypherRunner(Protocol):
@@ -162,6 +173,12 @@ def schema_statements() -> tuple[SchemaStatement, ...]:
         "ingested_at",
         "status",
     )
+    # TODO(slice-1 decision): DB-level existence constraints need Neo4j Enterprise
+    # — see ARCHITECTURE.md edition decision. The project standard is
+    # `neo4j:5-community`, where `REQUIRE ... IS NOT NULL` fails. These are flagged
+    # `enterprise_only=True` and skipped on Community by `apply_schema`; the
+    # non-null guarantee is upheld in code by the Pydantic models + the commit-time
+    # scoping/validation gate.
     for label in ENGAGEMENT_SCOPED_NODE_LABELS:
         for field in cross_cutting_fields:
             cname = f"{label.lower()}_{field}_exists"
@@ -172,21 +189,56 @@ def schema_statements() -> tuple[SchemaStatement, ...]:
                         f"CREATE CONSTRAINT {cname} IF NOT EXISTS "
                         f"FOR (n:{label}) REQUIRE n.{field} IS NOT NULL"
                     ),
+                    enterprise_only=True,
                 )
             )
 
     return tuple(out)
 
 
-def apply_schema(session: _CypherRunner) -> tuple[SchemaStatement, ...]:
-    """Apply every schema statement against an open Neo4j session/transaction.
+# Marker substring Neo4j Community emits when an Enterprise-only constraint is
+# attempted, used as a belt-and-braces guard alongside the edition probe.
+_ENTERPRISE_REQUIRED_MARKER = "requires Neo4j Enterprise Edition"
 
-    Returns the statements that were issued (in order) so callers can log.
-    `IF NOT EXISTS` makes each statement idempotent; calling `apply_schema`
-    twice in a row issues the same Cypher and converges to the same state.
+
+def apply_schema(
+    session: _CypherRunner, *, edition: str = "community"
+) -> tuple[SchemaStatement, ...]:
+    """Apply the schema bootstrap against an open Neo4j session/transaction.
+
+    Returns the statements that were *issued* (in order) so callers can log.
+    `IF NOT EXISTS` makes each statement idempotent.
+
+    Edition-aware (slice-1 decision): property-existence constraints
+    (`enterprise_only=True`) require Neo4j Enterprise. On `edition != "enterprise"`
+    they are skipped with a logged warning; uniqueness constraints + indexes
+    (which back idempotency and work on Community) always apply. If an
+    enterprise-only statement somehow slips through and the server rejects it with
+    the Enterprise-required error, that single statement is swallowed so the
+    bootstrap stays green on Community.
     """
 
-    statements = schema_statements()
-    for stmt in statements:
-        session.run(stmt.cypher)
-    return statements
+    is_enterprise = edition.lower() == "enterprise"
+    issued: list[SchemaStatement] = []
+    skipped = 0
+    for stmt in schema_statements():
+        if stmt.enterprise_only and not is_enterprise:
+            skipped += 1
+            continue
+        try:
+            session.run(stmt.cypher)
+        except Exception as exc:  # noqa: BLE001
+            if stmt.enterprise_only and _ENTERPRISE_REQUIRED_MARKER in str(exc):
+                skipped += 1
+                continue
+            raise
+        issued.append(stmt)
+    if skipped:
+        log.warning(
+            "schema.existence_constraints_skipped",
+            count=skipped,
+            edition=edition,
+            reason="property-existence constraints require Neo4j Enterprise; "
+            "non-null enforced in code (Pydantic + commit gate)",
+        )
+    return tuple(issued)

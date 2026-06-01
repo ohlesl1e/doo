@@ -14,6 +14,7 @@ from pathlib import Path
 import typer
 
 from doo.engagement.cli_keepalive import register_keepalive
+from doo.ingestion.cli_ingest import register_ingest
 from doo.observability.ids import new_span_id, new_trace_id
 from doo.observability.logging import bind_correlation, configure_logging, get_logger
 from doo.setup import EngagementMismatchError, ScopeChangeRequiresConfirmation
@@ -140,6 +141,8 @@ def status(
 
 # T7: register `doo engagement keepalive` (single line; keeps cli.py diff small).
 register_keepalive(engagement_app)
+# T2: register `doo ingest har`.
+register_ingest(app)
 
 
 if __name__ == "__main__":
