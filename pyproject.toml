@@ -1,0 +1,67 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "doo"
+version = "0.1.0"
+description = "DOO (Department of Offense): a security testing copilot for black-box web application testing."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { file = "LICENSE" }
+authors = [
+    { name = "ohlesl1e" },
+]
+classifiers = [
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+]
+dependencies = [
+    "pydantic>=2.6",
+    "fastapi>=0.110",
+    "typer>=0.12",
+    "structlog>=24.1",
+    "redis>=5.0",
+    "neo4j>=5.20",
+    "boto3>=1.34",
+    "pyjwt>=2.8",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "testcontainers[neo4j]>=4.0",
+    "mypy>=1.9",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+doo = "doo.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/doo"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/", "README.md", "LICENSE"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "W"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = "src"
+explicit_package_bases = true

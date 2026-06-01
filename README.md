@@ -6,8 +6,7 @@ doo ingests passive testing data (Burp traffic, HAR files, recon output), builds
 
 ## Status
 
-Pre-MVP. Design is mostly settled; no code yet. The ontology is fully drafted, 11 ADRs are recorded, and the remaining open design questions are tracked in [`docs/grill-queue.md`](docs/grill-queue.md).
-
+Slice 1 / T1 (engagement skeleton) — repo skeleton, layer-boundary Pydantic contracts, Neo4j schema bootstrap, structlog setup, and the engagement loader / CLI. The ingestion → graph pipeline (T2 onward) builds on top of these contracts.
 
 ## Design principles
 
@@ -39,20 +38,63 @@ Build vertically through one slice before broadening:
 3. **LLM-assisted hypothesis generation** — human approves before dispatch.
 4. **Bounded agent execution** — only after 1–3 are solid.
 
+## Repository layout
+
+Code:
+- `src/doo/ids/` — typed identifier aliases (`EngagementId`, `PrincipalId`, ...).
+- `src/doo/canonical/` — cross-cutting `Provenanced` / `Inferred` mixins (ADR-0005) and value objects (`HostRef`, `BlobRef`, `AuthContextCue`).
+- `src/doo/events/` — layer-boundary contracts: `IngestionEnvelope` (L1→L2), `L2Event` discriminated union (L2→L3), `L3Event` discriminated union (L3→consumers), plus the slice-4 hedge contracts (`TestCase`, `Finding`, `ExecutedAsEdge`).
+- `src/doo/setup/` — `EngagementConfig` Pydantic model and the idempotent loader (ADR-0019).
+- `src/doo/ontology/` — Neo4j schema bootstrap (ADR-0017 constraints + indexes + property-existence).
+- `src/doo/observability/` — `structlog` config and W3C trace-context id generators (ADR-0018).
+- `src/doo/cli.py` — Typer CLI (`doo engagement start` / `doo engagement status`).
+- `src/doo/ingestion/`, `src/doo/extraction/`, `src/doo/policy/`, `src/doo/infra/` — placeholders for later tracers.
+
+Design docs:
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — five-layer architecture, tech stack, build order, layer contracts.
+- [`ONTOLOGY.md`](ONTOLOGY.md) — graph schema (six-step draft, all done).
+- [`CONTEXT.md`](CONTEXT.md) — domain language.
+- [`docs/adr/`](docs/adr/) — architecture decision records (0001–0020).
+- [`docs/grill-queue.md`](docs/grill-queue.md) — open design decisions tracking.
+- [`docs/agents/`](docs/agents/) — agent skill docs (issue tracker, triage labels, domain docs).
+
+## Quickstart
+
+Boot the local-dev stack and install dev deps:
+
+```sh
+docker compose up -d
+cp .env.example .env  # then edit as needed
+pip install -e '.[dev]'
+```
+
+Run the tests:
+
+```sh
+pytest
+```
+
+CLI:
+
+```sh
+doo engagement start --config path/to/engagement.yaml
+doo engagement status <engagement-id>
+```
+
 ## Tech stack
 
 | Concern | Choice |
 |---|---|
-| Primary language | Python |
-| Burp integration | Kotlin/Java extension via Montoya API |
+| Primary language | Python 3.12 |
+| Burp integration | Kotlin/Java extension via Montoya API (later slice) |
 | Queue | Redis Streams |
 | Object storage | S3 or MinIO |
-| Schemas | Pydantic |
-| Graph DB | Neo4j |
-| Policy engine | OPA + Rego |
-| LLM access | Anthropic API + local LiteLLM |
-| Tool protocol | MCP |
-| Observability | OpenTelemetry |
+| Schemas | Pydantic v2 |
+| Graph DB | Neo4j 5 |
+| Policy engine | OPA + Rego (later slice) |
+| LLM access | Anthropic API + local LiteLLM (later slice) |
+| Tool protocol | MCP (later slice) |
+| Observability | OpenTelemetry — correlation IDs from day 1, SDK deferred (ADR-0018) |
 
 ## Hard rules
 
@@ -62,15 +104,6 @@ Build vertically through one slice before broadening:
 - Kill switch lives outside the agent process.
 - OPA checks happen twice — at planner and at dispatcher.
 - Provenance and confidence on every node and edge. No exceptions.
-
-## Repository layout
-
-- [`ARCHITECTURE.md`](ARCHITECTURE.md) — five-layer architecture, tech stack, build order.
-- [`ONTOLOGY.md`](ONTOLOGY.md) — graph schema.
-- [`CONTEXT.md`](CONTEXT.md) — domain language.
-- [`docs/adr/`](docs/adr/) — architecture decision records (0001–0011).
-- [`docs/grill-queue.md`](docs/grill-queue.md) — open design decisions before MVP code lands.
-- [`docs/agents/`](docs/agents/) — agent skill docs (issue tracker, triage labels, domain docs).
 
 ## License
 

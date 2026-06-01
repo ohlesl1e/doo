@@ -1,0 +1,62 @@
+# Local-dev stack for DOO slice 1.
+#
+# Three services: Neo4j (graph), Redis (queue + kill-switch lease), MinIO (blobs).
+# Configured for laptop use; tighten for staging/production.
+
+services:
+  neo4j:
+    image: neo4j:5-community
+    container_name: doo-neo4j
+    ports:
+      - "7474:7474"  # HTTP / Browser
+      - "7687:7687"  # Bolt
+    environment:
+      NEO4J_AUTH: "neo4j/doo-dev-password"
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_dbms_security_procedures_unrestricted: "apoc.*"
+    volumes:
+      - doo-neo4j-data:/data
+      - doo-neo4j-logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p doo-dev-password 'RETURN 1' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: doo-redis
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - doo-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    container_name: doo-minio
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Console
+    environment:
+      MINIO_ROOT_USER: "doo-dev"
+      MINIO_ROOT_PASSWORD: "doo-dev-password"
+    command: ["server", "/data", "--console-address", ":9001"]
+    volumes:
+      - doo-minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  doo-neo4j-data:
+  doo-neo4j-logs:
+  doo-redis-data:
+  doo-minio-data:

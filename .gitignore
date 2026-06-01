@@ -1,3 +1,7 @@
+# Claude Code agent worktrees & local artifacts
+.claude/worktrees/
+get-docker.sh
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

@@ -1,0 +1,142 @@
+"""Typer CLI: `doo engagement start` / `doo engagement status`.
+
+T1 ships only the engagement subcommand group; richer commands (ingest,
+keepalive, status of other slices) land in later tracers.
+
+The CLI is a thin wrapper: it parses args, builds the right graph dependency,
+calls into `doo.setup.loader`, and prints results. No business logic here.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import typer
+
+from doo.observability.logging import bind_correlation, configure_logging, get_logger
+from doo.observability.ids import new_span_id, new_trace_id
+from doo.setup import EngagementMismatchError, ScopeChangeRequiresConfirmation
+from doo.setup.loader import JsonFileLedger, load_engagement_from_yaml
+
+app = typer.Typer(
+    help="DOO — Department of Offense. Black-box security testing copilot.",
+    no_args_is_help=True,
+    add_completion=False,
+)
+
+engagement_app = typer.Typer(
+    help="Engagement lifecycle commands (per ADR-0012 / ADR-0019).",
+    no_args_is_help=True,
+)
+app.add_typer(engagement_app, name="engagement")
+
+log = get_logger(__name__)
+
+
+def _default_ledger() -> JsonFileLedger:
+    """Default ledger path: `~/.doo/engagement_ledger.json`.
+
+    Overridable by environment in production; T1 keeps it simple.
+    """
+    import os
+
+    home = Path(os.path.expanduser("~"))
+    return JsonFileLedger(home / ".doo" / "engagement_ledger.json")
+
+
+def _build_graph_state():
+    """Build the Neo4j-backed `GraphState` implementation.
+
+    Slice-1 T1 does not yet implement a real Neo4j writer — the L3 commit path
+    lands in T2. For now the CLI errors out cleanly if invoked without a fake;
+    tests inject their own state object.
+    """
+    raise NotImplementedError(
+        "Real Neo4j-backed graph state is implemented in T2 (L3 commit path). "
+        "T1 ships only the contracts, schema bootstrap, and loader logic; "
+        "tests inject a fake. Invoke from tests, or wait for T2."
+    )
+
+
+@engagement_app.command("start")
+def start(
+    config: Path = typer.Option(
+        ...,
+        "--config",
+        "-c",
+        help="Path to the engagement YAML.",
+        exists=True,
+        readable=True,
+        resolve_path=True,
+    ),
+    apply: bool = typer.Option(
+        False,
+        "--apply",
+        help="Skip the interactive confirm-prompt on material Scope diffs.",
+    ),
+) -> None:
+    """Create or re-attach an engagement (idempotent per ADR-0019)."""
+
+    configure_logging()
+    bind_correlation(trace_id=new_trace_id(), span_id=new_span_id())
+    log.info("engagement.start.invoked", config_path=str(config), apply=apply)
+
+    state = _build_graph_state()
+    ledger = _default_ledger()
+    try:
+        result = load_engagement_from_yaml(
+            config,
+            state,
+            ledger,
+            apply=apply,
+            stdin=sys.stdin,
+            stdout=sys.stdout,
+        )
+    except EngagementMismatchError as exc:
+        typer.secho(f"engagement.id mismatch: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+    except ScopeChangeRequiresConfirmation as exc:
+        typer.secho(f"refused: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=3)
+
+    if result.created:
+        typer.echo(f"created engagement {result.engagement_id} (scope {result.scope_content_hash[:12]}...)")
+    elif result.noop:
+        typer.echo(f"noop: engagement {result.engagement_id} is unchanged")
+    elif result.cosmetic_only:
+        typer.echo(f"updated engagement {result.engagement_id} (cosmetic only)")
+    else:
+        typer.echo(
+            f"updated engagement {result.engagement_id} "
+            f"(material changes applied; scope {result.scope_content_hash[:12]}...)"
+        )
+
+
+@engagement_app.command("status")
+def status(
+    engagement_id: str = typer.Argument(..., help="Engagement id to read."),
+) -> None:
+    """Read-only: print Engagement properties + Scope content_hash."""
+
+    configure_logging()
+    bind_correlation(trace_id=new_trace_id(), span_id=new_span_id())
+
+    from doo.ids import EngagementId
+
+    state = _build_graph_state()
+    current = state.fetch_engagement_state(EngagementId(engagement_id))
+    if current is None:
+        typer.secho(f"engagement {engagement_id} not found", fg=typer.colors.YELLOW, err=True)
+        raise typer.Exit(code=1)
+    typer.echo(
+        f"engagement {current.engagement_id} ({current.engagement_name!r})\n"
+        f"  description: {current.engagement_description!r}\n"
+        f"  scope_content_hash: {current.scope_content_hash}\n"
+        f"  kill_switch.lease_ttl_seconds: {current.kill_switch_ttl_seconds}\n"
+        f"  kill_switch.refresh_interval_seconds: {current.kill_switch_refresh_seconds}"
+    )
+
+
+if __name__ == "__main__":
+    app()
