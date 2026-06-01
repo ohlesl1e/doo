@@ -12,13 +12,12 @@ from __future__ import annotations
 
 import io
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 import yaml
 
-from doo.ids import EngagementId, ScopeContentHash
+from doo.ids import EngagementId
 from doo.setup import (
     EngagementConfig,
     EngagementMismatchError,

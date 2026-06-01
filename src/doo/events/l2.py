@@ -20,7 +20,6 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from doo.canonical.value_objects import AuthContextCue, BlobRef, HostRef
 from doo.ids import (
     EngagementId,
-    EventId,
     L2EventId,
     ObservationId,
     Sha256Hex,

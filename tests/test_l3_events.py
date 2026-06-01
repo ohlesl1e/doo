@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 from pydantic import TypeAdapter, ValidationError
@@ -23,7 +23,7 @@ def _common() -> dict:
         trace_id="0" * 32,
         span_id="0" * 16,
         engagement_id="acme-2026",
-        emitted_at=datetime.now(timezone.utc),
+        emitted_at=datetime.now(UTC),
     )
 
 
@@ -111,7 +111,7 @@ def test_l3_event_rejects_bad_trace_id() -> None:
             trace_id="not-hex",
             span_id="0" * 16,
             engagement_id="e",
-            emitted_at=datetime.now(timezone.utc),
+            emitted_at=datetime.now(UTC),
             node_type="X",
             node_id="x",
             properties={},

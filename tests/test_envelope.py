@@ -7,7 +7,7 @@ span-id format enforcement.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 from pydantic import ValidationError
@@ -27,7 +27,7 @@ def _valid_kwargs() -> dict:
         blob_format="har-1.2",
         blob_sha256="a" * 64,
         idempotency_key="b" * 64,
-        received_at=datetime.now(timezone.utc),
+        received_at=datetime.now(UTC),
         producer_id="har-upload-cli",
         bytes_size=12345,
     )

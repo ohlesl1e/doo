@@ -11,7 +11,7 @@ See ARCHITECTURE.md "Layer contracts (L1 -> L2 -> L3)" and the grill-queue G2
 outputs.
 """
 
-from doo.events.envelope import IngestionEnvelope, SourceKind, SOURCE_KINDS
+from doo.events.envelope import SOURCE_KINDS, IngestionEnvelope, SourceKind
 from doo.events.l2 import (
     L2Event,
     L2EventBase,
@@ -30,8 +30,8 @@ from doo.events.l3 import (
     Reconciliation,
 )
 from doo.events.slice4 import (
-    DispatchStatus,
     DISPATCH_STATUSES,
+    DispatchStatus,
     ExecutedAsEdge,
     Finding,
     FindingCategory,

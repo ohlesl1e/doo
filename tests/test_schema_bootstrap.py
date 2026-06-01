@@ -13,8 +13,6 @@ import pytest
 
 from doo.ontology import (
     ENGAGEMENT_SCOPED_NODE_LABELS,
-    SHARED_NODE_LABELS,
-    SchemaStatement,
     apply_schema,
     schema_statements,
 )
@@ -95,7 +93,7 @@ def neo4j_session(neo4j_container) -> Iterator[object]:
 
     uri = neo4j_container.get_connection_url()
     driver = GraphDatabase.driver(
-        uri, auth=("neo4j", neo4j_container.NEO4J_ADMIN_PASSWORD)
+        uri, auth=(neo4j_container.username, neo4j_container.password)
     )
     try:
         with driver.session() as sess:

@@ -7,7 +7,7 @@ enforced on ResponseArtifact. HostRef canonicalisation enforced.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 from pydantic import TypeAdapter, ValidationError
@@ -34,8 +34,8 @@ def _base_l2_kwargs() -> dict:
         envelope_event_id=_envelope_id(),
         source="har",
         source_id="entry-0|2026-05-31T00:00:00Z",
-        ingested_at=datetime.now(timezone.utc),
-        observed_at=datetime.now(timezone.utc),
+        ingested_at=datetime.now(UTC),
+        observed_at=datetime.now(UTC),
         confidence=1.0,
     )
 
