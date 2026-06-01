@@ -1,10 +1,9 @@
-"""Typer CLI: `doo engagement start` / `doo engagement status`.
+"""Typer CLI: `doo engagement start` / `doo engagement status` / `... keepalive`.
 
-T1 ships only the engagement subcommand group; richer commands (ingest,
-keepalive, status of other slices) land in later tracers.
-
+T1 ships the engagement subcommand group (start/status); T7 adds `keepalive`.
 The CLI is a thin wrapper: it parses args, builds the right graph dependency,
-calls into `doo.setup.loader`, and prints results. No business logic here.
+calls into `doo.setup.loader` (or `doo.engagement.keepalive`), and prints
+results. No business logic here.
 """
 
 from __future__ import annotations
@@ -14,8 +13,9 @@ from pathlib import Path
 
 import typer
 
-from doo.observability.logging import bind_correlation, configure_logging, get_logger
+from doo.engagement.cli_keepalive import register_keepalive
 from doo.observability.ids import new_span_id, new_trace_id
+from doo.observability.logging import bind_correlation, configure_logging, get_logger
 from doo.setup import EngagementMismatchError, ScopeChangeRequiresConfirmation
 from doo.setup.loader import JsonFileLedger, load_engagement_from_yaml
 
@@ -136,6 +136,10 @@ def status(
         f"  kill_switch.lease_ttl_seconds: {current.kill_switch_ttl_seconds}\n"
         f"  kill_switch.refresh_interval_seconds: {current.kill_switch_refresh_seconds}"
     )
+
+
+# T7: register `doo engagement keepalive` (single line; keeps cli.py diff small).
+register_keepalive(engagement_app)
 
 
 if __name__ == "__main__":

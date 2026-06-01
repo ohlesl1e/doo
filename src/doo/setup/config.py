@@ -15,9 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Self
-
-from typing import Any
+from typing import Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -111,11 +109,16 @@ class KillSwitchConfig(BaseModel):
 
     Per ARCHITECTURE.md L5 the lease lives in Redis, keyed
     `engagement:{id}:lease`. TTL default 60s; refresh 30s. Production targets
-    drop both. T1 does not yet implement the keepalive process; it ships in T7.
+    drop both. T7 implements the keepalive process that refreshes it.
+
+    `backend` is a forward-compatible knob: the mechanism (Redis) is reversible
+    per ARCHITECTURE.md (file lock / etcd / watchdog all satisfy the trust
+    split). Slice 1 only implements `"redis"`.
     """
 
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
 
+    backend: Literal["redis"] = "redis"
     lease_ttl_seconds: int = Field(default=60, ge=5)
     refresh_interval_seconds: int = Field(default=30, ge=1)
 

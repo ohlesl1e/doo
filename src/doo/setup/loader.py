@@ -26,7 +26,7 @@ from __future__ import annotations
 import dataclasses
 import difflib
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, Any, Protocol
 
@@ -193,7 +193,7 @@ def _build_diff(
     engagement_id: EngagementId,
     current: CurrentEngagementState,
     desired_scope_view: dict[str, Any],
-    desired_kill_switch: dict[str, int],
+    desired_kill_switch: dict[str, Any],
     current_scope_view: dict[str, Any] | None,
 ) -> str:
     """Human-readable unified diff of the changes the loader would apply."""
@@ -289,11 +289,12 @@ def load_engagement(
     """
 
     if now is None:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
 
     scope_content_hash = compute_scope_content_hash(config.scope)
     desired_scope_view = _scope_view(config)
-    desired_kill_switch = {
+    desired_kill_switch: dict[str, Any] = {
+        "backend": config.kill_switch.backend,
         "lease_ttl_seconds": config.kill_switch.lease_ttl_seconds,
         "refresh_interval_seconds": config.kill_switch.refresh_interval_seconds,
     }
