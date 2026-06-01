@@ -53,6 +53,10 @@ _Avoid_: Asset (that is the inferred entity, not the raw observation), Leak.
 An inferred backend resource that is referenced but not yet directly addressable — a leaked bucket name, an internal hostname, a database identifier — treated as a testing lead. The inference layer; created by a promotion step that carries confidence.
 _Avoid_: ResponseArtifact (that is the raw observation), Lead, Resource.
 
+**ParseFailure**:
+A first-class observation that L2 could not turn a particular blob (or a particular entry within one) into a `RequestObservation` or `ResponseArtifact`. Carries provenance back to the originating L1 envelope, the error kind (`malformed_blob`, `schema_mismatch`, `missing_required_field`, `decode_error`), an error message, and a location hint. Becomes a node in the graph so audit can see what didn't make it through — failure is never silently dropped. Re-extraction with a fixed parser may supersede a `ParseFailure` (the new commit produces real observations; the prior `ParseFailure` is marked `status = "retracted"`).
+_Avoid_: error, dead-letter (those name infrastructure; `ParseFailure` is the domain term for "we observed an input we couldn't interpret").
+
 **ObservedValue**:
 A *promoted* value found in observations — an identifier, URL, email, hostname, JWT, or secret-shaped string — tracked as a node so cross-context matches ("this value leaked in a response also appears as a request input to another `Endpoint`") become a single graph traversal. Inference layer; evidenced by the `ResponseArtifact`s and `RequestObservation`s that contained the value. Only **promoted** values become nodes (shape match, multiplicity ≥2, or LLM proposal); junk strings stay inline on the originating observation. For `kind ∈ {token, secret}`, the node stores **`value_hash` + length + first-N chars only** — never the full value. The graph is not a credential store.
 _Avoid_: Token, Value (unqualified — those are the inline observations; `ObservedValue` is the promoted entity).
@@ -60,7 +64,7 @@ _Avoid_: Token, Value (unqualified — those are the inline observations; `Obser
 ### Identity & access
 
 **Principal**:
-An identity the tester controls or observes — "test user A," "admin account," "anonymous." The actor, not the credential.
+An identity the tester controls or observes — "test user A," "admin account," "anonymous." The actor, not the credential. **Declared** Principals (tester-controlled, set at engagement setup per ADR-0012) carry an explicit `tier = "declared"` flag and may carry a `known_signals` property — bootstrap identifiers the tester observed about their own account during warm-up (JWT `sub`, `/me` user-id, identifying headers, email) that feed the ADR-0010 reconciliation priority list. Discovered Principals carry `tier = "discovered"` and no `known_signals`.
 _Avoid_: User, Account, Identity.
 
 **AuthContext**:
@@ -89,7 +93,7 @@ A specific testing campaign within a `Scope` — its own kill-switch, budget, ti
 _Avoid_: Campaign, Run, Session.
 
 **Scope**:
-The boundary of an engagement — which `Host`s, methods, path patterns, payload classes, rate limits, and time windows are allowed. Rules live as properties on the Scope node and are the **single source of truth** from which OPA's `data` bundle is generated (ADR-0003, gap #1). An `Engagement` runs `UNDER_SCOPE` exactly one Scope.
+The boundary of an engagement — which `Host`s, methods, path patterns, payload classes, rate limits, and time windows are allowed. Rules live as properties on the Scope node and are the **single source of truth** from which OPA's `data` bundle is generated (ADR-0003, gap #1). An `Engagement` runs `UNDER_SCOPE` exactly one Scope. **Identity is the content hash of the rule document** (ADR-0017), so two engagements declaring identical rules collapse to one `Scope` node; this is the de-facto program-level abstraction (Acme's published rules are one `Scope` shared by multiple campaigns). **Evaluated at dispatch and at query-time only, never at intake** (ADR-0020) — passive observations of out-of-scope hosts are recorded with full provenance; the agent simply may not actively probe them.
 _Avoid_: Allowlist, Program, Boundary (those are subsets or sibling concepts).
 
 **Finding**:
@@ -103,6 +107,10 @@ _Avoid_: PayloadType, Category.
 **Payload**:
 The concrete input bytes sent in one TestCase — a property/reference on that test's execution (in object storage if large), always tagged with a PayloadClass. Not a shared, deduplicated graph node.
 _Avoid_: a node per payload string.
+
+**dispatch_status**:
+A low-cardinality enum carried on every `EXECUTED_AS` edge from a `TestCase` to a `RequestObservation`, recording whether the bytes that went out actually exercised the intended test path. Values: `ok` (request completed; response is genuine test evidence), `auth_invalid` (401/403/known-login-redirect under a non-anonymous AuthContext — the test did not really run), `rate_limited` (dispatcher's rate guard blocked send), `dispatcher_blocked` (OPA deny, kill-switch lease miss, or other guard), `transport_error` (network failure). Coverage queries (C1–C5) filter to `dispatch_status = "ok"` when computing "tested and clean" — a `TestCase` whose only executions are non-`ok` is treated as **untested**, not as a clean finding. Set by deterministic dispatcher code per ADR-0013, never by the Interpreter.
+_Avoid_: result, outcome (those names conflate the deterministic dispatch classification with the LLM-driven response interpretation).
 
 **normalization discrepancy**:
 A signal raised when two concrete paths that canonicalize to the same Endpoint return materially different responses — evidence of case/slash/encoding-sensitive backend handling, and a candidate auth-bypass or path-traversal bug.
@@ -163,6 +171,8 @@ An explicit edge from every inference to each observation that fed it. Makes lin
 
 ## Identity rules
 
+- **Engagement scoping (per ADR-0017).** Every observation- and inference-layer node carries `engagement_id` as the first component of its identity tuple, scoping it to one `Engagement`. The only nodes whose identity does *not* include `engagement_id` are `Engagement` itself and `Scope`. The identity tuples in the rest of this section show the engagement-independent portion; the full identity of each scoped node is `(engagement_id, ...stated tuple...)`.
+- **Scope identity** = `content_hash = sha256(canonicalized(rule_document))`. Two engagements declaring identical Scope rules collapse to one `Scope` node; `Scope` is reusable across `Engagement`s and is the de-facto "program-level" abstraction (the published bug-bounty rules shared by all campaigns against that program).
 - **Endpoint identity = `(method, host, path-template)`.** The query string is excluded — query inputs are `Parameter`s (location=query), not part of path identity.
 - **Canonicalization before templating:** strip trailing slash; lowercase host and drop default port (keep non-default); RFC 3986 percent-encoding normalization; **preserve path case**. The raw concrete path is always kept on the `RequestObservation`.
 - **Normalization discrepancy:** two raw paths that canonicalize to the same Endpoint but return materially different responses raise a discrepancy signal — they are not silently merged, because the difference may be a vulnerability.
@@ -172,7 +182,7 @@ An explicit edge from every inference to each observation that fed it. Makes lin
 - **TestCase identity** is content-addressed: `key_hash = sha256(canonicalized(engagement_id, test_class, target_endpoint_id?, target_parameter_id?, target_trust_boundary_id?, payload_class, payload_hash, auth_context_id))`, unique-indexed. The target is a **three-way XOR**: exactly one of `target_endpoint_id` (route-level test), `target_parameter_id` (parameter-level test; the Parameter node carries its Endpoint via `HAS_PARAMETER`), or `target_trust_boundary_id` (boundary test). The other two normalize to null and fall out of the hash. `payload_hash` is over the concrete bytes the dispatcher will send (sentinel `sha256("")` for no-payload tests; never SQL null). Engagement is part of the identity, so cross-Engagement re-runs are distinct nodes.
 - **Principal identity** is **two-tier and revisable** (ADR-0010). *Declared* Principals (the ones we control) carry a manual label set at engagement setup, with `source = "manual"`, `confidence = 1.0`. *Discovered* Principals (actors observed in passive traffic) are identified by the strongest available stable signal — in priority order: JWT `sub` claim, observed user-id from `/me`/`/whoami` responses, stable `X-User-*` header, email tied to the AuthContext, or a synthetic fallback (low confidence, flagged `unmerged`). Declared and discovered **reconcile via the same priority list** — no phantom twins. Merging two synthetics later proven the same is `OF_PRINCIPAL` edge re-pointing, not node surgery; the orphan is marked retracted, not deleted. **Anonymous is a singleton per `Engagement`** — one anonymous `AuthContext`, one anonymous `Principal`.
 - **AuthContext identity** = `auth_hash = sha256(token_kind || ":" || token_value)`, where `token_kind ∈ {bearer, cookie, api_key, basic_auth, anonymous}`. The raw `token_value` is **never persisted** to the graph — only the hash, parsed claims, observed capabilities, and validity window (same secrets-handling discipline as ADR-0009). Token rotation = new AuthContext, same Principal.
-- **Host identity** = `(canonical_hostname, port)`. Canonicalization: lowercase hostname, ToASCII for IDN, strip trailing dot, strip default port (`:443` https / `:80` http), keep non-default ports. IP literals stay distinct from hostnames.
+- **Host identity** = `(scheme, canonical_hostname, port)`. Canonicalization: lowercase hostname, ToASCII for IDN, strip trailing dot, strip default port (`:443` https / `:80` http), keep non-default ports. IP literals stay distinct from hostnames. **Host is engagement-scoped** (per ADR-0017): two engagements observing the same hostname produce two `Host` nodes, because discovery in one engagement does not flow into another.
 - **Tenant identity** = `(kind, normalized_value)` with `kind ∈ {org_id, workspace, account_namespace, subdomain, …}`. When two Tenants are later proven the same (alternate identifiers — URL position *and* JWT claim — pointing at one tenant), **merge via `OF_TENANT` edge re-pointing**; orphan marked retracted (same mechanic as Principal-merge).
 - **Asset identity** = `(kind, normalized_value)` with `kind ∈ {internal_hostname, bucket_name, database_id, signed_url, internal_path, …}`. Distinct from `ObservedValue` (they coexist by ADR-0011) and linked by an optional `SAME_VALUE_AS` edge when both nodes refer to the same string.
 
