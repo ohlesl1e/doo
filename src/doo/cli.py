@@ -13,6 +13,7 @@ from pathlib import Path
 
 import typer
 
+from doo.cli_worker import register_worker
 from doo.engagement.cli_keepalive import register_keepalive
 from doo.ingestion.cli_ingest import register_ingest
 from doo.observability.ids import new_span_id, new_trace_id
@@ -158,6 +159,8 @@ def status(
 register_keepalive(engagement_app)
 # T2: register `doo ingest har`.
 register_ingest(app)
+# Slice-1: register `doo worker run` (drives the L2 + L3 pipeline workers).
+register_worker(app)
 
 
 if __name__ == "__main__":
