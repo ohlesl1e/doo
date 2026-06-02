@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 import re
 from collections.abc import Iterator
@@ -33,6 +34,7 @@ from email.parser import BytesParser
 from email.policy import default as default_email_policy
 from typing import Protocol
 from urllib.parse import parse_qsl, urlsplit
+from uuid import UUID
 
 import jwt
 
@@ -45,14 +47,28 @@ from doo.canonical.identity import (
 from doo.canonical.value_objects import AuthContextCue, BlobRef, HostRef
 from doo.events.envelope import IngestionEnvelope
 from doo.events.l2 import (
+    ArtifactLocation,
     BodyParam,
     L2Event,
     Method,
     ObservedParameter,
     ParseFailure,
     RequestObservation,
+    ResponseArtifact,
 )
-from doo.ids import EngagementId, L2EventId, ObservationId, Sha256Hex, SourceId
+from doo.extraction.artifacts import (
+    Extraction,
+    extract_from_body,
+    extract_from_headers,
+)
+from doo.ids import (
+    EngagementId,
+    L2EventId,
+    ObservationId,
+    ResponseArtifactId,
+    Sha256Hex,
+    SourceId,
+)
 from doo.observability.ids import new_span_id
 
 
@@ -140,6 +156,35 @@ def _new_l2_event_id() -> L2EventId:
     return L2EventId(new_span_id() + new_span_id())  # 32 hex chars; per-emission id.
 
 
+def _new_uuid7() -> str:
+    """Generate an RFC 9562 UUIDv7 (time-ordered) as a canonical string.
+
+    A `ResponseArtifact`'s node identity is `(engagement_id, artifact_id)`; the
+    artifact_id is a per-emission UUID7 (random within the millisecond), so node
+    identity alone is NOT idempotent. Re-ingestion is collapsed earlier by the
+    ADR-0016 semantic key built from the deterministic `source_id` (see
+    `_response_artifact_source_id`), so this id never needs to be stable.
+    """
+
+    import os
+    import time
+
+    unix_ms = int(time.time() * 1000)
+    rand = os.urandom(10)
+    b = bytearray(16)
+    b[0] = (unix_ms >> 40) & 0xFF
+    b[1] = (unix_ms >> 32) & 0xFF
+    b[2] = (unix_ms >> 24) & 0xFF
+    b[3] = (unix_ms >> 16) & 0xFF
+    b[4] = (unix_ms >> 8) & 0xFF
+    b[5] = unix_ms & 0xFF
+    b[6] = 0x70 | (rand[0] & 0x0F)  # version 7
+    b[7] = rand[1]
+    b[8] = 0x80 | (rand[2] & 0x3F)  # variant 10
+    b[9:16] = rand[3:10]
+    return str(UUID(bytes=bytes(b)))
+
+
 def _parse_started_at(raw: str) -> datetime:
     """Parse a HAR `startedDateTime` (ISO-8601, possibly `Z`-suffixed)."""
 
@@ -187,7 +232,7 @@ def parse_har(
 
     entries = log["entries"]
     for index, entry in enumerate(entries):
-        yield _parse_entry(entry, index, envelope, ingested_at, body_uploader)
+        yield from _parse_entry(entry, index, envelope, ingested_at, body_uploader)
 
 
 def _parse_entry(
@@ -196,8 +241,13 @@ def _parse_entry(
     envelope: IngestionEnvelope,
     ingested_at: datetime,
     body_uploader: BodyUploader | None,
-) -> L2Event:
-    """Parse one HAR entry into a `RequestObservation` or a `ParseFailure`."""
+) -> Iterator[L2Event]:
+    """Parse one HAR entry into a `RequestObservation` (+ its `ResponseArtifact`s).
+
+    Yields the `RequestObservation` first, then one `ResponseArtifact` per
+    deterministic extractor hit over the response body + headers (T6). A
+    malformed entry yields a single `ParseFailure` instead.
+    """
 
     location_hint = f"log.entries[{index}]"
     try:
@@ -234,14 +284,14 @@ def _parse_entry(
         request_body_ref, request_body_params = _extract_request_body(
             request, envelope.engagement_id, body_uploader
         )
-        response_body_ref = _extract_response_body(
-            response, envelope.engagement_id, body_uploader
+        response_body_ref, response_body_bytes, response_content_type = (
+            _extract_response_body(response, envelope.engagement_id, body_uploader)
         )
 
         observation_id = ObservationId(
             f"{envelope.engagement_id}:{_SOURCE}:{source_id}"
         )
-        return RequestObservation(
+        yield RequestObservation(
             event_id=_new_l2_event_id(),
             trace_id=envelope.trace_id,
             span_id=new_span_id(),
@@ -257,7 +307,7 @@ def _parse_entry(
             host=host_ref,
             concrete_path=concrete_path,
             query_string=query_string,
-            # Slice-1: no parsed headers/cookies and no response artifacts (T6).
+            # Slice-1: no parsed request headers/cookies surfaced flat.
             headers=(),
             cookies=(),
             query_params=query_params,
@@ -271,8 +321,21 @@ def _parse_entry(
             response_size_bytes=response_size,
             duration_ms=None,
         )
+        # --- T6: response-artifact extraction pass (runs after body upload). ---
+        yield from _emit_response_artifacts(
+            response=response,
+            response_body_bytes=response_body_bytes,
+            response_content_type=response_content_type,
+            response_status=response_status,
+            envelope=envelope,
+            ingested_at=ingested_at,
+            observed_at=observed_at,
+            ro_source_id=source_id,
+            request_observation_id=observation_id,
+        )
+        return
     except _EntryError as err:
-        return _entry_parse_failure(
+        yield _entry_parse_failure(
             envelope,
             ingested_at,
             source_id=SourceId(f"{index}|<unparsed>"),
@@ -281,7 +344,7 @@ def _parse_entry(
             location_hint=location_hint,
         )
     except Exception as exc:  # noqa: BLE001 - any unexpected shape becomes a ParseFailure
-        return _entry_parse_failure(
+        yield _entry_parse_failure(
             envelope,
             ingested_at,
             source_id=SourceId(f"{index}|<unparsed>"),
@@ -621,24 +684,30 @@ def _extract_response_body(
     response: object,
     engagement_id: str,
     body_uploader: BodyUploader | None,
-) -> BlobRef | None:
-    """Upload a response body to object storage; return its `BlobRef` (or None).
+) -> tuple[BlobRef | None, bytes | None, str]:
+    """Upload a response body to object storage; return ref + decoded bytes + ctype.
 
     `response.content.encoding == "base64"` is decoded *before* upload so the
     stored bytes are raw and `BlobRef.sha256` is over the raw bytes (ADR-0015 /
-    acceptance criterion). No body -> `None` with no object created. Response body
-    *parameters* are not extracted in slice-1 (response-artifact extraction is T6).
+    acceptance criterion). No body -> `(None, None, default ctype)` with no object
+    created.
+
+    The decoded `raw` bytes + resolved `content_type` are returned alongside the
+    ref so the T6 response-artifact pass can extract over the same bytes that were
+    content-addressed — without re-reading the blob. When no `body_uploader` is
+    supplied (pure parser unit tests) the ref is `None` but the bytes are still
+    returned so artifact extraction is exercised independently of upload.
     """
 
     if not isinstance(response, dict):
-        return None
+        return None, None, _DEFAULT_CONTENT_TYPE
     content = response.get("content")
     if not isinstance(content, dict):
-        return None
+        return None, None, _DEFAULT_CONTENT_TYPE
 
     text = content.get("text")
     if not isinstance(text, str) or not text:
-        return None
+        return None, None, _DEFAULT_CONTENT_TYPE
 
     encoding = content.get("encoding")
     if isinstance(encoding, str) and encoding.lower() == "base64":
@@ -651,23 +720,167 @@ def _extract_response_body(
     else:
         raw = text.encode("utf-8")
 
-    if not raw:
-        return None
-
     headers = _header_map(response)
     fallback_mime = (
         content.get("mimeType") if isinstance(content.get("mimeType"), str) else None
     )
     content_type = _content_type_of(headers, fallback_mime)
 
+    if not raw:
+        return None, None, content_type
+
     if body_uploader is None:
-        return None
-    return body_uploader.put_body(
+        return None, raw, content_type
+    ref = body_uploader.put_body(
         EngagementId(engagement_id),
         raw=raw,
         content_type=content_type,
         encoding=_content_encoding(headers),
     )
+    return ref, raw, content_type
+
+
+# --------------------------------------------------------------------------- #
+# T6: response-artifact extraction pass.
+# --------------------------------------------------------------------------- #
+
+
+def _response_artifact_source_id(
+    ro_source_id: str, extraction: Extraction, value_key: str
+) -> SourceId:
+    """Deterministic `source_id` for a `ResponseArtifact` (ADR-0016 idempotency).
+
+    The artifact's node id is a random UUID7, so it cannot back idempotency on its
+    own. This source_id is fully determined by the parent RO's source_id, the
+    extractor's *versioned* name, the structural location, and the value (or its
+    hash for secrets) — so re-ingesting the identical response produces the same
+    semantic key (`commit:{eng}:response_artifact:har:{source_id}`) and the commit
+    `SETNX` collapses the re-delivery before a duplicate node is created.
+
+    `value_key` is the raw value for non-secret kinds, or the value_hash for
+    secret kinds — never the raw secret (ADR-0015): the key is secret-free.
+    """
+
+    loc = extraction
+    location_key = (
+        f"header:{loc.header_name}"
+        if loc.section == "header"
+        else f"body:{loc.json_pointer or ''}:{loc.byte_start}:{loc.byte_end}"
+    )
+    return SourceId(
+        f"{ro_source_id}|ra|{extraction.extractor}|{location_key}|{value_key}"
+    )
+
+
+def _build_response_artifact(
+    extraction: Extraction,
+    *,
+    envelope: IngestionEnvelope,
+    ingested_at: datetime,
+    observed_at: datetime,
+    ro_source_id: str,
+    request_observation_id: ObservationId,
+) -> ResponseArtifact:
+    """Turn one `Extraction` into a `ResponseArtifact` L2 event.
+
+    Secret-shape extractions (ADR-0015) carry only `value_hash` (sha256 of the raw
+    matched bytes), `value_length`, and a `value_preview` of the first 8 chars —
+    the raw value is dropped here and survives only in the uploaded response-body
+    blob.
+    """
+
+    location = ArtifactLocation(
+        section=extraction.section,
+        header_name=extraction.header_name,
+        json_pointer=extraction.json_pointer,
+        byte_offset_start=extraction.byte_start,
+        byte_offset_end=extraction.byte_end,
+    )
+
+    value: str | None
+    value_hash: Sha256Hex | None
+    value_length: int | None
+    value_preview: str | None
+    value_key: str
+    if extraction.is_secret:
+        raw = extraction.value.encode("utf-8")
+        value = None
+        value_hash = Sha256Hex(hashlib.sha256(raw).hexdigest())
+        value_length = len(raw)
+        value_preview = extraction.value[:8]
+        value_key = value_hash
+    else:
+        value = extraction.value
+        value_hash = None
+        value_length = None
+        value_preview = None
+        value_key = extraction.value
+
+    source_id = _response_artifact_source_id(ro_source_id, extraction, value_key)
+    return ResponseArtifact(
+        event_id=_new_l2_event_id(),
+        trace_id=envelope.trace_id,
+        span_id=new_span_id(),
+        engagement_id=envelope.engagement_id,
+        envelope_event_id=envelope.event_id,
+        source=_SOURCE,
+        source_id=source_id,
+        ingested_at=ingested_at,
+        observed_at=observed_at,
+        confidence=1.0,
+        artifact_id=ResponseArtifactId(_new_uuid7()),
+        request_observation_id=request_observation_id,
+        artifact_kind=extraction.artifact_kind,
+        location=location,
+        extractor=extraction.extractor,
+        value=value,
+        value_hash=value_hash,
+        value_length=value_length,
+        value_preview=value_preview,
+    )
+
+
+def _emit_response_artifacts(
+    *,
+    response: object,
+    response_body_bytes: bytes | None,
+    response_content_type: str,
+    response_status: int,
+    envelope: IngestionEnvelope,
+    ingested_at: datetime,
+    observed_at: datetime,
+    ro_source_id: str,
+    request_observation_id: ObservationId,
+) -> Iterator[ResponseArtifact]:
+    """Run the deterministic extractors over a response and yield `ResponseArtifact`s.
+
+    Body extractors run over the decoded response bytes; header extractors run
+    over the response headers. Each `Extraction` becomes one `ResponseArtifact`
+    carrying a deterministic, secret-free `source_id` (ADR-0016) and a UUID7
+    `artifact_id`.
+    """
+
+    extractions: list[Extraction] = []
+    if response_body_bytes is not None:
+        extractions.extend(
+            extract_from_body(
+                response_body_bytes,
+                content_type=response_content_type,
+                status=response_status,
+            )
+        )
+    if isinstance(response, dict):
+        extractions.extend(extract_from_headers(_header_map(response)))
+
+    for extraction in extractions:
+        yield _build_response_artifact(
+            extraction,
+            envelope=envelope,
+            ingested_at=ingested_at,
+            observed_at=observed_at,
+            ro_source_id=ro_source_id,
+            request_observation_id=request_observation_id,
+        )
 
 
 def _parse_body_params(

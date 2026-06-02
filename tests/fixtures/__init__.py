@@ -30,3 +30,12 @@ LITERAL_SIBLING_HAR = FIXTURES_DIR / "literal_sibling.har"
 # multipart upload (one text field + one skipped binary part), a base64 response
 # body, and a no-body entry. All on api.example.com (one Host).
 BODIES_HAR = FIXTURES_DIR / "bodies.har"
+
+# --- T6 response-artifact corpus ---
+# Five GETs whose responses exercise the extractor set:
+#   1. 500 HTML body with `internal-billing.corp.example` -> hostname + error_message.
+#   2. 200 JSON body with a JWT in `access_token` -> secret_shaped (hash+preview).
+#   3. 200 with `Server: nginx/1.21.6` header (empty JSON body) -> fingerprint.
+#   4. 200 text body with an internal URL -> url + hostname.
+#   5. 200 text body with an AWS access-key shape -> secret_shaped.
+RESPONSE_ARTIFACTS_HAR = FIXTURES_DIR / "response_artifacts.har"

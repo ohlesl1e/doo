@@ -14,6 +14,7 @@ from pydantic import TypeAdapter, ValidationError
 
 from doo.canonical.value_objects import AuthContextCue, BlobRef, HostRef
 from doo.events.l2 import (
+    ArtifactLocation,
     L2Event,
     ParseFailure,
     RequestObservation,
@@ -74,14 +75,20 @@ def test_request_observation_rejects_relative_path() -> None:
         RequestObservation(**bad)
 
 
+def _body_location() -> ArtifactLocation:
+    return ArtifactLocation(section="body", byte_offset_start=0, byte_offset_end=4)
+
+
 def test_response_artifact_secret_kind_forbids_raw_value() -> None:
     base = _base_l2_kwargs()
     with pytest.raises(ValidationError) as exc_info:
         ResponseArtifact(
             **base,
-            observation_id="ra-1",
+            artifact_id="018f-uuid7",
             request_observation_id="ro-1",
             artifact_kind="token",
+            location=_body_location(),
+            extractor="regex:jwt_v1",
             value="eyJraWQiOi...",  # raw value forbidden for secret kinds (ADR-0015)
         )
     assert "secret" in str(exc_info.value).lower() or "forbidden" in str(exc_info.value).lower()
@@ -92,9 +99,11 @@ def test_response_artifact_secret_kind_requires_hash() -> None:
     # Carrying hash+length is valid.
     ra = ResponseArtifact(
         **base,
-        observation_id="ra-1",
+        artifact_id="018f-uuid7",
         request_observation_id="ro-1",
         artifact_kind="token",
+        location=_body_location(),
+        extractor="regex:jwt_v1",
         value_hash="a" * 64,
         value_length=512,
         value_preview="eyJraWQi",
@@ -108,17 +117,21 @@ def test_response_artifact_non_secret_kind_requires_raw_value() -> None:
     with pytest.raises(ValidationError):
         ResponseArtifact(
             **base,
-            observation_id="ra-1",
+            artifact_id="018f-uuid7",
             request_observation_id="ro-1",
             artifact_kind="email",
+            location=_body_location(),
+            extractor="regex:email_v1",
             # value missing
         )
     # Non-secret kind with a value is fine.
     ra = ResponseArtifact(
         **base,
-        observation_id="ra-2",
+        artifact_id="018f-uuid7b",
         request_observation_id="ro-1",
         artifact_kind="email",
+        location=_body_location(),
+        extractor="regex:email_v1",
         value="alice@example.com",
     )
     assert ra.value == "alice@example.com"
@@ -129,12 +142,24 @@ def test_response_artifact_non_secret_kind_rejects_hash_fields() -> None:
     with pytest.raises(ValidationError):
         ResponseArtifact(
             **base,
-            observation_id="ra-1",
+            artifact_id="018f-uuid7",
             request_observation_id="ro-1",
             artifact_kind="email",
+            location=_body_location(),
+            extractor="regex:email_v1",
             value="alice@example.com",
             value_hash="a" * 64,
         )
+
+
+def test_artifact_location_header_forbids_body_offsets() -> None:
+    with pytest.raises(ValidationError):
+        ArtifactLocation(section="header", header_name="Server", byte_offset_start=0)
+
+
+def test_artifact_location_header_requires_name() -> None:
+    with pytest.raises(ValidationError):
+        ArtifactLocation(section="header")
 
 
 def test_parse_failure_constructs_with_required_fields() -> None:

@@ -27,8 +27,14 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Protocol
 
-from doo.events.l2 import L2Event, ParseFailure, RequestObservation
-from doo.events.l3 import L3Event, NodeCreated, NodeUpdated, PropertyChange
+from doo.events.l2 import L2Event, ParseFailure, RequestObservation, ResponseArtifact
+from doo.events.l3 import (
+    EdgeCreated,
+    L3Event,
+    NodeCreated,
+    NodeUpdated,
+    PropertyChange,
+)
 from doo.ids import CommitId, EngagementId
 from doo.infra.neo4j_driver import Neo4jClient
 from doo.infra.streams import L3_EVENTS_STREAM, StreamClient
@@ -37,6 +43,7 @@ from doo.observability.logging import bind_correlation, get_logger
 from doo.ontology.resolve import (
     commit_parse_failure,
     commit_request_observation,
+    commit_response_artifact,
     resolve_auth_context,
     resolve_host,
 )
@@ -147,10 +154,11 @@ class CommitOrchestrator:
 
         if isinstance(event, RequestObservation):
             result = self._commit_request_observation(event, commit_id, span_id)
+        elif isinstance(event, ResponseArtifact):
+            result = self._commit_response_artifact(event, commit_id, span_id)
         elif isinstance(event, ParseFailure):
             result = self._commit_parse_failure(event, commit_id, span_id)
-        else:
-            # ResponseArtifact arrives in T6; not produced by the slice-1 parser.
+        else:  # pragma: no cover - the union is exhaustive above
             log.warning("commit.unsupported_event_kind", kind=event.kind)
             return CommitResult(
                 commit_id=commit_id,
@@ -277,6 +285,44 @@ class CommitOrchestrator:
             )
         return tuple(events)
 
+    def _commit_response_artifact(
+        self, artifact: ResponseArtifact, commit_id: CommitId, span_id: str
+    ) -> CommitResult:
+        """Commit a `ResponseArtifact` node + its `YIELDED` edge from the parent RO.
+
+        Idempotency is already enforced upstream by the semantic-key `SETNX` in
+        `commit` (the artifact's deterministic `source_id`), so by the time we are
+        here this is a first-delivery commit. The MERGE in `commit_response_artifact`
+        is still identity-keyed for correctness under any unexpected replay.
+        """
+
+        commit_response_artifact(self._neo4j, artifact=artifact)
+        l3_events: tuple[L3Event, ...] = (
+            self._node_created(
+                "ResponseArtifact", str(artifact.artifact_id), artifact, commit_id, span_id
+            ),
+            EdgeCreated(
+                commit_id=commit_id,
+                trace_id=artifact.trace_id,
+                span_id=span_id,  # type: ignore[arg-type]
+                engagement_id=artifact.engagement_id,
+                emitted_at=datetime.now(UTC),
+                edge_type="YIELDED",
+                from_node=str(artifact.request_observation_id),
+                to_node=str(artifact.artifact_id),
+                properties={"engagement_id": artifact.engagement_id},
+            ),
+        )
+        return CommitResult(
+            commit_id=commit_id,
+            engagement_id=artifact.engagement_id,
+            event_kind=artifact.kind,
+            source_id=artifact.source_id,
+            idempotent_noop=False,
+            node_ids=(str(artifact.artifact_id),),
+            l3_events=l3_events,
+        )
+
     def _commit_parse_failure(
         self, pf: ParseFailure, commit_id: CommitId, span_id: str
     ) -> CommitResult:
@@ -300,7 +346,7 @@ class CommitOrchestrator:
     def _node_created(
         node_type: str,
         node_id: str,
-        event: RequestObservation | ParseFailure,
+        event: RequestObservation | ParseFailure | ResponseArtifact,
         commit_id: CommitId,
         span_id: str,
     ) -> NodeCreated:

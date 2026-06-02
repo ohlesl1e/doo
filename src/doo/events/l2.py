@@ -22,6 +22,7 @@ from doo.ids import (
     EngagementId,
     L2EventId,
     ObservationId,
+    ResponseArtifactId,
     Sha256Hex,
     SourceId,
     SpanId,
@@ -165,6 +166,7 @@ class RequestObservation(L2EventBase):
 
 ResponseArtifactKind = Literal[
     "identifier",
+    "ip_address",
     "url",
     "hostname",
     "email",
@@ -175,31 +177,100 @@ ResponseArtifactKind = Literal[
     "token",
 ]
 
+# Where in the response an artifact was found. `body` artifacts carry byte
+# offsets into the (decoded) response body; `header` artifacts carry the source
+# header name. The two are mutually exclusive — see `ArtifactLocation`.
+ArtifactSection = Literal["body", "header"]
+
+# Kinds whose raw value must never enter the graph (ADR-0015): only the
+# value_hash + value_length + value_preview are carried; the raw bytes live only
+# in the MinIO response-body blob.
+SECRET_ARTIFACT_KINDS: frozenset[str] = frozenset(("secret_shaped", "token"))
+
+
+class ArtifactLocation(BaseModel):
+    """Structured pointer to where a `ResponseArtifact` was extracted from.
+
+    `section = "header"` artifacts carry `header_name` (the source header).
+    `section = "body"` artifacts carry byte offsets into the *decoded* response
+    body and, for structured (JSON) bodies, an RFC 6901 `json_pointer` to the
+    leaf the value came from. Offsets are over the same raw bytes that were
+    content-addressed and uploaded to object storage (T5), so a consumer can
+    re-derive the exact substring from the blob without it ever being copied into
+    a graph property for secret kinds (ADR-0015).
+    """
+
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    section: ArtifactSection
+    header_name: str | None = None
+    json_pointer: str | None = None
+    byte_offset_start: int | None = Field(default=None, ge=0)
+    byte_offset_end: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def _section_shape(self) -> Self:
+        if self.section == "header":
+            if not self.header_name:
+                raise ValueError("header artifacts must carry a header_name")
+            if (
+                self.json_pointer is not None
+                or self.byte_offset_start is not None
+                or self.byte_offset_end is not None
+            ):
+                raise ValueError("header artifacts must not carry body offsets / json_pointer")
+        else:  # body
+            if self.header_name is not None:
+                raise ValueError("body artifacts must not carry a header_name")
+            if (
+                self.byte_offset_start is not None
+                and self.byte_offset_end is not None
+                and self.byte_offset_end < self.byte_offset_start
+            ):
+                raise ValueError("byte_offset_end must be >= byte_offset_start")
+        return self
+
 
 class ResponseArtifact(L2EventBase):
-    """One discrete thing extracted from a response.
+    """One discrete thing extracted deterministically from a response (T6).
+
+    The artifact's node identity is `(engagement_id, artifact_id)` with
+    `artifact_id` a UUID7. Node identity is therefore *not* idempotent on its own
+    — re-ingestion must be collapsed by the ADR-0016 semantic key, which is built
+    from the deterministic `source_id` the extractor stamps (derived from the
+    parent RO's source_id + extractor + location + value/value_hash). So a
+    re-delivered identical artifact short-circuits at the commit `SETNX` before
+    the random `artifact_id` node is ever written.
+
+    `request_observation_id` back-references the parent `RequestObservation`; the
+    L3 commit draws a `YIELDED` edge RO -> ResponseArtifact carrying
+    `engagement_id`.
 
     Per ADR-0015: for `secret_shaped` / `token` kinds, only `value_hash`,
-    `value_length`, `value_preview` are carried. For other kinds, the raw
-    substring is carried in `value`. Both populated is invalid.
+    `value_length`, `value_preview` (first 8 chars) are carried. For other kinds,
+    the raw substring is carried in `value`. Both populated is invalid.
     """
 
     kind: Literal["response_artifact"] = "response_artifact"
-    observation_id: ObservationId
+    artifact_id: ResponseArtifactId
     request_observation_id: ObservationId
     artifact_kind: ResponseArtifactKind
+    location: ArtifactLocation
+    # Versioned rule name, per CONTEXT.md (`regex:internal_hostname_v1`,
+    # `json-walk:id-fields_v1`). A rule change bumps the version suffix and is an
+    # independent extractor; it does not retract or re-mean prior artifacts.
+    extractor: str = Field(min_length=1)
     # Non-secret kinds: raw value lives here.
     value: str | None = None
     # Secret-shaped kinds: hashed shape only (ADR-0015).
     value_hash: Sha256Hex | None = None
     value_length: int | None = Field(default=None, ge=0)
     value_preview: str | None = None
-    location_hint: str | None = None
 
     @model_validator(mode="after")
     def _secret_discipline(self) -> Self:
         _check_trace_span(self.trace_id, self.span_id)
-        is_secret_kind = self.artifact_kind in ("secret_shaped", "token")
+        is_secret_kind = self.artifact_kind in SECRET_ARTIFACT_KINDS
         if is_secret_kind:
             if self.value is not None:
                 raise ValueError(

@@ -111,7 +111,7 @@ def schema_statements() -> tuple[SchemaStatement, ...]:
     scoped_identity: dict[str, tuple[str, ...]] = {
         # Observation layer.
         "RequestObservation": ("engagement_id", "observation_id"),
-        "ResponseArtifact": ("engagement_id", "observation_id"),
+        "ResponseArtifact": ("engagement_id", "artifact_id"),
         "ParseFailure": ("engagement_id", "observation_id"),
         # Inference layer.
         "Endpoint": ("engagement_id", "method", "host_id", "path_template"),

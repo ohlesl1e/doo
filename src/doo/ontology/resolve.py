@@ -38,13 +38,14 @@ from doo.canonical.identity import (
     principal_id,
 )
 from doo.canonical.value_objects import AuthContextCue, HostRef
-from doo.events.l2 import ParseFailure, RequestObservation
+from doo.events.l2 import ParseFailure, RequestObservation, ResponseArtifact
 from doo.ids import (
     AuthContextId,
     EngagementId,
     HostId,
     ObservationId,
     PrincipalId,
+    ResponseArtifactId,
     Sha256Hex,
 )
 from doo.infra.neo4j_driver import Neo4jClient
@@ -618,6 +619,81 @@ def commit_request_observation(
         props=props,
     )
     return obs.observation_id
+
+
+def commit_response_artifact(
+    client: Neo4jClient, *, artifact: ResponseArtifact
+) -> ResponseArtifactId:
+    """MERGE the `ResponseArtifact` node + its `YIELDED` edge from the parent RO (T6).
+
+    Identity is `(engagement_id, artifact_id)` with `artifact_id` a UUID7. Node
+    identity alone is *not* idempotent (the UUID7 is random); re-ingestion is
+    collapsed upstream by the ADR-0016 semantic key built from the artifact's
+    deterministic `source_id`, so a re-delivered identical artifact never reaches
+    this write. The MERGE is still on the full identity tuple for correctness.
+
+    The `YIELDED` edge points RO -> ResponseArtifact and carries `engagement_id`
+    on both endpoints and on the edge, so a consumer can confirm the artifact and
+    its parent share an engagement (ADR-0017). The structured `location` is stored
+    flat (`location_section`, `location_header_name`, `location_json_pointer`,
+    byte offsets) since Neo4j has no struct type.
+
+    Secret discipline (ADR-0015): for secret kinds, only `value_hash`,
+    `value_length`, `value_preview` are set; `value` is null. The raw secret never
+    becomes a node property — it lives only in the response-body blob.
+    """
+
+    props = cross_cutting(
+        source=artifact.source,
+        source_id=artifact.source_id,
+        observed_at=artifact.observed_at,
+        ingested_at=artifact.ingested_at,
+        confidence=artifact.confidence,
+    )
+    loc = artifact.location
+    client.execute_write(
+        """
+        MATCH (r:RequestObservation {engagement_id: $engagement_id,
+                                     observation_id: $request_observation_id})
+        MERGE (a:ResponseArtifact {engagement_id: $engagement_id,
+                                   artifact_id: $artifact_id})
+        ON CREATE SET a.id = $artifact_id,
+                      a.request_observation_id = $request_observation_id,
+                      a.artifact_kind = $artifact_kind,
+                      a.extractor = $extractor,
+                      a.location_section = $location_section,
+                      a.location_header_name = $location_header_name,
+                      a.location_json_pointer = $location_json_pointer,
+                      a.byte_offset_start = $byte_offset_start,
+                      a.byte_offset_end = $byte_offset_end,
+                      a.value = $value,
+                      a.value_hash = $value_hash,
+                      a.value_length = $value_length,
+                      a.value_preview = $value_preview,
+                      a.envelope_event_id = $envelope_event_id,
+                      a += $props
+        ON MATCH SET a.last_seen = $props.last_seen
+        MERGE (r)-[y:YIELDED]->(a)
+        ON CREATE SET y.engagement_id = $engagement_id
+        """,
+        engagement_id=artifact.engagement_id,
+        artifact_id=artifact.artifact_id,
+        request_observation_id=artifact.request_observation_id,
+        artifact_kind=artifact.artifact_kind,
+        extractor=artifact.extractor,
+        location_section=loc.section,
+        location_header_name=loc.header_name,
+        location_json_pointer=loc.json_pointer,
+        byte_offset_start=loc.byte_offset_start,
+        byte_offset_end=loc.byte_offset_end,
+        value=artifact.value,
+        value_hash=artifact.value_hash,
+        value_length=artifact.value_length,
+        value_preview=artifact.value_preview,
+        envelope_event_id=str(artifact.envelope_event_id),
+        props=props,
+    )
+    return artifact.artifact_id
 
 
 def commit_parse_failure(client: Neo4jClient, *, pf: ParseFailure) -> ObservationId:
