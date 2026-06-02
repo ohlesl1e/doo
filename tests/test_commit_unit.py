@@ -26,11 +26,36 @@ SPAN = "b" * 16
 
 
 class _FakeNeo4j:
+    """In-memory fake: records writes and answers the cohort/endpoint reads the
+    re-templating pass issues, so the orchestration logic is testable without
+    docker. The live re-templating SQL is exercised by the E2E integration test.
+    """
+
     def __init__(self) -> None:
         self.writes: list[str] = []
+        # The single committed observation, surfaced back to the cohort read.
+        self._cohort: list[dict[str, object]] = []
 
     def execute_write(self, cypher: str, **params: object) -> list[dict[str, object]]:
         self.writes.append(cypher)
+        # When the RO node is committed, remember it so the cohort read returns it.
+        if "MERGE (r:RequestObservation" in cypher:
+            self._cohort.append(
+                {
+                    "id": params["observation_id"],
+                    "path": params["concrete_path"],
+                    "qnames": params.get("query_param_names") or [],
+                }
+            )
+        return []
+
+    def execute_read(self, cypher: str, **params: object) -> list[dict[str, object]]:
+        if "MATCH (r:RequestObservation" in cypher:
+            return list(self._cohort)
+        if "MATCH (e:Endpoint" in cypher and "RETURN e.id AS id" in cypher:
+            return []  # no pre-existing endpoints in the fake
+        if "OPTIONAL MATCH (:RequestObservation)-[hit:HIT]" in cypher:
+            return [{"hits": 0}]
         return []
 
 

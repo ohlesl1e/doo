@@ -52,7 +52,26 @@ class _Streams:
 
 
 class _Neo4j:
+    def __init__(self) -> None:
+        self._cohort: list[dict[str, object]] = []
+
     def execute_write(self, cypher: str, **params: object) -> list[dict[str, object]]:
+        if "MERGE (r:RequestObservation" in cypher:
+            self._cohort.append(
+                {
+                    "id": params["observation_id"],
+                    "path": params["concrete_path"],
+                    "qnames": params.get("query_param_names") or [],
+                }
+            )
+        return []
+
+    def execute_read(self, cypher: str, **params: object) -> list[dict[str, object]]:
+        # Answer the re-templating cohort/endpoint/HIT reads (no real graph here).
+        if "MATCH (r:RequestObservation" in cypher:
+            return list(self._cohort)
+        if "OPTIONAL MATCH (:RequestObservation)-[hit:HIT]" in cypher:
+            return [{"hits": 0}]
         return []
 
 

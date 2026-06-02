@@ -15,3 +15,12 @@ MIXED_HAR = FIXTURES_DIR / "mixed_one_malformed.har"
 ALL_MALFORMED_HAR = FIXTURES_DIR / "all_malformed.har"
 # Not even valid JSON.
 NOT_JSON_HAR = FIXTURES_DIR / "not_json.har"
+
+# --- T3 path-templating corpus ---
+# /users/42, /users/87, /users/123 -> one Endpoint /users/{user_id}.
+USERS_TEMPLATING_HAR = FIXTURES_DIR / "users_templating.har"
+# /v1/orgs/abc-123/projects + /v2/orgs/def-456/projects -> two Endpoints,
+# version segment stays literal under multiplicity.
+VERSION_TEMPLATING_HAR = FIXTURES_DIR / "version_templating.har"
+# /users/42, /users/87, /users/settings -> /users/{user_id} + literal /users/settings.
+LITERAL_SIBLING_HAR = FIXTURES_DIR / "literal_sibling.har"

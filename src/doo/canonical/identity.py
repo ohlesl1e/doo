@@ -12,9 +12,9 @@ What lives here:
   IP literals distinct from hostnames.
 - `canonicalize_path(path)` -> the canonical concrete path: strip trailing slash
   (except root), RFC-3986 percent-encoding normalisation, **preserve path case**.
-  The raw concrete path is still what gets stored on the RequestObservation; this
-  is the value Endpoint identity is composed from (templating arrives in T3, so
-  for now the concrete path *is* the `path_template`).
+  The raw concrete path is still what gets stored on the RequestObservation; the
+  canonical concrete path is what templating (T3, `canonical/templating.py`)
+  runs over to infer an Endpoint's `path_template`.
 - `compute_auth_hash(token_kind, token_value)` -> `auth_hash` per CONTEXT.md
   AuthContext identity = `sha256(token_kind || ":" || token_value)`. The
   anonymous singleton uses a fixed sentinel token value.
@@ -37,6 +37,7 @@ from doo.ids import (
     AuthContextId,
     EngagementId,
     HostId,
+    ParameterId,
     PrincipalId,
     Sha256Hex,
     SourceId,
@@ -198,6 +199,19 @@ def endpoint_id(
     """Stable `Endpoint` node id over `(engagement_id, method, host_id, path_template)`."""
 
     return _hash_tuple(engagement_id, method.upper(), host_node_id, path_template)
+
+
+def parameter_id(
+    engagement_id: EngagementId, endpoint_node_id: str, location: str, name: str
+) -> ParameterId:
+    """Stable `Parameter` node id over `(engagement_id, endpoint_id, location, name)`.
+
+    Matches the `Parameter` uniqueness constraint in `ontology/schema.py`. A
+    Parameter is an emergent L3 aggregate keyed to one Endpoint, so the
+    Endpoint's node id is part of its identity (CONTEXT.md / ADR-0017).
+    """
+
+    return ParameterId(_hash_tuple(engagement_id, endpoint_node_id, location, name))
 
 
 def auth_context_id(engagement_id: EngagementId, auth_hash: Sha256Hex) -> AuthContextId:

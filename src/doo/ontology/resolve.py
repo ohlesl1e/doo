@@ -6,13 +6,11 @@ single `RequestObservation` implies, all engagement-scoped per ADR-0017:
 - `resolve_host` — Host identity `(engagement_id, scheme, canonical_hostname,
   port)`; engagement-scoped (two engagements observing the same hostname get two
   Host nodes).
-- `resolve_endpoint` — Endpoint identity `(engagement_id, method, host_id,
-  path_template)`; slice-1 uses the **concrete path as path_template**
-  (templating arrives in T3).
 - `resolve_auth_context` — anonymous singleton only: exactly one anonymous
   AuthContext + one anonymous Principal per engagement (CONTEXT.md / ADR-0010).
-- `commit_request_observation` — the RequestObservation node plus its structural
-  edges (`HIT` to Endpoint, `OBSERVED_UNDER` to AuthContext, `ON_HOST` to Host).
+- `commit_request_observation` — the RequestObservation node plus its non-`HIT`
+  structural edges (`OBSERVED_UNDER` to AuthContext, `ON_HOST` to Host). The
+  revisable `HIT` -> Endpoint grouping is owned by `ontology/templating.py`.
 - `commit_parse_failure` — the ParseFailure node with a back-ref edge to the
   envelope (recorded as a property; the envelope is an L1 artifact, not a graph
   node, so the back-ref is `envelope_event_id`).
@@ -34,7 +32,6 @@ from doo.canonical.identity import (
     anonymous_principal_identity_key,
     auth_context_id,
     compute_anonymous_auth_hash,
-    endpoint_id,
     host_id,
     principal_id,
 )
@@ -54,19 +51,25 @@ from doo.infra.neo4j_driver import Neo4jClient
 # nodes (Endpoint) created deterministically carry `deterministic-templating`.
 
 
-def _cross_cutting(
-    *, source: str, source_id: str | None, observed_at: datetime, ingested_at: datetime
+def cross_cutting(
+    *,
+    source: str,
+    source_id: str | None,
+    observed_at: datetime,
+    ingested_at: datetime,
+    confidence: float = 1.0,
 ) -> dict[str, object]:
     """The seven ADR-0005 fields + status, as a Cypher params dict.
 
     `first_seen`/`last_seen` are the event time (`observed_at`); `ingested_at` is
-    transaction time. Confidence is 1.0 for clean deterministic facts.
+    transaction time. Confidence is 1.0 for clean deterministic facts; the
+    templating pass passes a lower value for cold-start inferences.
     """
 
     return {
         "source": source,
         "source_id": source_id,
-        "confidence": 1.0,
+        "confidence": confidence,
         "confidence_method": "heuristic",
         "first_seen": observed_at,
         "last_seen": observed_at,
@@ -94,7 +97,7 @@ def resolve_host(
     """MERGE the engagement-scoped `Host` node; return its id (ADR-0017)."""
 
     node_id = host_id(engagement_id, host)
-    props = _cross_cutting(
+    props = cross_cutting(
         source="har", source_id=None, observed_at=observed_at, ingested_at=ingested_at
     )
     # MERGE on the deterministic `id` (a hash of the full identity tuple) rather
@@ -120,49 +123,6 @@ def resolve_host(
     return node_id
 
 
-def resolve_endpoint(
-    client: Neo4jClient,
-    *,
-    engagement_id: EngagementId,
-    method: str,
-    host_node_id: HostId,
-    path_template: str,
-    observed_at: datetime,
-    ingested_at: datetime,
-) -> str:
-    """MERGE the `Endpoint` node (concrete path AS path_template for slice-1).
-
-    Templating (T3) will later revise `path_template`; until then the concrete
-    path is the template, which is a legitimate single-observation inference.
-    """
-
-    node_id = endpoint_id(engagement_id, method, host_node_id, path_template)
-    props = _cross_cutting(
-        source="deterministic-templating",
-        source_id=None,
-        observed_at=observed_at,
-        ingested_at=ingested_at,
-    )
-    client.execute_write(
-        """
-        MERGE (e:Endpoint {engagement_id: $engagement_id, method: $method,
-                           host_id: $host_id, path_template: $path_template})
-        ON CREATE SET e.id = $id, e += $props
-        ON MATCH SET e.last_seen = $props.last_seen
-        WITH e
-        MATCH (h:Host {engagement_id: $engagement_id, id: $host_id})
-        MERGE (e)-[:ON_HOST]->(h)
-        """,
-        engagement_id=engagement_id,
-        method=method.upper(),
-        host_id=host_node_id,
-        path_template=path_template,
-        id=node_id,
-        props=props,
-    )
-    return node_id
-
-
 def resolve_auth_context(
     client: Neo4jClient,
     *,
@@ -182,10 +142,10 @@ def resolve_auth_context(
     p_key = anonymous_principal_identity_key()
     p_id = principal_id(engagement_id, p_key)
 
-    ac_props = _cross_cutting(
+    ac_props = cross_cutting(
         source="har", source_id=None, observed_at=observed_at, ingested_at=ingested_at
     )
-    p_props = _cross_cutting(
+    p_props = cross_cutting(
         source="har", source_id=None, observed_at=observed_at, ingested_at=ingested_at
     )
     client.execute_write(
@@ -217,37 +177,44 @@ def commit_request_observation(
     *,
     obs: RequestObservation,
     host_node_id: HostId,
-    endpoint_node_id: str,
     auth_context_node_id: AuthContextId,
 ) -> ObservationId:
-    """MERGE the `RequestObservation` node and its structural edges.
+    """MERGE the `RequestObservation` node and its non-`HIT` structural edges.
 
-    Edges: `HIT` -> Endpoint (the revisable grouping), `OBSERVED_UNDER` ->
-    AuthContext, `ON_HOST` -> Host. Identity `(engagement_id, observation_id)`,
-    so re-delivery converges.
+    Edges created here: `OBSERVED_UNDER` -> AuthContext, `ON_HOST` -> Host.
+    Identity `(engagement_id, observation_id)`, so re-delivery converges.
+
+    The `HIT` -> Endpoint edge is **not** created here. `HIT` is the revisable
+    grouping inference (ADR-0004); it is owned by the re-templating pass
+    (`ontology/templating.py`) which decides the path-template over the whole
+    `(method, host)` cohort and re-groups `HIT` edges as evidence accumulates.
+
+    The observed query-parameter names are stored on the node (`query_param_names`)
+    so the L3 Parameter-aggregation pass can roll them up without re-reading the
+    object store; path-position Parameters come from templating.
     """
 
-    props = _cross_cutting(
+    props = cross_cutting(
         source=obs.source,
         source_id=obs.source_id,
         observed_at=obs.observed_at,
         ingested_at=obs.ingested_at,
     )
+    query_param_names = [p.name for p in obs.query_params]
     client.execute_write(
         """
         MERGE (r:RequestObservation {engagement_id: $engagement_id,
                                      observation_id: $observation_id})
         ON CREATE SET r.id = $observation_id, r.method = $method,
                       r.concrete_path = $concrete_path, r.query_string = $query_string,
+                      r.query_param_names = $query_param_names,
                       r.response_status = $response_status,
                       r.envelope_event_id = $envelope_event_id,
                       r += $props
         ON MATCH SET r.last_seen = $props.last_seen
         WITH r
-        MATCH (e:Endpoint {engagement_id: $engagement_id, id: $endpoint_id})
         MATCH (h:Host {engagement_id: $engagement_id, id: $host_id})
         MATCH (ac:AuthContext {engagement_id: $engagement_id, id: $auth_context_id})
-        MERGE (r)-[:HIT]->(e)
         MERGE (r)-[:ON_HOST]->(h)
         MERGE (r)-[:OBSERVED_UNDER]->(ac)
         """,
@@ -256,9 +223,9 @@ def commit_request_observation(
         method=obs.method,
         concrete_path=obs.concrete_path,
         query_string=obs.query_string,
+        query_param_names=query_param_names,
         response_status=obs.response_status,
         envelope_event_id=str(obs.envelope_event_id),
-        endpoint_id=endpoint_node_id,
         host_id=host_node_id,
         auth_context_id=auth_context_node_id,
         props=props,
@@ -274,7 +241,7 @@ def commit_parse_failure(client: Neo4jClient, *, pf: ParseFailure) -> Observatio
     `(engagement_id, observation_id)`.
     """
 
-    props = _cross_cutting(
+    props = cross_cutting(
         source=pf.source,
         source_id=pf.source_id,
         observed_at=pf.observed_at,

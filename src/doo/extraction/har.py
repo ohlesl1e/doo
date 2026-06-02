@@ -19,12 +19,18 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator
 from datetime import UTC, datetime
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 from doo.canonical.identity import canonicalize_host, canonicalize_path, derive_har_source_id
 from doo.canonical.value_objects import AuthContextCue, HostRef
 from doo.events.envelope import IngestionEnvelope
-from doo.events.l2 import L2Event, Method, ParseFailure, RequestObservation
+from doo.events.l2 import (
+    L2Event,
+    Method,
+    ObservedParameter,
+    ParseFailure,
+    RequestObservation,
+)
 from doo.ids import L2EventId, ObservationId, SourceId
 from doo.observability.ids import new_span_id
 
@@ -121,6 +127,7 @@ def _parse_entry(
             raise _EntryError("missing_required_field", "request missing `url`")
 
         host_ref, concrete_path, query_string = _split_url(url)
+        query_params = _query_parameters(request, query_string)
 
         response = entry.get("response")
         response_status, response_size = _response_shape(response)
@@ -147,7 +154,7 @@ def _parse_entry(
             # Slice-1: no body / no parsed inputs / no response artifacts.
             headers=(),
             cookies=(),
-            query_params=(),
+            query_params=query_params,
             body_params=(),
             request_body_ref=None,
             auth_context_cue=AuthContextCue(is_anonymous=True),
@@ -188,6 +195,50 @@ def _split_url(url: str) -> tuple[HostRef, str, str | None]:
     concrete_path = canonicalize_path(raw_path)
     query_string = parts.query if parts.query else None
     return host_ref, concrete_path, query_string
+
+
+def _query_parameters(
+    request: dict[str, object], query_string: str | None
+) -> tuple[ObservedParameter, ...]:
+    """Extract query `ObservedParameter`s from a HAR request.
+
+    Prefers HAR's structured `request.queryString` array (`[{name, value}]`);
+    falls back to parsing the raw query string when the array is absent. Each
+    becomes a flat `ObservedParameter(location="query")` — L3 aggregates these
+    into `Parameter` nodes over many observations (the emergent-aggregate model
+    in `events/l2.py`). Slice-1 does not scrub query values (no secrets policy
+    applies to query inputs here; ADR-0015 governs response artifacts).
+    """
+
+    out: list[ObservedParameter] = []
+    raw = request.get("queryString")
+    if isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            value = item.get("value")
+            out.append(
+                ObservedParameter(
+                    name=name,
+                    location="query",
+                    value=value if isinstance(value, str) else None,
+                )
+            )
+        if out:
+            # A populated structured array is authoritative.
+            return tuple(out)
+
+    # No (or empty) structured array: fall back to parsing the raw query string.
+    # Some exporters emit `queryString: []` even for a query URL, so the raw
+    # string is the more reliable source when the array is empty.
+    if query_string:
+        for name, value in parse_qsl(query_string, keep_blank_values=True):
+            if name:
+                out.append(ObservedParameter(name=name, location="query", value=value or None))
+    return tuple(out)
 
 
 def _response_shape(response: object) -> tuple[int, int]:

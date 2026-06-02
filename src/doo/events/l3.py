@@ -48,10 +48,16 @@ class NodeCreated(_L3EventBase):
     properties: dict[str, Any]
 
 
-class _PropertyChange(BaseModel):
+class PropertyChange(BaseModel):
+    """An old/new value pair for one changed property on a `NodeUpdated`."""
+
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
     old: Any
     new: Any
+
+
+# Backwards-compatible alias (the type was originally underscore-private).
+_PropertyChange = PropertyChange
 
 
 class NodeUpdated(_L3EventBase):
@@ -61,7 +67,7 @@ class NodeUpdated(_L3EventBase):
     node_type: str = Field(min_length=1)
     node_id: str = Field(min_length=1)
     # Property name -> {old, new}.
-    changed_properties: dict[str, _PropertyChange]
+    changed_properties: dict[str, PropertyChange]
 
 
 class EdgeCreated(_L3EventBase):

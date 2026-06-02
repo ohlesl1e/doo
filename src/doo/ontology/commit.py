@@ -28,7 +28,7 @@ from datetime import UTC, datetime
 from typing import Protocol
 
 from doo.events.l2 import L2Event, ParseFailure, RequestObservation
-from doo.events.l3 import L3Event, NodeCreated
+from doo.events.l3 import L3Event, NodeCreated, NodeUpdated, PropertyChange
 from doo.ids import CommitId, EngagementId
 from doo.infra.neo4j_driver import Neo4jClient
 from doo.infra.streams import L3_EVENTS_STREAM, StreamClient
@@ -38,9 +38,9 @@ from doo.ontology.resolve import (
     commit_parse_failure,
     commit_request_observation,
     resolve_auth_context,
-    resolve_endpoint,
     resolve_host,
 )
+from doo.ontology.templating import RetemplateResult, retemplate_cohort
 
 log = get_logger(__name__)
 
@@ -180,39 +180,42 @@ class CommitOrchestrator:
             observed_at=obs.observed_at,
             ingested_at=obs.ingested_at,
         )
-        # Slice-1: concrete path AS path_template (templating arrives in T3).
-        endpoint_node_id = resolve_endpoint(
-            self._neo4j,
-            engagement_id=obs.engagement_id,
-            method=obs.method,
-            host_node_id=host_node_id,
-            path_template=obs.concrete_path,
-            observed_at=obs.observed_at,
-            ingested_at=obs.ingested_at,
-        )
         anon = resolve_auth_context(
             self._neo4j,
             engagement_id=obs.engagement_id,
             observed_at=obs.observed_at,
             ingested_at=obs.ingested_at,
         )
+        # Commit the observation node + its non-HIT edges first, so the
+        # re-templating pass sees it in the cohort it reads back.
         commit_request_observation(
             self._neo4j,
             obs=obs,
             host_node_id=host_node_id,
-            endpoint_node_id=endpoint_node_id,
             auth_context_node_id=anon.auth_context_id,
         )
-        node_ids = (
+        # Endpoint identity is a revisable inference (ADR-0004): re-template the
+        # whole (method, host) cohort, which owns Endpoint creation, HIT
+        # re-grouping, and Parameter aggregation.
+        retemplate = retemplate_cohort(
+            self._neo4j,
+            engagement_id=obs.engagement_id,
+            method=obs.method,
+            host_node_id=host_node_id,
+            observed_at=obs.observed_at,
+            ingested_at=obs.ingested_at,
+            primary_concrete_path=obs.concrete_path,
+        )
+
+        base_node_ids = (
             host_node_id,
-            endpoint_node_id,
             str(anon.auth_context_id),
             str(anon.principal_id),
             str(obs.observation_id),
         )
+        node_ids = base_node_ids + retemplate.endpoint_ids + retemplate.parameter_ids
         l3_events = (
             self._node_created("Host", host_node_id, obs, commit_id, span_id),
-            self._node_created("Endpoint", endpoint_node_id, obs, commit_id, span_id),
             self._node_created(
                 "AuthContext", str(anon.auth_context_id), obs, commit_id, span_id
             ),
@@ -222,7 +225,7 @@ class CommitOrchestrator:
             self._node_created(
                 "RequestObservation", str(obs.observation_id), obs, commit_id, span_id
             ),
-        )
+        ) + self._templating_events(retemplate, obs, commit_id, span_id)
         return CommitResult(
             commit_id=commit_id,
             engagement_id=obs.engagement_id,
@@ -232,6 +235,46 @@ class CommitOrchestrator:
             node_ids=node_ids,
             l3_events=l3_events,
         )
+
+    def _templating_events(
+        self,
+        retemplate: RetemplateResult,
+        obs: RequestObservation,
+        commit_id: CommitId,
+        span_id: str,
+    ) -> tuple[L3Event, ...]:
+        """Translate a re-templating result into l3-events.
+
+        `node_created` for every Endpoint/Parameter MERGEd this pass, and
+        `node_updated` carrying `{path_template: {old, new}}` for each Endpoint
+        whose template was revised by fresh evidence (ADR-0004 re-templating).
+        Re-emitting NodeCreated for already-present nodes is acceptable —
+        consumers treat l3-events as idempotent structural facts.
+        """
+
+        events: list[L3Event] = []
+        for eid in retemplate.endpoint_ids:
+            events.append(self._node_created("Endpoint", eid, obs, commit_id, span_id))
+        for pid in retemplate.parameter_ids:
+            events.append(self._node_created("Parameter", pid, obs, commit_id, span_id))
+        for change in retemplate.template_changes:
+            events.append(
+                NodeUpdated(
+                    commit_id=commit_id,
+                    trace_id=obs.trace_id,
+                    span_id=span_id,  # type: ignore[arg-type]
+                    engagement_id=obs.engagement_id,
+                    emitted_at=datetime.now(UTC),
+                    node_type="Endpoint",
+                    node_id=change.endpoint_id,
+                    changed_properties={
+                        "path_template": PropertyChange(
+                            old=change.old_template, new=change.new_template
+                        )
+                    },
+                )
+            )
+        return tuple(events)
 
     def _commit_parse_failure(
         self, pf: ParseFailure, commit_id: CommitId, span_id: str
