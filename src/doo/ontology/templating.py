@@ -74,6 +74,7 @@ class _CohortObservation:
     observation_id: str
     concrete_path: str
     query_param_names: tuple[str, ...]
+    body_param_names: tuple[str, ...]
 
 
 def retemplate_cohort(
@@ -204,7 +205,7 @@ def _read_cohort(
         MATCH (r:RequestObservation {engagement_id: $engagement_id, method: $method})
               -[:ON_HOST]->(h:Host {engagement_id: $engagement_id, id: $host_id})
         RETURN r.id AS id, r.concrete_path AS path,
-               r.query_param_names AS qnames
+               r.query_param_names AS qnames, r.body_param_names AS bnames
         ORDER BY r.id
         """,
         engagement_id=engagement_id,
@@ -214,11 +215,13 @@ def _read_cohort(
     out: list[_CohortObservation] = []
     for row in rows:
         qnames = row.get("qnames") or []
+        bnames = row.get("bnames") or []
         out.append(
             _CohortObservation(
                 observation_id=str(row["id"]),
                 concrete_path=str(row["path"]),
                 query_param_names=tuple(str(q) for q in qnames),
+                body_param_names=tuple(str(b) for b in bnames),
             )
         )
     return out
@@ -334,12 +337,13 @@ def _aggregate_parameters(
     observed_at: datetime,
     ingested_at: datetime,
 ) -> list[str]:
-    """MERGE the Endpoint's path + query `Parameter` nodes and `HAS_PARAMETER` edges.
+    """MERGE the Endpoint's path/query/body `Parameter` nodes and `HAS_PARAMETER` edges.
 
     Identity `(engagement_id, endpoint_id, location, name)`. Path Parameters come
-    from the template's inferred positions; query Parameters are the union of the
-    observed query-parameter names across the cohort members. Idempotent: re-running
-    MERGEs the same nodes/edges. Returns the Parameter node ids touched.
+    from the template's inferred positions; query and body Parameters are the union
+    of the observed query- / body-parameter names across the cohort members (T5
+    extends T3's aggregation to `location="body"`). Idempotent: re-running MERGEs the
+    same nodes/edges. Returns the Parameter node ids touched.
     """
 
     specs: list[tuple[str, str, float, str | None]] = []  # (location, name, conf, shape)
@@ -352,6 +356,13 @@ def _aggregate_parameters(
                 continue
             seen_query.add(name)
             specs.append(("query", name, 1.0, None))
+    seen_body: set[str] = set()
+    for m in members:
+        for name in m.body_param_names:
+            if name in seen_body:
+                continue
+            seen_body.add(name)
+            specs.append(("body", name, 1.0, None))
 
     touched: list[str] = []
     for location, name, confidence, shape in specs:

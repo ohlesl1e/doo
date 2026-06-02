@@ -3,8 +3,15 @@
 Turns a HAR blob into a sequence of `L2Event`s. Each entry becomes one
 `RequestObservation` carrying an `AuthContextCue` extracted from its request
 headers/cookies — hashed at the L2 boundary so raw tokens never leave this layer
-(ADR-0015). Anonymous requests carry `AuthContextCue(is_anonymous=True)`. No body
-extraction and no response-artifact extraction in slice-1 (those land in T6).
+(ADR-0015). Anonymous requests carry `AuthContextCue(is_anonymous=True)`.
+
+Request/response bodies are uploaded to object storage and referenced by `BlobRef`
+on the observation (T5): the graph holds only the hash + metadata + storage key,
+never the raw bytes (CLAUDE.md hard rule / ADR-0015). Body *parameters* are
+extracted deterministically — form-urlencoded pairs, JSON leaves with RFC 6901
+JSON Pointers, and best-effort multipart text fields. Known-secret-shape leaf
+values are not surfaced as raw `BodyParam.value`s; the raw token lives only in the
+uploaded body. Response-artifact extraction still lands in T6.
 
 `ParseFailure` handling is first-class from day one: a malformed entry yields a
 `ParseFailure` event (not an exception) so the L2 worker never crashes on bad
@@ -19,8 +26,12 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import re
 from collections.abc import Iterator
 from datetime import UTC, datetime
+from email.parser import BytesParser
+from email.policy import default as default_email_policy
+from typing import Protocol
 from urllib.parse import parse_qsl, urlsplit
 
 import jwt
@@ -31,17 +42,37 @@ from doo.canonical.identity import (
     compute_auth_hash,
     derive_har_source_id,
 )
-from doo.canonical.value_objects import AuthContextCue, HostRef
+from doo.canonical.value_objects import AuthContextCue, BlobRef, HostRef
 from doo.events.envelope import IngestionEnvelope
 from doo.events.l2 import (
+    BodyParam,
     L2Event,
     Method,
     ObservedParameter,
     ParseFailure,
     RequestObservation,
 )
-from doo.ids import L2EventId, ObservationId, Sha256Hex, SourceId
+from doo.ids import EngagementId, L2EventId, ObservationId, Sha256Hex, SourceId
 from doo.observability.ids import new_span_id
+
+
+class BodyUploader(Protocol):
+    """Sink for raw request/response body bytes (the T5 MinIO upload).
+
+    `parse_har` is handed one of these by the L2 worker (a `BlobClient`). It is a
+    Protocol so the parser stays decoupled from boto3 and is trivially fakeable in
+    unit tests. `raw` is the *decoded* body (the caller resolves base64); the
+    implementation content-addresses it by `sha256(raw)` and returns a `BlobRef`.
+    """
+
+    def put_body(
+        self,
+        engagement_id: EngagementId,
+        *,
+        raw: bytes,
+        content_type: str,
+        encoding: str | None = None,
+    ) -> BlobRef: ...
 
 # Header names (lowercased) treated as API-key-bearing. `Authorization` is handled
 # separately (bearer / basic); these are the common bespoke key headers.
@@ -59,6 +90,47 @@ _VALID_METHODS: frozenset[str] = frozenset(
 
 _SOURCE = "har"
 
+_FORM_CONTENT_TYPE = "application/x-www-form-urlencoded"
+_DEFAULT_CONTENT_TYPE = "application/octet-stream"
+
+# Known-secret-shape value detectors (T5 / ADR-0015). A leaf body value matching
+# any of these is treated as a secret and its raw value is *not* surfaced on a
+# BodyParam — the body still lands in object storage, but the graph never sees the
+# raw token. Secret-shape *extraction* (emitting hashed shape, like response
+# artifacts) is deferred — see `# TODO(secret-shape-bodies)` below.
+_JWT_RE = re.compile(r"^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$")
+# Parameter *names* that conventionally carry secrets regardless of value shape.
+_SECRET_NAME_HINTS: frozenset[str] = frozenset(
+    (
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "api_key",
+        "apikey",
+        "client_secret",
+        "private_key",
+    )
+)
+
+
+def _is_secret_shaped(name: str, value: str) -> bool:
+    """True if `(name, value)` looks like a secret whose raw value must not surface.
+
+    Conservative: a JWT-shaped value, or a non-trivial value under a
+    secret-conventional parameter name. Used only to *suppress* the raw value on a
+    BodyParam (ADR-0015); the body itself is still uploaded to object storage.
+    """
+
+    if _JWT_RE.match(value):
+        return True
+    if name.lower() in _SECRET_NAME_HINTS and value:
+        return True
+    return False
+
 
 def _now() -> datetime:
     return datetime.now(UTC)
@@ -74,12 +146,21 @@ def _parse_started_at(raw: str) -> datetime:
     return datetime.fromisoformat(raw.replace("Z", "+00:00"))
 
 
-def parse_har(blob: bytes, envelope: IngestionEnvelope) -> Iterator[L2Event]:
+def parse_har(
+    blob: bytes,
+    envelope: IngestionEnvelope,
+    body_uploader: BodyUploader | None = None,
+) -> Iterator[L2Event]:
     """Parse a HAR blob into `L2Event`s, propagating envelope correlation fields.
 
     Yields one `RequestObservation` per well-formed entry and one `ParseFailure`
     per malformed entry. A whole-blob failure (bad JSON / not a HAR log) yields a
     single blob-level `ParseFailure`. Never raises on bad input.
+
+    When `body_uploader` is supplied (the L2 worker always supplies a `BlobClient`),
+    request/response bodies are uploaded to object storage and referenced via
+    `BlobRef`s on the emitted `RequestObservation` (T5). When it is `None` (pure
+    parser unit tests), bodies are skipped and the refs are `None`.
     """
 
     ingested_at = _now()
@@ -106,7 +187,7 @@ def parse_har(blob: bytes, envelope: IngestionEnvelope) -> Iterator[L2Event]:
 
     entries = log["entries"]
     for index, entry in enumerate(entries):
-        yield _parse_entry(entry, index, envelope, ingested_at)
+        yield _parse_entry(entry, index, envelope, ingested_at, body_uploader)
 
 
 def _parse_entry(
@@ -114,6 +195,7 @@ def _parse_entry(
     index: int,
     envelope: IngestionEnvelope,
     ingested_at: datetime,
+    body_uploader: BodyUploader | None,
 ) -> L2Event:
     """Parse one HAR entry into a `RequestObservation` or a `ParseFailure`."""
 
@@ -148,6 +230,14 @@ def _parse_entry(
         response = entry.get("response")
         response_status, response_size = _response_shape(response)
 
+        # --- T5: bodies -> object storage, body params extracted. ---
+        request_body_ref, request_body_params = _extract_request_body(
+            request, envelope.engagement_id, body_uploader
+        )
+        response_body_ref = _extract_response_body(
+            response, envelope.engagement_id, body_uploader
+        )
+
         observation_id = ObservationId(
             f"{envelope.engagement_id}:{_SOURCE}:{source_id}"
         )
@@ -167,16 +257,17 @@ def _parse_entry(
             host=host_ref,
             concrete_path=concrete_path,
             query_string=query_string,
-            # Slice-1: no body / no parsed inputs / no response artifacts.
+            # Slice-1: no parsed headers/cookies and no response artifacts (T6).
             headers=(),
             cookies=(),
             query_params=query_params,
             body_params=(),
-            request_body_ref=None,
+            request_body_params=request_body_params,
+            request_body_ref=request_body_ref,
             auth_context_cue=auth_context_cue,
             response_status=response_status,
             response_headers=(),
-            response_body_ref=None,
+            response_body_ref=response_body_ref,
             response_size_bytes=response_size,
             duration_ms=None,
         )
@@ -415,6 +506,331 @@ def _response_shape(response: object) -> tuple[int, int]:
     size = response.get("bodySize")
     size_int = size if isinstance(size, int) and size >= 0 else 0
     return status_int, size_int
+
+
+# --------------------------------------------------------------------------- #
+# T5: body extraction + body-parameter parsing.
+# --------------------------------------------------------------------------- #
+
+
+def _content_type_of(headers: dict[str, str], fallback_mime: str | None) -> str:
+    """Resolve a body's content type from request/response headers (or mimeType).
+
+    Prefers the `Content-Type` header (full value, params kept). Falls back to the
+    HAR `postData.mimeType` / `content.mimeType` when no header is present, then to
+    `application/octet-stream`.
+    """
+
+    raw = headers.get("content-type") or fallback_mime
+    return raw.strip() if isinstance(raw, str) and raw.strip() else _DEFAULT_CONTENT_TYPE
+
+
+def _base_mime(content_type: str) -> str:
+    """The bare media type, lowercased, sans parameters (`;charset=...`)."""
+
+    return content_type.split(";", 1)[0].strip().lower()
+
+
+def _content_encoding(headers: dict[str, str]) -> str | None:
+    """The compression encoding HAR/headers declare (`gzip` / `br`), else None.
+
+    Informational only — HAR `postData.text` / `content.text` is already the
+    decompressed body, so we never decompress here; we just record the metadata on
+    the `BlobRef.encoding` so downstream knows the wire encoding.
+    """
+
+    enc = headers.get("content-encoding", "").strip().lower()
+    if "gzip" in enc:
+        return "gzip"
+    if "br" in enc:
+        return "br"
+    return None
+
+
+def _extract_request_body(
+    request: dict[str, object],
+    engagement_id: str,
+    body_uploader: BodyUploader | None,
+) -> tuple[BlobRef | None, tuple[BodyParam, ...]]:
+    """Upload a request body to object storage and parse its parameters.
+
+    Returns `(request_body_ref, body_params)`. No body -> `(None, ())` with **no**
+    object created. The body text comes from `postData.text`, or is reconstructed
+    from `postData.params` for form-encoded entries. Body-param parsing is
+    content-type driven (form / JSON / multipart / other).
+    """
+
+    post = request.get("postData")
+    if not isinstance(post, dict):
+        return None, ()
+
+    headers = _header_map(request)
+    fallback_mime = post.get("mimeType") if isinstance(post.get("mimeType"), str) else None
+    content_type = _content_type_of(headers, fallback_mime)
+    base_mime = _base_mime(content_type)
+
+    raw = _request_body_bytes(post, base_mime)
+    if raw is None:
+        return None, ()
+
+    body_params = _parse_body_params(raw, base_mime, content_type)
+
+    if body_uploader is None:
+        return None, body_params
+    ref = body_uploader.put_body(
+        EngagementId(engagement_id),
+        raw=raw,
+        content_type=content_type,
+        encoding=_content_encoding(headers),
+    )
+    return ref, body_params
+
+
+def _request_body_bytes(post: dict[str, object], base_mime: str) -> bytes | None:
+    """The raw request-body bytes from a HAR `postData`, or None when absent.
+
+    Prefers `postData.text`; for form-encoded entries with no text, reconstructs
+    the body from the structured `postData.params` array. An empty body yields
+    `None` (no object is created for an empty body).
+    """
+
+    text = post.get("text")
+    if isinstance(text, str) and text:
+        return text.encode("utf-8")
+
+    if base_mime == _FORM_CONTENT_TYPE:
+        params = post.get("params")
+        if isinstance(params, list):
+            pairs: list[tuple[str, str]] = []
+            for item in params:
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("name")
+                if not isinstance(name, str) or not name:
+                    continue
+                value = item.get("value")
+                pairs.append((name, value if isinstance(value, str) else ""))
+            if pairs:
+                from urllib.parse import urlencode
+
+                return urlencode(pairs).encode("utf-8")
+    return None
+
+
+def _extract_response_body(
+    response: object,
+    engagement_id: str,
+    body_uploader: BodyUploader | None,
+) -> BlobRef | None:
+    """Upload a response body to object storage; return its `BlobRef` (or None).
+
+    `response.content.encoding == "base64"` is decoded *before* upload so the
+    stored bytes are raw and `BlobRef.sha256` is over the raw bytes (ADR-0015 /
+    acceptance criterion). No body -> `None` with no object created. Response body
+    *parameters* are not extracted in slice-1 (response-artifact extraction is T6).
+    """
+
+    if not isinstance(response, dict):
+        return None
+    content = response.get("content")
+    if not isinstance(content, dict):
+        return None
+
+    text = content.get("text")
+    if not isinstance(text, str) or not text:
+        return None
+
+    encoding = content.get("encoding")
+    if isinstance(encoding, str) and encoding.lower() == "base64":
+        try:
+            raw = base64.b64decode(text, validate=True)
+        except (binascii.Error, ValueError):
+            # Declared base64 but not decodable: store the literal text bytes
+            # rather than dropping the body (best-effort, never crash).
+            raw = text.encode("utf-8")
+    else:
+        raw = text.encode("utf-8")
+
+    if not raw:
+        return None
+
+    headers = _header_map(response)
+    fallback_mime = (
+        content.get("mimeType") if isinstance(content.get("mimeType"), str) else None
+    )
+    content_type = _content_type_of(headers, fallback_mime)
+
+    if body_uploader is None:
+        return None
+    return body_uploader.put_body(
+        EngagementId(engagement_id),
+        raw=raw,
+        content_type=content_type,
+        encoding=_content_encoding(headers),
+    )
+
+
+def _parse_body_params(
+    raw: bytes, base_mime: str, content_type: str
+) -> tuple[BodyParam, ...]:
+    """Parse a request body into `BodyParam`s, content-type driven.
+
+    - `application/x-www-form-urlencoded` -> one BodyParam per `name=value` pair,
+      `json_pointer=None`.
+    - `application/json` -> recurse the structure; one BodyParam per leaf with an
+      RFC 6901 JSON Pointer (`/user/profile/email`, `/items/0/sku`).
+    - `multipart/form-data` -> best-effort text fields (RFC 7578 lite); binary
+      parts (those with a `filename` or non-text content type) are skipped.
+    - any other content type -> no BodyParams (the body is still uploaded).
+
+    Known-secret-shape leaf values are emitted with `value=None` (ADR-0015): the
+    parameter's existence is recorded, but the raw token is not — it lives only in
+    the uploaded body.
+
+    # TODO(secret-shape-bodies): emit a hashed secret shape (value_hash +
+    # value_length, like `ResponseArtifact`) for suppressed leaves so the planner
+    # can reason about "a refresh token flows here" without seeing the token. That
+    # extraction is deferred to a future slice; for now the value is simply dropped.
+    """
+
+    if base_mime == _FORM_CONTENT_TYPE:
+        return _parse_form_body(raw, content_type)
+    if base_mime == "application/json" or base_mime.endswith("+json"):
+        return _parse_json_body(raw, content_type)
+    if base_mime == "multipart/form-data":
+        return _parse_multipart_body(raw, content_type)
+    return ()
+
+
+def _body_param(name: str, value: str, json_pointer: str | None, content_type: str) -> BodyParam:
+    """Build a `BodyParam`, suppressing the raw value for secret-shaped leaves."""
+
+    safe_value: str | None = None if _is_secret_shaped(name, value) else value
+    return BodyParam(
+        name=name,
+        content_type=content_type,
+        json_pointer=json_pointer,
+        value=safe_value,
+    )
+
+
+def _parse_form_body(raw: bytes, content_type: str) -> tuple[BodyParam, ...]:
+    """One `BodyParam` per `name=value` pair in a form-urlencoded body."""
+
+    text = raw.decode("utf-8", errors="replace")
+    out: list[BodyParam] = []
+    for name, value in parse_qsl(text, keep_blank_values=True):
+        if name:
+            out.append(_body_param(name, value, None, _FORM_CONTENT_TYPE))
+    return tuple(out)
+
+
+def _parse_json_body(raw: bytes, content_type: str) -> tuple[BodyParam, ...]:
+    """One `BodyParam` per JSON leaf, addressed by an RFC 6901 JSON Pointer."""
+
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return ()
+    out: list[BodyParam] = []
+    _walk_json("", doc, content_type, out)
+    return tuple(out)
+
+
+def _rfc6901_escape(token: str) -> str:
+    """Escape a single RFC 6901 reference token (`~` -> `~0`, `/` -> `~1`)."""
+
+    return token.replace("~", "~0").replace("/", "~1")
+
+
+def _walk_json(pointer: str, node: object, content_type: str, out: list[BodyParam]) -> None:
+    """Recurse a JSON value, emitting a `BodyParam` per leaf.
+
+    `pointer` is the RFC 6901 JSON Pointer to `node`. Object keys and array indices
+    extend the pointer; scalars (and empty containers) are leaves. The leaf's
+    `name` is its final reference token (the JSON key, or the array index for
+    array elements); the full pointer is carried on `json_pointer`.
+    """
+
+    if isinstance(node, dict):
+        if not node:
+            return
+        for key, value in node.items():
+            child = f"{pointer}/{_rfc6901_escape(str(key))}"
+            _walk_json(child, value, content_type, out)
+        return
+    if isinstance(node, list):
+        for index, value in enumerate(node):
+            child = f"{pointer}/{index}"
+            _walk_json(child, value, content_type, out)
+        return
+
+    # Leaf. Derive the parameter name from the final pointer token.
+    name = pointer.rsplit("/", 1)[-1] if pointer else ""
+    if not name:
+        # A bare scalar top-level JSON body has no key to name; skip it.
+        return
+    name = name.replace("~1", "/").replace("~0", "~")
+    value_str = _scalar_to_str(node)
+    out.append(_body_param(name, value_str, pointer, content_type))
+
+
+def _scalar_to_str(value: object) -> str:
+    """Render a JSON scalar as the string a `BodyParam.value` carries."""
+
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value)
+
+
+def _parse_multipart_body(raw: bytes, content_type: str) -> tuple[BodyParam, ...]:
+    """Best-effort RFC 7578 multipart parse: text fields only, binary parts skipped.
+
+    Uses the stdlib email parser to split parts (multipart/form-data is MIME).
+    A part is treated as a text field when it has a `name` in its
+    Content-Disposition, no `filename`, and a text-ish (or absent) content type.
+    Binary parts (those with a `filename`, or a non-text content type) are skipped
+    — the whole body is still uploaded to object storage by the caller.
+    """
+
+    message_bytes = b"Content-Type: " + content_type.encode("utf-8") + b"\r\n\r\n" + raw
+    try:
+        msg = BytesParser(policy=default_email_policy).parsebytes(message_bytes)
+    except Exception:  # noqa: BLE001 - never crash the parser on odd multipart
+        return ()
+    if not msg.is_multipart():
+        return ()
+
+    out: list[BodyParam] = []
+    for part in msg.iter_parts():
+        disposition = part.get_content_disposition()
+        if disposition != "form-data":
+            continue
+        filename = part.get_filename()
+        if filename is not None:
+            continue  # file upload part: binary, skip.
+        name = part.get_param("name", header="content-disposition")
+        if not isinstance(name, str) or not name:
+            continue
+        part_ctype = (part.get_content_type() or "").lower()
+        if part_ctype and not (
+            part_ctype.startswith("text/")
+            or part_ctype == "application/json"
+            or part_ctype.endswith("+json")
+        ):
+            continue  # non-text part: skip its (possibly binary) payload.
+        try:
+            value = part.get_content()
+        except Exception:  # noqa: BLE001 - undecodable part -> skip, don't crash
+            continue
+        if not isinstance(value, str):
+            continue
+        out.append(_body_param(name, value.rstrip("\r\n"), None, "multipart/form-data"))
+    return tuple(out)
 
 
 class _EntryError(Exception):

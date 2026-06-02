@@ -74,7 +74,9 @@ def process_envelope(deps: L2WorkerDeps, envelope: IngestionEnvelope) -> list[L2
 
     events = []
     try:
-        for event in parser(blob, envelope):
+        # The BlobClient doubles as the T5 body uploader: bodies stream into
+        # object storage during parse, the graph sees only the BlobRef.
+        for event in parser(blob, envelope, deps.blobs):
             events.append(event)
     except Exception as exc:  # noqa: BLE001 - parser robustness backstop
         # The parser is supposed to emit ParseFailures internally, but if it

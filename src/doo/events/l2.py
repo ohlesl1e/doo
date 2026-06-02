@@ -59,6 +59,35 @@ class ObservedParameter(BaseModel):
     value: str | None = None
 
 
+class BodyParam(BaseModel):
+    """One parameter extracted from a request body (T5).
+
+    A richer sibling of `ObservedParameter` for body inputs: it additionally
+    carries the body's `content_type` and, for structured (JSON) bodies, an
+    RFC 6901 `json_pointer` addressing the leaf the value came from
+    (e.g. `/user/profile/email`). For flat bodies (form-urlencoded, multipart
+    text fields) `json_pointer` is `None`.
+
+    L2 emits these flat under the `RequestObservation`; L3 aggregates them into
+    `Parameter` nodes keyed `(engagement_id, endpoint_id, name, location="body")`,
+    exactly like query/path params (the emergent-aggregate model). The aggregate
+    `Parameter.location` is always `"body"`.
+
+    Secret discipline (ADR-0015): known-secret-shape body values are *not*
+    surfaced here as raw `value`s — see `extraction/har.py`'s
+    `# TODO(secret-shape-bodies)`. Until that lands, `value` carries the raw leaf
+    for non-secret bodies; the raw body itself always lives only in object storage.
+    """
+
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    name: str = Field(min_length=1)
+    content_type: str = Field(min_length=1)
+    # RFC 6901 JSON Pointer for JSON-body leaves; None for flat bodies.
+    json_pointer: str | None = None
+    value: str | None = None
+
+
 class L2EventBase(BaseModel):
     """Fields every L2 event variant carries."""
 
@@ -111,7 +140,10 @@ class RequestObservation(L2EventBase):
     headers: tuple[ObservedParameter, ...] = ()
     cookies: tuple[ObservedParameter, ...] = ()
     query_params: tuple[ObservedParameter, ...] = ()
+    # Legacy flat body params (kept for back-compat; T5 emits the richer
+    # `request_body_params` below carrying content_type + RFC 6901 json_pointer).
     body_params: tuple[ObservedParameter, ...] = ()
+    request_body_params: tuple[BodyParam, ...] = ()
     request_body_ref: BlobRef | None = None
 
     auth_context_cue: AuthContextCue

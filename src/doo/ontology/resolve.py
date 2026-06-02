@@ -554,7 +554,14 @@ def commit_request_observation(
 
     The observed query-parameter names are stored on the node (`query_param_names`)
     so the L3 Parameter-aggregation pass can roll them up without re-reading the
-    object store; path-position Parameters come from templating.
+    object store; path-position Parameters come from templating. Body-parameter
+    names are stored the same way (`body_param_names`).
+
+    Request/response body `BlobRef`s are persisted as JSON-serialised string
+    properties (`request_body_ref` / `response_body_ref`) — Neo4j has no struct
+    property type, so the small `BlobRef` serialises as a JSON string holding the
+    hash + metadata + storage key (the raw body lives only in object storage;
+    ADR-0015 / CLAUDE.md hard rule).
     """
 
     props = cross_cutting(
@@ -564,6 +571,17 @@ def commit_request_observation(
         ingested_at=obs.ingested_at,
     )
     query_param_names = [p.name for p in obs.query_params]
+    # De-duplicated body-param names, order-preserving, for L3 aggregation.
+    body_param_names: list[str] = []
+    for bp in obs.request_body_params:
+        if bp.name not in body_param_names:
+            body_param_names.append(bp.name)
+    request_body_ref = (
+        obs.request_body_ref.model_dump_json() if obs.request_body_ref is not None else None
+    )
+    response_body_ref = (
+        obs.response_body_ref.model_dump_json() if obs.response_body_ref is not None else None
+    )
     client.execute_write(
         """
         MERGE (r:RequestObservation {engagement_id: $engagement_id,
@@ -571,6 +589,9 @@ def commit_request_observation(
         ON CREATE SET r.id = $observation_id, r.method = $method,
                       r.concrete_path = $concrete_path, r.query_string = $query_string,
                       r.query_param_names = $query_param_names,
+                      r.body_param_names = $body_param_names,
+                      r.request_body_ref = $request_body_ref,
+                      r.response_body_ref = $response_body_ref,
                       r.response_status = $response_status,
                       r.envelope_event_id = $envelope_event_id,
                       r += $props
@@ -587,6 +608,9 @@ def commit_request_observation(
         concrete_path=obs.concrete_path,
         query_string=obs.query_string,
         query_param_names=query_param_names,
+        body_param_names=body_param_names,
+        request_body_ref=request_body_ref,
+        response_body_ref=response_body_ref,
         response_status=obs.response_status,
         envelope_event_id=str(obs.envelope_event_id),
         host_id=host_node_id,

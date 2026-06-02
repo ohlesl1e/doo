@@ -30,7 +30,7 @@ from doo.ontology.graph_state import Neo4jGraphState
 from doo.ontology.l3_worker import L3WorkerDeps, run_l3_worker
 from doo.ontology.schema import apply_schema
 from doo.setup import EngagementConfig, load_engagement
-from tests.fixtures import ANON_HAR, MIXED_HAR
+from tests.fixtures import ANON_HAR, BODIES_HAR, MIXED_HAR
 from tests.test_loader import _base_config_dict
 
 _SIGNING_KEY = "irrelevant-signing-key-at-least-32-bytes-long!"
@@ -349,6 +349,101 @@ def test_bearer_har_reconciles_to_declared_principal_no_raw_token(
     blob = _j.dumps([n["props"] for n in nodes], default=str)
     assert _PIPELINE_TOKEN not in blob
     assert _PIPELINE_TOKEN.split(".")[2] not in blob
+
+
+def test_bodies_har_full_pipeline_blobs_params_and_secrets(
+    neo4j_client, redis_client, blob_client
+) -> None:
+    """T5 end-to-end: bodies land in MinIO, RO nodes carry serialised BlobRefs,
+    body bytes round-trip out of MinIO by `BlobRef.key` with a matching sha256,
+    body params aggregate into `location="body"` Parameter nodes (incl. a JSON
+    pointer), and the raw refresh token lives only in MinIO — never in a graph
+    node property (ADR-0015)."""
+
+    import base64
+    import hashlib
+    import json as _j
+
+    eid = "eng-e2e-bodies"
+    _seed_engagement(neo4j_client, eid)
+    _run_pipeline(
+        neo4j=neo4j_client,
+        redis_client=redis_client,
+        blob_client=blob_client,
+        engagement_id=eid,
+        har_bytes=BODIES_HAR.read_bytes(),
+        filename="bodies.har",
+    )
+
+    # 6 entries -> 6 RequestObservations on one Host.
+    assert _count(neo4j_client, "RequestObservation", eid) == 6
+    assert _count(neo4j_client, "Host", eid) == 1
+
+    # --- POST /api/users carries a request_body_ref; bytes round-trip by key. ---
+    rows = neo4j_client.execute_read(
+        "MATCH (r:RequestObservation {engagement_id: $eid, concrete_path: '/api/users'}) "
+        "RETURN r.request_body_ref AS rb",
+        eid=eid,
+    )
+    assert rows and rows[0]["rb"]
+    ref = _j.loads(rows[0]["rb"])
+    assert ref["content_type"] == "application/json"
+    assert ref["key"] == f"engagement/{eid}/source/har/bodies/{ref['sha256']}.bin"
+    # Round-trip the body out of MinIO via BlobRef.key; sha256 matches.
+    body = blob_client.get(ref["key"])
+    assert hashlib.sha256(body).hexdigest() == ref["sha256"]
+    # The body is the real JSON request body, and it still holds the raw token.
+    assert b"alice.profile@example.com" in body
+    assert b"eyJhbGciOiJIUzI1Ni1." in body
+
+    # --- base64 response body decoded before upload; stored bytes are raw. ---
+    rows = neo4j_client.execute_read(
+        "MATCH (r:RequestObservation {engagement_id: $eid, concrete_path: '/api/avatar'}) "
+        "RETURN r.response_body_ref AS rb",
+        eid=eid,
+    )
+    resp_ref = _j.loads(rows[0]["rb"])
+    stored = blob_client.get(resp_ref["key"])
+    assert stored == base64.b64decode("iVBORw0KGgoAAAByYXdiaW5hcnktYnl0ZXM=")
+    assert hashlib.sha256(stored).hexdigest() == resp_ref["sha256"]
+
+    # --- no-body entry: both refs null, no placeholder object. ---
+    rows = neo4j_client.execute_read(
+        "MATCH (r:RequestObservation {engagement_id: $eid, concrete_path: '/api/health'}) "
+        "RETURN r.request_body_ref AS rq, r.response_body_ref AS rs",
+        eid=eid,
+    )
+    assert rows[0]["rq"] is None and rows[0]["rs"] is None
+
+    # --- body params aggregate into Parameter nodes with location="body". ---
+    # JSON-pointer-named leaf: /user/email leaf has name "email".
+    body_params = neo4j_client.execute_read(
+        "MATCH (e:Endpoint {engagement_id: $eid})-[:HAS_PARAMETER]->"
+        "(p:Parameter {engagement_id: $eid, location: 'body'}) "
+        "RETURN collect(DISTINCT p.name) AS names",
+        eid=eid,
+    )
+    names = set(body_params[0]["names"])
+    # Form pairs from /api/login + /api/search, multipart caption, JSON leaves.
+    assert {"username", "remember", "q", "page", "caption"} <= names
+    assert "email" in names  # from the JSON body's /user/email + /user/profile/email
+    assert "refresh_token" in names  # the param exists even though its value is suppressed
+
+    # Every body Parameter hangs off an Endpoint via HAS_PARAMETER.
+    edge = neo4j_client.execute_read(
+        "MATCH (:Endpoint {engagement_id: $eid})-[:HAS_PARAMETER]->"
+        "(p:Parameter {engagement_id: $eid, location: 'body'}) RETURN count(p) AS c",
+        eid=eid,
+    )
+    assert edge[0]["c"] >= 1
+
+    # --- ADR-0015: the raw refresh token appears in NO graph node property. ---
+    nodes = neo4j_client.execute_read(
+        "MATCH (n {engagement_id: $eid}) RETURN properties(n) AS props", eid=eid
+    )
+    blob = _j.dumps([n["props"] for n in nodes], default=str)
+    assert "eyJhbGciOiJIUzI1Ni1." not in blob  # raw token never in the graph
+    assert "hunter2" not in blob  # the form password value is suppressed too
 
 
 def test_unknown_engagement_4xx_nothing_lands(neo4j_client, redis_client, blob_client) -> None:

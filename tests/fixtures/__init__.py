@@ -24,3 +24,9 @@ USERS_TEMPLATING_HAR = FIXTURES_DIR / "users_templating.har"
 VERSION_TEMPLATING_HAR = FIXTURES_DIR / "version_templating.har"
 # /users/42, /users/87, /users/settings -> /users/{user_id} + literal /users/settings.
 LITERAL_SIBLING_HAR = FIXTURES_DIR / "literal_sibling.har"
+
+# --- T5 body-extraction corpus ---
+# POST+JSON (nested + a refresh_token), POST+form (text), POST+form (params),
+# multipart upload (one text field + one skipped binary part), a base64 response
+# body, and a no-body entry. All on api.example.com (one Host).
+BODIES_HAR = FIXTURES_DIR / "bodies.har"

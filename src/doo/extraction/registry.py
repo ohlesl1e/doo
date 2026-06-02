@@ -16,10 +16,12 @@ from collections.abc import Callable, Iterator
 
 from doo.events.envelope import IngestionEnvelope
 from doo.events.l2 import L2Event
-from doo.extraction.har import parse_har
+from doo.extraction.har import BodyUploader, parse_har
 
-# A parser turns a raw blob + its envelope into a stream of L2 events.
-Parser = Callable[[bytes, IngestionEnvelope], Iterator[L2Event]]
+# A parser turns a raw blob + its envelope into a stream of L2 events. An optional
+# `BodyUploader` lets the parser stream request/response bodies into object storage
+# (T5); parsers that don't extract bodies ignore it.
+Parser = Callable[[bytes, IngestionEnvelope, BodyUploader | None], Iterator[L2Event]]
 
 
 class UnknownParserError(LookupError):
