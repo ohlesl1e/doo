@@ -55,12 +55,22 @@ test:
 - **Query-time scoping** — `tests/test_for_engagement.py` (`for_engagement` returns
   only the current engagement's nodes).
 
-## T8 capstone — deferred
+## Comprehensive E2E + coverage matrix (T8 capstone)
 
-The comprehensive end-to-end test that exercises *every* slice-1 capability
-(templating, body params, response artifacts, declared-Principal/AuthContext
-reconciliation, the keepalive lifecycle), the exporter-variety HAR corpus, and the
-PRD user-story coverage matrix are the **T8 capstone**. They depend on T3–T6 being
-in place and land once those tracers are complete. What's in CI today: the full unit
-+ integration suite for everything merged so far, plus the isolation negative tests
-above.
+- **`tests/e2e/test_slice1_full.py`** — one comprehensive HAR
+  (`tests/fixtures/har/comprehensive.har`) driven through the real L1→L2→L3
+  pipeline on testcontainers, asserting the integrated graph across *every* T2–T6
+  capability at once (templating, declared-Principal reconciliation, bodies, body
+  params, response artifacts, ParseFailure, secret discipline) plus re-ingestion
+  idempotency. The container fixtures are re-exposed for the package in
+  `tests/e2e/conftest.py`.
+- **`tests/test_har_corpus.py`** — exporter-shape robustness across the
+  Burp/Chrome/Firefox/Charles corpus in `tests/fixtures/har/` (see its
+  `README.md`).
+- **`tests/coverage-matrix.md`** — maps every PRD (issue #2) user story to its
+  test(s), with the handful of intentionally-not-unit-tested stories called out.
+
+The engagement-start / keepalive-lifecycle / loader-rerun CLI flows the capstone
+also implies are covered by `tests/test_keepalive.py` and `tests/test_loader.py`
+(referenced from the matrix), so the E2E focuses on the integrated graph rather
+than re-driving those CLI subprocesses.

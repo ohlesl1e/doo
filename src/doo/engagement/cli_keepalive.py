@@ -73,7 +73,7 @@ def _build_reader() -> LeaseConfigReader:  # pragma: no cover - needs live Neo4j
 
     uri = os.environ.get("DOO_NEO4J_URI", "bolt://localhost:7687")
     user = os.environ.get("DOO_NEO4J_USER", "neo4j")
-    password = os.environ.get("DOO_NEO4J_PASSWORD", "neo4j")
+    password = os.environ.get("DOO_NEO4J_PASSWORD", "password")
     driver = GraphDatabase.driver(uri, auth=(user, password))
     session = driver.session()
     return _Neo4jLeaseConfigReader(session)

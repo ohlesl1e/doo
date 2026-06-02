@@ -31,6 +31,26 @@ LITERAL_SIBLING_HAR = FIXTURES_DIR / "literal_sibling.har"
 # body, and a no-body entry. All on api.example.com (one Host).
 BODIES_HAR = FIXTURES_DIR / "bodies.har"
 
+# --- T8 exporter-shape corpus (tests/fixtures/har/) ---
+HAR_DIR = FIXTURES_DIR / "har"
+# One HAR per real-world exporter, each carrying that exporter's shape quirks.
+BURP_EXPORT_HAR = HAR_DIR / "burp.har"
+CHROME_EXPORT_HAR = HAR_DIR / "chrome.har"
+FIREFOX_EXPORT_HAR = HAR_DIR / "firefox.har"
+CHARLES_EXPORT_HAR = HAR_DIR / "charles.har"
+# Valid HAR JSON with individually-malformed entries (+ one good entry).
+HAR_DIR_MALFORMED = HAR_DIR / "malformed.har"
+# The comprehensive HAR exercising every T2-T6 capability (driven by the E2E).
+COMPREHENSIVE_HAR = HAR_DIR / "comprehensive.har"
+
+# Every exporter variant, for the corpus robustness test.
+EXPORTER_HARS = (
+    BURP_EXPORT_HAR,
+    CHROME_EXPORT_HAR,
+    FIREFOX_EXPORT_HAR,
+    CHARLES_EXPORT_HAR,
+)
+
 # --- T6 response-artifact corpus ---
 # Five GETs whose responses exercise the extractor set:
 #   1. 500 HTML body with `internal-billing.corp.example` -> hostname + error_message.

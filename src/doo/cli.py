@@ -38,26 +38,41 @@ log = get_logger(__name__)
 def _default_ledger() -> JsonFileLedger:
     """Default ledger path: `~/.doo/engagement_ledger.json`.
 
-    Overridable by environment in production; T1 keeps it simple.
+    Overridable via `DOO_LEDGER_PATH` (used by tests and scripted runs that
+    must not touch the operator's home directory).
     """
     import os
 
+    override = os.environ.get("DOO_LEDGER_PATH")
+    if override:
+        return JsonFileLedger(Path(override))
     home = Path(os.path.expanduser("~"))
     return JsonFileLedger(home / ".doo" / "engagement_ledger.json")
 
 
 def _build_graph_state() -> GraphState:
-    """Build the Neo4j-backed `GraphState` implementation.
+    """Build the Neo4j-backed `GraphState` implementation (T2 onward).
 
-    Slice-1 T1 does not yet implement a real Neo4j writer — the L3 commit path
-    lands in T2. For now the CLI errors out cleanly if invoked without a fake;
-    tests inject their own state object.
+    Connects to Neo4j from environment configuration (the same env vars the
+    `ingest` and `keepalive` commands read) and bootstraps the schema
+    constraints idempotently so a fresh `engagement start` against an empty
+    database lands the engagement under the ADR-0017 uniqueness invariants.
+    Tests may inject their own `GraphState` instead of calling this.
     """
-    raise NotImplementedError(
-        "Real Neo4j-backed graph state is implemented in T2 (L3 commit path). "
-        "T1 ships only the contracts, schema bootstrap, and loader logic; "
-        "tests inject a fake. Invoke from tests, or wait for T2."
+    import os
+
+    from doo.infra.neo4j_driver import Neo4jClient
+    from doo.ontology.graph_state import Neo4jGraphState
+    from doo.ontology.schema import apply_schema
+
+    client = Neo4jClient.connect(
+        os.environ.get("DOO_NEO4J_URI", "bolt://localhost:7687"),
+        os.environ.get("DOO_NEO4J_USER", "neo4j"),
+        os.environ.get("DOO_NEO4J_PASSWORD", "password"),
     )
+    with client.driver.session() as session:
+        apply_schema(session, edition=client.server_edition())
+    return Neo4jGraphState(client)
 
 
 @engagement_app.command("start")

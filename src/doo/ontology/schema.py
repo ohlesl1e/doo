@@ -45,7 +45,7 @@ class _CypherRunner(Protocol):
     a real Neo4j driver, a testcontainer session, or a fake in unit tests.
     """
 
-    def run(self, cypher: str) -> object: ...  # pragma: no cover - protocol
+    def run(self, cypher: str, /) -> object: ...  # pragma: no cover - protocol
 
 
 # Shared structural nodes: identity is engagement-independent (ADR-0017).

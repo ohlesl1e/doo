@@ -1,0 +1,34 @@
+# Engagement config fixture for the comprehensive slice-1 E2E
+# (tests/e2e/test_slice1_full.py). Declares one Principal whose JWT `sub`
+# (uuid-aaa) matches the bearer token in tests/fixtures/har/comprehensive.har,
+# so the authenticated /me traffic reconciles to this declared Principal
+# (no phantom twin). The token is an env-var reference per ADR-0012 — the test
+# sets DOO_TEST_TOKEN_A in the subprocess environment.
+engagement:
+  id: acme-test
+  name: Acme comprehensive E2E
+  description: Comprehensive slice-1 end-to-end exercise.
+
+scope:
+  host_patterns:
+    - "^api\\.example\\.com$"
+  allowed_methods:
+    - GET
+    - POST
+  allowed_path_patterns:
+    - "^/.*$"
+  payload_class_denylist:
+    - destructive-sql
+
+kill_switch:
+  lease_ttl_seconds: 60
+  refresh_interval_seconds: 30
+
+principals:
+  - label: test-user-a
+    description: Primary declared test account.
+    auth_contexts:
+      - kind: bearer
+        token: "${DOO_TEST_TOKEN_A}"
+    known_signals:
+      jwt_sub: uuid-aaa
