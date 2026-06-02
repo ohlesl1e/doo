@@ -6,7 +6,9 @@ doo ingests passive testing data (Burp traffic, HAR files, recon output), builds
 
 ## Status
 
-Slice 1 / T1 (engagement skeleton) — repo skeleton, layer-boundary Pydantic contracts, Neo4j schema bootstrap, structlog setup, and the engagement loader / CLI. The ingestion → graph pipeline (T2 onward) builds on top of these contracts.
+**Slice 1 complete** — the full HAR → graph pipeline. Drop in a HAR file and get an engagement-isolated Neo4j graph of the target: canonicalised hosts, templated endpoints, aggregated parameters, declared/discovered/anonymous principals, request/response bodies in object storage, and response artifacts — with provenance on every node and secrets hashed at the L2 boundary. CI (lint + types + the full testcontainer suite) is in place.
+
+See **[`docs/running.md`](docs/running.md)** to run it.
 
 ## Design principles
 
@@ -47,38 +49,38 @@ Code:
 - `src/doo/setup/` — `EngagementConfig` Pydantic model and the idempotent loader (ADR-0019).
 - `src/doo/ontology/` — Neo4j schema bootstrap (ADR-0017 constraints + indexes + property-existence).
 - `src/doo/observability/` — `structlog` config and W3C trace-context id generators (ADR-0018).
-- `src/doo/cli.py` — Typer CLI (`doo engagement start` / `doo engagement status`).
-- `src/doo/ingestion/`, `src/doo/extraction/`, `src/doo/policy/`, `src/doo/infra/` — placeholders for later tracers.
+- `src/doo/cli.py` + `cli_worker.py` — Typer CLI (`doo engagement start/status/keepalive`, `doo ingest har`, `doo worker run`).
+- `src/doo/ingestion/` (L1 intake + L2 worker), `src/doo/extraction/` (HAR parser + response-artifact extractors), `src/doo/ontology/` (L3 commit, entity resolution, path templating), `src/doo/policy/` (Scope evaluator + deny-all Rego), `src/doo/infra/` (Redis/MinIO/Neo4j clients), `src/doo/engagement/` (kill-switch keepalive).
 
 Design docs:
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — five-layer architecture, tech stack, build order, layer contracts.
 - [`ONTOLOGY.md`](ONTOLOGY.md) — graph schema (six-step draft, all done).
 - [`CONTEXT.md`](CONTEXT.md) — domain language.
-- [`docs/adr/`](docs/adr/) — architecture decision records (0001–0020).
+- [`docs/running.md`](docs/running.md) — how to run the pipeline locally.
+- [`docs/adr/`](docs/adr/) — architecture decision records (0001–0021).
 - [`docs/grill-queue.md`](docs/grill-queue.md) — open design decisions tracking.
 - [`docs/agents/`](docs/agents/) — agent skill docs (issue tracker, triage labels, domain docs).
 
 ## Quickstart
 
-Boot the local-dev stack and install dev deps:
-
 ```sh
-docker compose up -d
-cp .env.example .env  # then edit as needed
-pip install -e '.[dev]'
+docker compose up -d --wait          # Neo4j + Redis + MinIO
+.venv/bin/pip install -e '.[dev]'
+cp .env.example .env                 # connection config; doo auto-loads it
+
+# turn a HAR into a graph:
+.venv/bin/doo engagement start --config tests/fixtures/yaml/acme-test.yaml
+.venv/bin/doo ingest har --engagement acme-test tests/fixtures/har/comprehensive.har
+.venv/bin/doo worker run --once
+# then explore http://localhost:7474  (neo4j / doo-dev-password)
 ```
 
-Run the tests:
+Full walkthrough, command reference, and troubleshooting: **[`docs/running.md`](docs/running.md)**.
+
+Run the tests (testcontainers — no compose stack needed):
 
 ```sh
-pytest
-```
-
-CLI:
-
-```sh
-doo engagement start --config path/to/engagement.yaml
-doo engagement status <engagement-id>
+.venv/bin/pytest -q
 ```
 
 ## Tech stack
