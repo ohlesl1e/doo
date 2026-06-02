@@ -26,13 +26,23 @@ from __future__ import annotations
 import dataclasses
 import difflib
 import json
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, Any, Protocol
 
-from doo.ids import EngagementId, ScopeContentHash
+import jwt
+
+from doo.canonical.identity import (
+    auth_context_id,
+    compute_auth_hash,
+    declared_principal_identity_key,
+    principal_id,
+)
+from doo.ids import EngagementId, ScopeContentHash, Sha256Hex
 from doo.observability.logging import get_logger
 from doo.setup.config import (
+    DeclaredPrincipal,
     EngagementConfig,
     compute_scope_content_hash,
 )
@@ -56,6 +66,19 @@ class ScopeChangeRequiresConfirmation(EngagementSetupError):
     """Material change detected and confirmation was refused or unavailable."""
 
 
+class MissingTokenEnvVarError(EngagementSetupError):
+    """A declared `auth_contexts[].token` env-var reference is unset at load time."""
+
+
+class JwtSubjectMismatchError(EngagementSetupError):
+    """A declared JWT's decoded `sub` disagrees with `known_signals.jwt_sub`.
+
+    Per the T4 spec this fails loudly at load time, naming both values — a
+    declared Principal whose token doesn't match its stated identity is a setup
+    error the tester must fix before any traffic is attributed.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Graph state abstraction.
 # ---------------------------------------------------------------------------
@@ -63,7 +86,13 @@ class ScopeChangeRequiresConfirmation(EngagementSetupError):
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class CurrentEngagementState:
-    """Snapshot of the current Engagement subgraph relevant to the loader."""
+    """Snapshot of the current Engagement subgraph relevant to the loader.
+
+    `declared_principals` is the material view of the engagement's declared
+    Principals (keyed by label) as currently stored in the graph — used to diff
+    principal adds/removes/mods (ADR-0019). Each value is the same shape produced
+    by `_principal_view`, so the diff is a plain dict comparison.
+    """
 
     engagement_id: EngagementId
     engagement_name: str
@@ -71,6 +100,7 @@ class CurrentEngagementState:
     scope_content_hash: ScopeContentHash
     kill_switch_ttl_seconds: int
     kill_switch_refresh_seconds: int
+    declared_principals: dict[str, dict[str, Any]] = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -189,6 +219,144 @@ def _scope_view(config: EngagementConfig) -> dict[str, Any]:
     }
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class _ResolvedAuthContext:
+    """A declared AuthContext after env-var resolution + JWT cross-check.
+
+    Carries only the secret-free derived material: the `auth_hash`, the kind,
+    decoded (unverified) JWT claims, and a derived `validity_window`. The raw
+    token is *never* stored here — it is hashed and discarded.
+    """
+
+    auth_hash: Sha256Hex
+    kind: str
+    bearer_claims: dict[str, str | int | float | bool | None]
+    validity_window: dict[str, Any] | None
+
+
+def _resolve_env_token(env_var_name: str, *, principal_label: str, env: dict[str, str]) -> str:
+    value = env.get(env_var_name)
+    if value is None or value == "":
+        raise MissingTokenEnvVarError(
+            f"declared principal {principal_label!r}: token env-var ${{{env_var_name}}} "
+            "is unset or empty at load time (ADR-0012: tokens come from the "
+            "environment, never the YAML)"
+        )
+    return value
+
+
+def _decode_jwt_unverified(token: str) -> dict[str, Any]:
+    """Decode a JWT without verification; `{}` if it isn't a JWT (ADR-0015)."""
+
+    try:
+        decoded = jwt.decode(token, options={"verify_signature": False, "verify_exp": False})
+    except jwt.PyJWTError:
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def _resolve_auth_context(
+    decl: Any,
+    *,
+    principal: DeclaredPrincipal,
+    env: dict[str, str],
+) -> _ResolvedAuthContext:
+    """Resolve one declared AuthContext: env token -> hash, JWT cross-check, exp.
+
+    Raw token resolved here is hashed and immediately dropped — only the hash and
+    derived metadata escape this function (ADR-0015).
+    """
+
+    token = _resolve_env_token(decl.env_var_name, principal_label=principal.label, env=env)
+    auth_hash = compute_auth_hash(decl.kind, token)
+
+    bearer_claims: dict[str, str | int | float | bool | None] = {}
+    validity_window: dict[str, Any] | None = None
+
+    if decl.kind == "bearer":
+        decoded = _decode_jwt_unverified(token)
+        # Cross-check decoded `sub` vs declared `known_signals.jwt_sub`.
+        declared_sub = principal.known_signals.jwt_sub
+        token_sub = decoded.get("sub")
+        if declared_sub is not None and token_sub is not None and str(token_sub) != declared_sub:
+            raise JwtSubjectMismatchError(
+                f"declared principal {principal.label!r}: token `sub` claim "
+                f"{str(token_sub)!r} disagrees with known_signals.jwt_sub "
+                f"{declared_sub!r}. Fix the token or the declared signal before loading."
+            )
+        # Keep only scalar claims (cue/graph carry scalars only).
+        for key, value in decoded.items():
+            if isinstance(value, str | int | float | bool) or value is None:
+                bearer_claims[str(key)] = value
+        exp = decoded.get("exp")
+        if isinstance(exp, int | float):
+            validity_window = {
+                "exp": datetime.fromtimestamp(float(exp), tz=UTC).isoformat()
+            }
+
+    # The raw `token` goes out of scope here and is never persisted.
+    return _ResolvedAuthContext(
+        auth_hash=auth_hash,
+        kind=decl.kind,
+        bearer_claims=bearer_claims,
+        validity_window=validity_window,
+    )
+
+
+def _principal_view(
+    principal: DeclaredPrincipal, resolved: tuple[_ResolvedAuthContext, ...]
+) -> dict[str, Any]:
+    """Material view of a declared Principal for diffing (ADR-0019).
+
+    Secret-free by construction: only `auth_hash`es and known-signal values,
+    never raw tokens. A change to any field (token reference -> different hash,
+    known_signals, auth-context kinds) is a material diff.
+    """
+
+    auth_contexts: list[dict[str, Any]] = sorted(
+        (
+            {
+                "kind": r.kind,
+                "auth_hash": r.auth_hash,
+                "validity_window": r.validity_window,
+            }
+            for r in resolved
+        ),
+        key=lambda a: str(a["auth_hash"]),
+    )
+    return {
+        "label": principal.label,
+        "description": principal.description,
+        "auth_contexts": auth_contexts,
+        "known_signals": {
+            "jwt_sub": principal.known_signals.jwt_sub,
+            "me_user_id": principal.known_signals.me_user_id,
+            "email": principal.known_signals.email,
+            "headers": dict(sorted(principal.known_signals.headers.items())),
+        },
+    }
+
+
+def _resolve_principals(
+    config: EngagementConfig, *, env: dict[str, str]
+) -> dict[str, tuple[DeclaredPrincipal, tuple[_ResolvedAuthContext, ...], dict[str, Any]]]:
+    """Resolve every declared Principal: env tokens, JWT cross-checks, views.
+
+    Returns a label-keyed map of `(principal, resolved_auth_contexts, view)`.
+    Raises `MissingTokenEnvVarError` / `JwtSubjectMismatchError` loudly.
+    """
+
+    out: dict[str, tuple[DeclaredPrincipal, tuple[_ResolvedAuthContext, ...], dict[str, Any]]] = {}
+    for principal in config.principals:
+        resolved = tuple(
+            _resolve_auth_context(ac, principal=principal, env=env)
+            for ac in principal.auth_contexts
+        )
+        view = _principal_view(principal, resolved)
+        out[principal.label] = (principal, resolved, view)
+    return out
+
+
 def _build_diff(
     *,
     engagement_id: EngagementId,
@@ -196,6 +364,7 @@ def _build_diff(
     desired_scope_view: dict[str, Any],
     desired_kill_switch: dict[str, Any],
     current_scope_view: dict[str, Any] | None,
+    desired_principal_views: dict[str, dict[str, Any]] | None = None,
 ) -> str:
     """Human-readable unified diff of the changes the loader would apply."""
 
@@ -211,10 +380,12 @@ def _build_diff(
             "lease_ttl_seconds": current.kill_switch_ttl_seconds,
             "refresh_interval_seconds": current.kill_switch_refresh_seconds,
         },
+        "principals": current.declared_principals,
     }
     desired_view = {
         "scope": desired_scope_view,
         "kill_switch": desired_kill_switch,
+        "principals": desired_principal_views if desired_principal_views is not None else {},
     }
 
     current_lines = render(current_view, f"engagement {engagement_id} (current)")
@@ -239,6 +410,7 @@ def load_engagement_from_yaml(
     stdin: IO[str] | None = None,
     stdout: IO[str] | None = None,
     now: datetime | None = None,
+    env: dict[str, str] | None = None,
 ) -> EngagementLoadResult:
     """Parse YAML, then delegate to `load_engagement`."""
 
@@ -267,11 +439,93 @@ def load_engagement_from_yaml(
         stdin=stdin,
         stdout=stdout,
         now=now,
+        env=env,
     )
 
     if prior_id is None:
         ledger.set(yaml_path, config.engagement.id)
     return result
+
+
+def _principal_mutations(
+    *,
+    engagement_id: EngagementId,
+    principal: DeclaredPrincipal,
+    resolved: tuple[_ResolvedAuthContext, ...],
+    view: dict[str, Any],
+    now: datetime,
+) -> list[PlannedMutation]:
+    """Emit the `principal_declare` + `auth_context_declare` mutations (ADR-0010).
+
+    Declared Principal: `tier="declared"`, `source="manual"`, `confidence=1.0`,
+    `confidence_method="manual"`. Each AuthContext is engagement-scoped and joined
+    by an `OF_PRINCIPAL` edge. The mutation properties carry only secret-free
+    derived material (hashes, claims, validity window).
+    """
+
+    identity_key = declared_principal_identity_key(principal.label)
+    p_id = principal_id(engagement_id, identity_key)
+    cross = {
+        "source": "manual",
+        "source_id": None,
+        "confidence": 1.0,
+        "confidence_method": "manual",
+        "first_seen": now,
+        "last_seen": now,
+        "ingested_at": now,
+        "status": "active",
+    }
+    out: list[PlannedMutation] = [
+        PlannedMutation(
+            kind="principal_declare",
+            properties={
+                "engagement_id": engagement_id,
+                "id": p_id,
+                "identity_key": identity_key,
+                "tier": "declared",
+                "label": principal.label,
+                "description": principal.description,
+                "known_signals": view["known_signals"],
+                **cross,
+            },
+        )
+    ]
+    for r in resolved:
+        ac_id = auth_context_id(engagement_id, r.auth_hash)
+        out.append(
+            PlannedMutation(
+                kind="auth_context_declare",
+                properties={
+                    "engagement_id": engagement_id,
+                    "id": ac_id,
+                    "auth_hash": r.auth_hash,
+                    "token_kind": r.kind,
+                    "tier": "declared",
+                    "is_anonymous": False,
+                    "validity_window": r.validity_window,
+                    "bearer_claims": r.bearer_claims,
+                    "principal_identity_key": identity_key,
+                    **cross,
+                },
+            )
+        )
+    return out
+
+
+def _principal_removal_mutations(
+    *, engagement_id: EngagementId, label: str
+) -> list[PlannedMutation]:
+    """Retract a declared Principal that was removed from the YAML (ADR-0019)."""
+
+    return [
+        PlannedMutation(
+            kind="principal_retract",
+            properties={
+                "engagement_id": engagement_id,
+                "identity_key": declared_principal_identity_key(label),
+            },
+        )
+    ]
 
 
 def load_engagement(
@@ -282,15 +536,21 @@ def load_engagement(
     stdin: IO[str] | None = None,
     stdout: IO[str] | None = None,
     now: datetime | None = None,
+    env: dict[str, str] | None = None,
 ) -> EngagementLoadResult:
     """Idempotent create-or-reattach.
 
     No filesystem / no YAML — caller has already turned a YAML file into a
     validated config. Suitable for direct programmatic use and for tests.
+
+    `env` is the environment used to resolve `${VAR}` token references; defaults
+    to `os.environ`. Injectable so tests need not mutate the real environment.
     """
 
     if now is None:
         now = datetime.now(UTC)
+    if env is None:
+        env = dict(os.environ)
 
     scope_content_hash = compute_scope_content_hash(config.scope)
     desired_scope_view = _scope_view(config)
@@ -298,6 +558,13 @@ def load_engagement(
         "backend": config.kill_switch.backend,
         "lease_ttl_seconds": config.kill_switch.lease_ttl_seconds,
         "refresh_interval_seconds": config.kill_switch.refresh_interval_seconds,
+    }
+
+    # Resolve declared Principals up front (env tokens, JWT cross-check, exp).
+    # Raises loudly on a missing env var or a sub/jwt_sub mismatch.
+    resolved_principals = _resolve_principals(config, env=env)
+    desired_principal_views = {
+        label: view for label, (_p, _r, view) in resolved_principals.items()
     }
 
     current = state.fetch_engagement_state(config.engagement.id)
@@ -355,11 +622,22 @@ def load_engagement(
                 },
             )
         )
+        for principal, resolved, view in resolved_principals.values():
+            mutations.extend(
+                _principal_mutations(
+                    engagement_id=config.engagement.id,
+                    principal=principal,
+                    resolved=resolved,
+                    view=view,
+                    now=now,
+                )
+            )
         state.apply_mutations(tuple(mutations))
         log.info(
             "engagement.created",
             engagement_id=config.engagement.id,
             scope_content_hash=scope_content_hash,
+            declared_principals=len(resolved_principals),
         )
         return EngagementLoadResult(
             engagement_id=config.engagement.id,
@@ -380,7 +658,25 @@ def load_engagement(
     name_changed = current.engagement_name != config.engagement.name
     description_changed = current.engagement_description != config.engagement.description
 
-    material = scope_changed or killswitch_changed
+    # Principal diff (ADR-0019): adds, removes, and mods are material. The
+    # comparison is over the secret-free `_principal_view` dicts.
+    current_principal_views = current.declared_principals
+    principals_added = sorted(
+        set(desired_principal_views) - set(current_principal_views)
+    )
+    principals_removed = sorted(
+        set(current_principal_views) - set(desired_principal_views)
+    )
+    principals_modified = sorted(
+        label
+        for label in set(desired_principal_views) & set(current_principal_views)
+        if desired_principal_views[label] != current_principal_views[label]
+    )
+    principals_changed = bool(
+        principals_added or principals_removed or principals_modified
+    )
+
+    material = scope_changed or killswitch_changed or principals_changed
     cosmetic = name_changed or description_changed
 
     if not material and not cosmetic:
@@ -403,6 +699,7 @@ def load_engagement(
             desired_scope_view=desired_scope_view,
             desired_kill_switch=desired_kill_switch,
             current_scope_view=None,
+            desired_principal_views=desired_principal_views,
         )
         if stdout is not None:
             stdout.write(diff)
@@ -465,6 +762,24 @@ def load_engagement(
                     "last_seen": now,
                 },
             )
+        )
+
+    # Principal adds + mods: (re-)declare. Removes: retract. Unrelated declared
+    # Principals (neither added/removed/modified) emit no mutation.
+    for label in (*principals_added, *principals_modified):
+        principal, resolved, view = resolved_principals[label]
+        mutations.extend(
+            _principal_mutations(
+                engagement_id=config.engagement.id,
+                principal=principal,
+                resolved=resolved,
+                view=view,
+                now=now,
+            )
+        )
+    for label in principals_removed:
+        mutations.extend(
+            _principal_removal_mutations(engagement_id=config.engagement.id, label=label)
         )
 
     state.apply_mutations(tuple(mutations))

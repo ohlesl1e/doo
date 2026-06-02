@@ -11,9 +11,12 @@ detected.
 """
 
 from doo.setup.config import (
+    DeclaredAuthContext,
+    DeclaredPrincipal,
     EngagementConfig,
     EngagementMeta,
     KillSwitchConfig,
+    KnownSignals,
     RateLimit,
     ScopeRules,
     TimeWindow,
@@ -23,17 +26,24 @@ from doo.setup.loader import (
     EngagementLoadResult,
     EngagementMismatchError,
     EngagementSetupError,
+    JwtSubjectMismatchError,
+    MissingTokenEnvVarError,
     ScopeChangeRequiresConfirmation,
     load_engagement,
 )
 
 __all__ = [
+    "DeclaredAuthContext",
+    "DeclaredPrincipal",
     "EngagementConfig",
     "EngagementLoadResult",
     "EngagementMeta",
     "EngagementMismatchError",
     "EngagementSetupError",
+    "JwtSubjectMismatchError",
     "KillSwitchConfig",
+    "KnownSignals",
+    "MissingTokenEnvVarError",
     "RateLimit",
     "ScopeChangeRequiresConfirmation",
     "ScopeRules",

@@ -32,7 +32,7 @@ import hashlib
 import ipaddress
 from urllib.parse import quote, unquote
 
-from doo.canonical.value_objects import HostRef, Scheme
+from doo.canonical.value_objects import AuthContextCue, HostRef, Scheme
 from doo.ids import (
     AuthContextId,
     EngagementId,
@@ -159,6 +159,43 @@ def compute_anonymous_auth_hash() -> Sha256Hex:
     return compute_auth_hash(ANONYMOUS_TOKEN_KIND, ANONYMOUS_TOKEN_VALUE)
 
 
+def compute_cue_auth_hash(cue: AuthContextCue) -> Sha256Hex:
+    """The AuthContext identity `auth_hash` for a (non-anonymous) cue.
+
+    The hash is deterministic over the cue's already-hashed credential material,
+    so two requests carrying the same credential collapse to one AuthContext.
+
+    A pure-bearer cue's `auth_hash` equals its `bearer_token_hash` — which is
+    `sha256("bearer:" || token)` — so a discovered bearer AuthContext shares the
+    identity of the declared AuthContext set up from the same token (ADR-0017),
+    and re-attaches rather than duplicating.
+
+    For multi-credential or non-bearer cues, the identity is a sha256 over the
+    sorted, kind-tagged hash material — still deterministic and secret-free.
+    """
+
+    if cue.is_anonymous:
+        return compute_anonymous_auth_hash()
+
+    parts: list[str] = []
+    if cue.bearer_token_hash is not None:
+        parts.append(f"bearer={cue.bearer_token_hash}")
+    for ch in sorted(cue.cookie_session_hashes):
+        parts.append(f"cookie={ch}")
+    for name in sorted(cue.api_key_headers):
+        parts.append(f"api_key={name.lower()}:{cue.api_key_headers[name]}")
+    if cue.basic_auth_user_hash is not None:
+        parts.append(f"basic_auth={cue.basic_auth_user_hash}")
+
+    # Single bearer credential: identity *is* the bearer hash, so a discovered
+    # bearer AuthContext converges onto the declared one from the same token.
+    if parts == [f"bearer={cue.bearer_token_hash}"] and cue.bearer_token_hash is not None:
+        return cue.bearer_token_hash
+
+    digest = hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+    return Sha256Hex(digest)
+
+
 def derive_har_source_id(entry_index: int, started_at: str) -> SourceId:
     """Per-entry stable `source_id` for HAR ingestion (ADR-0016).
 
@@ -230,3 +267,24 @@ def principal_id(engagement_id: EngagementId, identity_key: str) -> PrincipalId:
     """Stable `Principal` node id over `(engagement_id, identity_key)` (ADR-0010)."""
 
     return PrincipalId(_hash_tuple(engagement_id, identity_key))
+
+
+def declared_principal_identity_key(label: str) -> str:
+    """The `identity_key` of a declared Principal — its manual label (ADR-0010).
+
+    Declared Principals key on the tester-set label directly so re-loading the
+    same YAML converges to the same node.
+    """
+
+    return f"declared:{label}"
+
+
+def discovered_principal_identity_key(auth_hash: Sha256Hex) -> str:
+    """Synthetic-fallback `identity_key` for a discovered Principal (ADR-0010 step 5).
+
+    Deterministic over the first observed AuthContext's `auth_hash`, so
+    re-ingesting the same traffic converges to the same synthetic Principal
+    (needed for replay / audit reproducibility).
+    """
+
+    return f"discovered:{auth_hash}"

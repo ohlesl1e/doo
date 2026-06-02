@@ -90,8 +90,11 @@ class AuthContextCue(BaseModel):
 
     is_anonymous: bool
     bearer_token_hash: Sha256Hex | None = None
+    # Cookie session values, one hash per cookie name (sorted by name).
     cookie_session_hashes: tuple[Sha256Hex, ...] = ()
-    api_key_headers: tuple[str, ...] = ()
+    # API-key-bearing headers: header name -> hash of its value. Names are
+    # non-secret; the value hash is the secret-safe representation (ADR-0015).
+    api_key_headers: dict[str, Sha256Hex] = Field(default_factory=dict)
     basic_auth_user_hash: Sha256Hex | None = None
     # JWT decoded *without verification* (planner-side claim peek, not a trust
     # decision). Empty dict when not present or not parseable.
@@ -111,7 +114,13 @@ class AuthContextCue(BaseModel):
         if not self.is_anonymous and not carries_creds:
             raise ValueError("non-anonymous AuthContextCue must carry at least one credential hash")
         # All hashes must be sha256-hex shaped.
-        for h in (self.bearer_token_hash, self.basic_auth_user_hash, *self.cookie_session_hashes):
+        all_hashes = (
+            self.bearer_token_hash,
+            self.basic_auth_user_hash,
+            *self.cookie_session_hashes,
+            *self.api_key_headers.values(),
+        )
+        for h in all_hashes:
             if h is not None and not _SHA256_HEX_RE.match(h):
                 raise ValueError("auth hash must be 64 lowercase hex chars")
         return self

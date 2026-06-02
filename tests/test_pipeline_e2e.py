@@ -12,9 +12,11 @@ deleted).
 
 from __future__ import annotations
 
+import json as _json
 from collections.abc import Iterator
 from datetime import UTC, datetime
 
+import jwt as _jwt
 import pytest
 
 from doo.ids import EngagementId
@@ -27,7 +29,40 @@ from doo.ontology.commit import CommitOrchestrator, RedisSetNX
 from doo.ontology.graph_state import Neo4jGraphState
 from doo.ontology.l3_worker import L3WorkerDeps, run_l3_worker
 from doo.ontology.schema import apply_schema
+from doo.setup import EngagementConfig, load_engagement
 from tests.fixtures import ANON_HAR, MIXED_HAR
+from tests.test_loader import _base_config_dict
+
+_SIGNING_KEY = "irrelevant-signing-key-at-least-32-bytes-long!"
+_PIPELINE_TOKEN = _jwt.encode(
+    {"sub": "uuid-aaa", "exp": 4102444800}, _SIGNING_KEY, algorithm="HS256"
+)
+
+
+def _bearer_har(token: str) -> bytes:
+    """A single-entry HAR carrying `Authorization: Bearer <token>`."""
+
+    doc = {
+        "log": {
+            "version": "1.2",
+            "entries": [
+                {
+                    "startedDateTime": "2026-05-01T10:00:00.000Z",
+                    "request": {
+                        "method": "GET",
+                        "url": "https://api.example.com/me",
+                        "headers": [
+                            {"name": "Authorization", "value": f"Bearer {token}"}
+                        ],
+                        "cookies": [],
+                        "queryString": [],
+                    },
+                    "response": {"status": 200, "bodySize": 10},
+                }
+            ],
+        }
+    }
+    return _json.dumps(doc).encode("utf-8")
 
 
 @pytest.fixture
@@ -259,6 +294,61 @@ def test_cross_engagement_isolation(neo4j_client, redis_client, blob_client) -> 
         "WHERE a.id = b.id RETURN count(*) AS c"
     )
     assert shared[0]["c"] == 0
+
+
+def test_bearer_har_reconciles_to_declared_principal_no_raw_token(
+    neo4j_client, redis_client, blob_client
+) -> None:
+    """T4 end-to-end: a bearer HAR whose JWT sub matches a declared Principal's
+    `known_signals.jwt_sub` attaches to that declared Principal (no phantom twin),
+    and the raw token appears in no Neo4j node property (acceptance criterion)."""
+
+    eid = "eng-e2e-bearer"
+    d = _base_config_dict()
+    d["engagement"]["id"] = eid
+    d["scope"]["host_patterns"] = ["^api\\.example\\.com$"]
+    d["principals"] = [
+        {
+            "label": "test-user-a",
+            "auth_contexts": [{"kind": "bearer", "token": "${TOK_A}"}],
+            "known_signals": {"jwt_sub": "uuid-aaa"},
+        }
+    ]
+    config = EngagementConfig.model_validate(d)
+    load_engagement(config, Neo4jGraphState(neo4j_client), env={"TOK_A": _PIPELINE_TOKEN})
+
+    _run_pipeline(
+        neo4j=neo4j_client,
+        redis_client=redis_client,
+        blob_client=blob_client,
+        engagement_id=eid,
+        har_bytes=_bearer_har(_PIPELINE_TOKEN),
+        filename="bearer.har",
+    )
+
+    # No phantom twin: exactly one non-anonymous Principal (the declared one).
+    rows = neo4j_client.execute_read(
+        "MATCH (p:Principal {engagement_id: $eid, tier: 'declared', label: 'test-user-a'}) "
+        "RETURN count(p) AS c",
+        eid=eid,
+    )
+    assert rows[0]["c"] == 1
+    disc = neo4j_client.execute_read(
+        "MATCH (p:Principal {engagement_id: $eid, tier: 'discovered'}) "
+        "WHERE p.is_anonymous = false RETURN count(p) AS c",
+        eid=eid,
+    )
+    assert disc[0]["c"] == 0
+
+    # Secrets discipline: the raw token (and its signature) live in no node prop.
+    nodes = neo4j_client.execute_read(
+        "MATCH (n {engagement_id: $eid}) RETURN properties(n) AS props", eid=eid
+    )
+    import json as _j
+
+    blob = _j.dumps([n["props"] for n in nodes], default=str)
+    assert _PIPELINE_TOKEN not in blob
+    assert _PIPELINE_TOKEN.split(".")[2] not in blob
 
 
 def test_unknown_engagement_4xx_nothing_lands(neo4j_client, redis_client, blob_client) -> None:

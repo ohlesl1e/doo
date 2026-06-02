@@ -180,11 +180,12 @@ class CommitOrchestrator:
             observed_at=obs.observed_at,
             ingested_at=obs.ingested_at,
         )
-        anon = resolve_auth_context(
+        auth = resolve_auth_context(
             self._neo4j,
             engagement_id=obs.engagement_id,
             observed_at=obs.observed_at,
             ingested_at=obs.ingested_at,
+            cue=obs.auth_context_cue,
         )
         # Commit the observation node + its non-HIT edges first, so the
         # re-templating pass sees it in the cohort it reads back.
@@ -192,7 +193,7 @@ class CommitOrchestrator:
             self._neo4j,
             obs=obs,
             host_node_id=host_node_id,
-            auth_context_node_id=anon.auth_context_id,
+            auth_context_node_id=auth.auth_context_id,
         )
         # Endpoint identity is a revisable inference (ADR-0004): re-template the
         # whole (method, host) cohort, which owns Endpoint creation, HIT
@@ -209,18 +210,18 @@ class CommitOrchestrator:
 
         base_node_ids = (
             host_node_id,
-            str(anon.auth_context_id),
-            str(anon.principal_id),
+            str(auth.auth_context_id),
+            str(auth.principal_id),
             str(obs.observation_id),
         )
         node_ids = base_node_ids + retemplate.endpoint_ids + retemplate.parameter_ids
         l3_events = (
             self._node_created("Host", host_node_id, obs, commit_id, span_id),
             self._node_created(
-                "AuthContext", str(anon.auth_context_id), obs, commit_id, span_id
+                "AuthContext", str(auth.auth_context_id), obs, commit_id, span_id
             ),
             self._node_created(
-                "Principal", str(anon.principal_id), obs, commit_id, span_id
+                "Principal", str(auth.principal_id), obs, commit_id, span_id
             ),
             self._node_created(
                 "RequestObservation", str(obs.observation_id), obs, commit_id, span_id

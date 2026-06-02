@@ -1,10 +1,10 @@
 """HAR 1.2 parser (slice-1 T2, deep module B).
 
-Turns a HAR blob into a sequence of `L2Event`s. Slice-1 scope is the simplest
-contents: anonymous unauthenticated `GET`s with concrete paths, no body
-extraction, no path templating, no response-artifact extraction. Each entry
-becomes exactly one `RequestObservation` carrying `AuthContextCue(is_anonymous
-=True)`.
+Turns a HAR blob into a sequence of `L2Event`s. Each entry becomes one
+`RequestObservation` carrying an `AuthContextCue` extracted from its request
+headers/cookies — hashed at the L2 boundary so raw tokens never leave this layer
+(ADR-0015). Anonymous requests carry `AuthContextCue(is_anonymous=True)`. No body
+extraction and no response-artifact extraction in slice-1 (those land in T6).
 
 `ParseFailure` handling is first-class from day one: a malformed entry yields a
 `ParseFailure` event (not an exception) so the L2 worker never crashes on bad
@@ -16,12 +16,21 @@ No LLM here — deterministic parsing only (CLAUDE.md hard rule).
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from urllib.parse import parse_qsl, urlsplit
 
-from doo.canonical.identity import canonicalize_host, canonicalize_path, derive_har_source_id
+import jwt
+
+from doo.canonical.identity import (
+    canonicalize_host,
+    canonicalize_path,
+    compute_auth_hash,
+    derive_har_source_id,
+)
 from doo.canonical.value_objects import AuthContextCue, HostRef
 from doo.events.envelope import IngestionEnvelope
 from doo.events.l2 import (
@@ -31,8 +40,14 @@ from doo.events.l2 import (
     ParseFailure,
     RequestObservation,
 )
-from doo.ids import L2EventId, ObservationId, SourceId
+from doo.ids import L2EventId, ObservationId, Sha256Hex, SourceId
 from doo.observability.ids import new_span_id
+
+# Header names (lowercased) treated as API-key-bearing. `Authorization` is handled
+# separately (bearer / basic); these are the common bespoke key headers.
+_API_KEY_HEADER_NAMES: frozenset[str] = frozenset(
+    ("x-api-key", "apikey", "api-key", "x-api-token", "x-auth-token", "x-access-token")
+)
 
 # Methods we accept in slice-1. HAR may carry others; an unexpected method on an
 # otherwise-valid entry is still parsed (we don't restrict to GET) — scope
@@ -128,6 +143,7 @@ def _parse_entry(
 
         host_ref, concrete_path, query_string = _split_url(url)
         query_params = _query_parameters(request, query_string)
+        auth_context_cue = extract_auth_context_cue(request)
 
         response = entry.get("response")
         response_status, response_size = _response_shape(response)
@@ -157,7 +173,7 @@ def _parse_entry(
             query_params=query_params,
             body_params=(),
             request_body_ref=None,
-            auth_context_cue=AuthContextCue(is_anonymous=True),
+            auth_context_cue=auth_context_cue,
             response_status=response_status,
             response_headers=(),
             response_body_ref=None,
@@ -239,6 +255,148 @@ def _query_parameters(
             if name:
                 out.append(ObservedParameter(name=name, location="query", value=value or None))
     return tuple(out)
+
+
+def _header_map(request: dict[str, object]) -> dict[str, str]:
+    """Lowercased header name -> value from a HAR request's `headers` array.
+
+    On duplicate header names, the last value wins (HAR rarely repeats them).
+    """
+
+    out: dict[str, str] = {}
+    raw = request.get("headers")
+    if isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            value = item.get("value")
+            if isinstance(name, str) and isinstance(value, str):
+                out[name.lower()] = value
+    return out
+
+
+def _cookie_pairs(request: dict[str, object]) -> list[tuple[str, str]]:
+    """`(name, value)` cookie pairs from a HAR request's `cookies` array."""
+
+    out: list[tuple[str, str]] = []
+    raw = request.get("cookies")
+    if isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            value = item.get("value")
+            if isinstance(name, str) and name and isinstance(value, str):
+                out.append((name, value))
+    return out
+
+
+def _decode_jwt_claims(token: str) -> dict[str, str | int | float | bool | None]:
+    """Decode a JWT *without verification* (claim peek only, never a trust call).
+
+    Per ADR-0015 / the issue: `verify_signature=False`, `verify_exp=False`. Any
+    non-JWT bearer token (opaque, not three base64url segments) yields `{}`.
+    Only scalar claims are kept (the cue's `bearer_claims` type is scalar-valued);
+    structured claims are dropped for the cue.
+    """
+
+    try:
+        decoded = jwt.decode(
+            token,
+            options={"verify_signature": False, "verify_exp": False},
+        )
+    except jwt.PyJWTError:
+        return {}
+    if not isinstance(decoded, dict):
+        return {}
+    claims: dict[str, str | int | float | bool | None] = {}
+    for key, value in decoded.items():
+        if isinstance(value, str | int | float | bool) or value is None:
+            claims[str(key)] = value
+    return claims
+
+
+def extract_auth_context_cue(request: dict[str, object]) -> AuthContextCue:
+    """Extract an `AuthContextCue` from a HAR request, hashing at the L2 boundary.
+
+    Per ADR-0015 raw tokens never leave L2: every credential is reduced to a
+    sha256 here and the raw bytes are dropped. Detects:
+
+    - `Authorization: Bearer <jwt>` -> `bearer_token_hash` + decoded (unverified)
+      `bearer_claims`.
+    - `Authorization: Basic <b64>` -> hash of the *username only*; the password is
+      never carried forward.
+    - cookies -> per-cookie-name value hashes (sorted by name).
+    - `X-API-Key`-style headers -> per-header-name value hashes.
+
+    When no auth-bearing material is present, returns the anonymous singleton cue
+    (`is_anonymous=True`).
+    """
+
+    headers = _header_map(request)
+
+    bearer_token_hash: Sha256Hex | None = None
+    basic_auth_user_hash: Sha256Hex | None = None
+    bearer_claims: dict[str, str | int | float | bool | None] = {}
+
+    authorization = headers.get("authorization", "").strip()
+    if authorization:
+        scheme, _, credential = authorization.partition(" ")
+        scheme_lower = scheme.lower()
+        credential = credential.strip()
+        if scheme_lower == "bearer" and credential:
+            bearer_token_hash = compute_auth_hash("bearer", credential)
+            bearer_claims = _decode_jwt_claims(credential)
+        elif scheme_lower == "basic" and credential:
+            username = _basic_auth_username(credential)
+            if username is not None:
+                # Hash the username only — the password never leaves L2.
+                basic_auth_user_hash = compute_auth_hash("basic_auth", username)
+
+    cookie_hashes = tuple(
+        compute_auth_hash("cookie", value)
+        for _name, value in sorted(_cookie_pairs(request), key=lambda p: p[0])
+    )
+
+    api_key_headers: dict[str, Sha256Hex] = {}
+    for name_lower, value in headers.items():
+        if name_lower in _API_KEY_HEADER_NAMES and value:
+            api_key_headers[name_lower] = compute_auth_hash("api_key", value)
+
+    if (
+        bearer_token_hash is None
+        and basic_auth_user_hash is None
+        and not cookie_hashes
+        and not api_key_headers
+    ):
+        return AuthContextCue(is_anonymous=True)
+
+    return AuthContextCue(
+        is_anonymous=False,
+        bearer_token_hash=bearer_token_hash,
+        cookie_session_hashes=cookie_hashes,
+        api_key_headers=api_key_headers,
+        basic_auth_user_hash=basic_auth_user_hash,
+        bearer_claims=bearer_claims,
+    )
+
+
+def _basic_auth_username(credential: str) -> str | None:
+    """Decode a base64 `Basic` credential and return the username only.
+
+    Returns `None` if the credential isn't decodable base64 `user:pass`. The
+    password is intentionally never returned — it must not leave L2 (ADR-0015).
+    """
+
+    try:
+        raw = base64.b64decode(credential, validate=True).decode("utf-8", errors="replace")
+    except (binascii.Error, ValueError):
+        return None
+    username, sep, _password = raw.partition(":")
+    if not sep:
+        return None
+    return username
 
 
 def _response_shape(response: object) -> tuple[int, int]:

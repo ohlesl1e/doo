@@ -39,17 +39,66 @@ class FakeGraphState:
 
     by_id: dict[EngagementId, CurrentEngagementState] = field(default_factory=dict)
     applied: list[PlannedMutation] = field(default_factory=list)
+    # engagement_id -> {label -> _principal_view-shaped dict}
+    principals: dict[EngagementId, dict[str, dict]] = field(default_factory=dict)
 
     def fetch_engagement_state(
         self, engagement_id: EngagementId
     ) -> CurrentEngagementState | None:
-        return self.by_id.get(engagement_id)
+        base = self.by_id.get(engagement_id)
+        if base is None:
+            return None
+        # Re-emit with the current principal views attached (loader diffs these).
+        return CurrentEngagementState(
+            engagement_id=base.engagement_id,
+            engagement_name=base.engagement_name,
+            engagement_description=base.engagement_description,
+            scope_content_hash=base.scope_content_hash,
+            kill_switch_ttl_seconds=base.kill_switch_ttl_seconds,
+            kill_switch_refresh_seconds=base.kill_switch_refresh_seconds,
+            declared_principals=dict(self.principals.get(engagement_id, {})),
+        )
+
+    def _apply_principal_mutation(self, m: PlannedMutation) -> None:
+        eid = m.properties["engagement_id"]
+        bucket = self.principals.setdefault(eid, {})
+        if m.kind == "principal_declare":
+            label = m.properties["label"]
+            ks = m.properties["known_signals"]
+            view = bucket.setdefault(
+                label,
+                {"label": label, "description": None, "auth_contexts": [], "known_signals": ks},
+            )
+            view["description"] = m.properties["description"]
+            view["known_signals"] = ks
+            view["auth_contexts"] = []  # rebuilt by following auth_context_declare
+        elif m.kind == "auth_context_declare":
+            # Attach to the most recently declared principal (label via identity_key).
+            ik = m.properties["principal_identity_key"]
+            label = ik.removeprefix("declared:")
+            view = bucket.setdefault(
+                label,
+                {"label": label, "description": None, "auth_contexts": [], "known_signals": {}},
+            )
+            view["auth_contexts"].append(
+                {
+                    "kind": m.properties["token_kind"],
+                    "auth_hash": m.properties["auth_hash"],
+                    "validity_window": m.properties["validity_window"],
+                }
+            )
+            view["auth_contexts"].sort(key=lambda a: str(a["auth_hash"]))
+        elif m.kind == "principal_retract":
+            label = m.properties["identity_key"].removeprefix("declared:")
+            bucket.pop(label, None)
 
     def apply_mutations(self, mutations: tuple[PlannedMutation, ...]) -> None:
         self.applied.extend(mutations)
         # Record what the state would look like after applying — so subsequent
         # `fetch_engagement_state` calls in the same test see the new world.
         for m in mutations:
+            if m.kind in ("principal_declare", "auth_context_declare", "principal_retract"):
+                self._apply_principal_mutation(m)
             if m.kind == "engagement_create":
                 # Find the matching scope mutation we just recorded.
                 scope_hash = None
@@ -250,11 +299,34 @@ def test_loader_strict_extra_forbid_rejects_unknown_yaml_keys() -> None:
         _build_config(d)
 
 
-def test_loader_t1_does_not_accept_principals_block() -> None:
-    """Principals block lands in T4; T1 schema must not silently accept it."""
+def test_loader_accepts_well_formed_principals_block() -> None:
+    """T4: the `principals[]` block is now a valid part of the schema."""
+
+    d = _base_config_dict()
+    d["principals"] = [
+        {
+            "label": "test-user-a",
+            "auth_contexts": [{"kind": "bearer", "token": "${TOK_A}"}],
+            "known_signals": {"jwt_sub": "uuid-aaa"},
+        }
+    ]
+    config = _build_config(d)
+    assert config.principals[0].label == "test-user-a"
+    assert config.principals[0].auth_contexts[0].env_var_name == "TOK_A"
+
+
+def test_loader_rejects_inline_token_and_non_kebab_label() -> None:
+    """T4: tokens must be env-var refs (ADR-0012); labels must be kebab-case."""
     from pydantic import ValidationError
 
     d = _base_config_dict()
-    d["principals"] = [{"label": "test_user_a"}]
+    d["principals"] = [
+        {"label": "test-user-a", "auth_contexts": [{"kind": "bearer", "token": "raw-secret"}]}
+    ]
     with pytest.raises(ValidationError):
         _build_config(d)
+
+    d2 = _base_config_dict()
+    d2["principals"] = [{"label": "Test_User_A"}]
+    with pytest.raises(ValidationError):
+        _build_config(d2)

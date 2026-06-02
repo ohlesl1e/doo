@@ -1,8 +1,10 @@
 """`EngagementConfig` Pydantic model and `Scope.content_hash` computation.
 
-Per ADR-0012 setup declares only tester-side facts. T1 covers Engagement
-metadata + Scope rules + kill-switch config. Declared Principals (the
-`principals:` block) ship in T4 — intentionally absent here.
+Per ADR-0012 setup declares only tester-side facts: Engagement metadata, Scope
+rules, kill-switch config, and (T4) declared `Principal`s — the test accounts the
+tester controls, their `AuthContext` token material (as env-var references, never
+inline), and any identifying signals the tester observed from warm-up traffic
+against their own accounts.
 
 Per ADR-0017 the Scope identity is `sha256(canonicalized(rule_document))`. The
 canonicalisation is "sort all keys, sort list items where order does not
@@ -15,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -145,6 +148,100 @@ class EngagementMeta(BaseModel):
     time_window: TimeWindow | None = None
 
 
+# ---------------------------------------------------------------------------
+# Declared Principals (T4, ADR-0010 + ADR-0012).
+# ---------------------------------------------------------------------------
+
+# Auth schemes a tester may declare for a Principal's AuthContext. These are the
+# token *kinds* understood by the L2 secrets-hashing boundary (ADR-0015) and the
+# `auth_hash` identity rule (ADR-0017).
+AuthContextKind = Literal["bearer", "cookie", "api_key", "basic_auth"]
+
+# `${ENV_VAR}` reference. Tokens never appear inline per ADR-0012 — only the name
+# of the environment variable the loader resolves at load time.
+_ENV_REF_RE = re.compile(r"^\$\{(?P<name>[A-Za-z_][A-Za-z0-9_]*)\}$")
+
+# Stable kebab-case label for a declared Principal (the manual `identity_key`).
+_LABEL_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+
+class DeclaredAuthContext(BaseModel):
+    """One declared `AuthContext` for a Principal (ADR-0012).
+
+    `token` is an env-var reference (`${VAR}`), never an inline secret. The loader
+    resolves it at load time, hashes it at the boundary, and discards the raw
+    value — it never reaches the graph (ADR-0015).
+    """
+
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    kind: AuthContextKind
+    token: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _token_is_env_ref(self) -> Self:
+        if not _ENV_REF_RE.match(self.token):
+            raise ValueError(
+                f"auth_contexts[].token must be an env-var reference like ${{VAR}} "
+                f"(ADR-0012: tokens never inline); got {self.token!r}"
+            )
+        return self
+
+    @property
+    def env_var_name(self) -> str:
+        """The `VAR` name inside the `${VAR}` reference."""
+
+        m = _ENV_REF_RE.match(self.token)
+        assert m is not None  # guaranteed by the validator
+        return m.group("name")
+
+
+class KnownSignals(BaseModel):
+    """Identifying signals the tester observed from warm-up traffic (ADR-0012).
+
+    These drive declared-vs-discovered reconciliation (ADR-0010): a discovered
+    AuthContext whose signal matches one of these attaches to this declared
+    Principal rather than spawning a phantom twin.
+
+    All fields optional; a Principal may be declared with token material alone.
+    `headers` maps an identifying header name to its expected value (e.g.
+    `{"X-User-Id": "42"}`).
+    """
+
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    jwt_sub: str | None = None
+    me_user_id: str | None = None
+    email: str | None = None
+    headers: dict[str, str] = Field(default_factory=dict)
+
+
+class DeclaredPrincipal(BaseModel):
+    """A test account the tester controls (ADR-0012 + ADR-0010).
+
+    `label` is the stable kebab-case `identity_key` for the declared tier. The
+    `auth_contexts` carry env-var token references; `known_signals` carry the
+    identifying signals used for reconciliation.
+    """
+
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    label: str = Field(min_length=1)
+    description: str | None = None
+    auth_contexts: tuple[DeclaredAuthContext, ...] = ()
+    known_signals: KnownSignals = Field(default_factory=KnownSignals)
+
+    _coerce_auth_contexts = field_validator("auth_contexts", mode="before")(_list_to_tuple)
+
+    @model_validator(mode="after")
+    def _label_is_kebab(self) -> Self:
+        if not _LABEL_RE.match(self.label):
+            raise ValueError(
+                f"principal label must be kebab-case ([a-z0-9-]); got {self.label!r}"
+            )
+        return self
+
+
 class EngagementConfig(BaseModel):
     """The whole YAML file, validated."""
 
@@ -153,6 +250,16 @@ class EngagementConfig(BaseModel):
     engagement: EngagementMeta
     scope: ScopeRules
     kill_switch: KillSwitchConfig = Field(default_factory=KillSwitchConfig)
+    principals: tuple[DeclaredPrincipal, ...] = ()
+
+    _coerce_principals = field_validator("principals", mode="before")(_list_to_tuple)
+
+    @model_validator(mode="after")
+    def _unique_principal_labels(self) -> Self:
+        labels = [p.label for p in self.principals]
+        if len(set(labels)) != len(labels):
+            raise ValueError("principal labels must be unique within an engagement")
+        return self
 
 
 # ---------------------------------------------------------------------------
