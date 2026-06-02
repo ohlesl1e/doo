@@ -8,7 +8,7 @@ spans — flipping that switch later is a configuration change (ADR-0018).
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 import structlog
 from structlog.contextvars import bind_contextvars, clear_contextvars, merge_contextvars
@@ -97,4 +97,5 @@ def clear_correlation() -> None:
 
 def get_logger(name: str | None = None) -> structlog.stdlib.BoundLogger:
     """Get a structlog bound logger."""
-    return structlog.get_logger(name) if name is not None else structlog.get_logger()
+    logger = structlog.get_logger(name) if name is not None else structlog.get_logger()
+    return cast("structlog.stdlib.BoundLogger", logger)

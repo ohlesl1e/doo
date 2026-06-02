@@ -129,7 +129,8 @@ class JsonFileLedger:
         if not self.ledger_path.exists():
             return {}
         try:
-            return json.loads(self.ledger_path.read_text())
+            data: dict[str, str] = json.loads(self.ledger_path.read_text())
+            return data
         except json.JSONDecodeError:
             log.warning(
                 "engagement_ledger.unreadable", path=str(self.ledger_path), action="treat_as_empty"

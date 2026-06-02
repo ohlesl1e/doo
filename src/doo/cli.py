@@ -18,7 +18,7 @@ from doo.ingestion.cli_ingest import register_ingest
 from doo.observability.ids import new_span_id, new_trace_id
 from doo.observability.logging import bind_correlation, configure_logging, get_logger
 from doo.setup import EngagementMismatchError, ScopeChangeRequiresConfirmation
-from doo.setup.loader import JsonFileLedger, load_engagement_from_yaml
+from doo.setup.loader import GraphState, JsonFileLedger, load_engagement_from_yaml
 
 app = typer.Typer(
     help="DOO — Department of Offense. Black-box security testing copilot.",
@@ -46,7 +46,7 @@ def _default_ledger() -> JsonFileLedger:
     return JsonFileLedger(home / ".doo" / "engagement_ledger.json")
 
 
-def _build_graph_state():
+def _build_graph_state() -> GraphState:
     """Build the Neo4j-backed `GraphState` implementation.
 
     Slice-1 T1 does not yet implement a real Neo4j writer — the L3 commit path
@@ -96,10 +96,10 @@ def start(
         )
     except EngagementMismatchError as exc:
         typer.secho(f"engagement.id mismatch: {exc}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=2)
+        raise typer.Exit(code=2) from exc
     except ScopeChangeRequiresConfirmation as exc:
         typer.secho(f"refused: {exc}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=3)
+        raise typer.Exit(code=3) from exc
 
     if result.created:
         typer.echo(f"created engagement {result.engagement_id} (scope {result.scope_content_hash[:12]}...)")
