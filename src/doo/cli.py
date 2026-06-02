@@ -36,6 +36,16 @@ app.add_typer(engagement_app, name="engagement")
 log = get_logger(__name__)
 
 
+@app.callback()
+def _load_environment() -> None:
+    """Load a `.env` from the current directory (if present) before any command
+    reads `DOO_*` config, so connection vars don't have to be exported by hand."""
+
+    from doo.cli_env import load_dotenv
+
+    load_dotenv()
+
+
 def _default_ledger() -> JsonFileLedger:
     """Default ledger path: `~/.doo/engagement_ledger.json`.
 
@@ -62,11 +72,11 @@ def _build_graph_state() -> GraphState:
     """
     import os
 
-    from doo.infra.neo4j_driver import Neo4jClient
+    from doo.cli_env import connect_neo4j_or_exit
     from doo.ontology.graph_state import Neo4jGraphState
     from doo.ontology.schema import apply_schema
 
-    client = Neo4jClient.connect(
+    client = connect_neo4j_or_exit(
         os.environ.get("DOO_NEO4J_URI", "bolt://localhost:7687"),
         os.environ.get("DOO_NEO4J_USER", "neo4j"),
         os.environ.get("DOO_NEO4J_PASSWORD", "password"),

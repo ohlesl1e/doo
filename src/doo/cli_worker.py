@@ -60,15 +60,15 @@ class _WorkerRuntime:
     def __init__(self) -> None:
         import redis
 
+        from doo.cli_env import connect_neo4j_or_exit
         from doo.infra.blobs import BlobClient
-        from doo.infra.neo4j_driver import Neo4jClient
         from doo.infra.streams import RedisStreamLike, StreamClient
         from doo.ingestion.l2_worker import L2WorkerDeps
         from doo.ontology.commit import CommitOrchestrator, RedisSetNX
         from doo.ontology.l3_worker import L3WorkerDeps
         from doo.ontology.schema import apply_schema
 
-        self._neo4j = Neo4jClient.connect(
+        self._neo4j = connect_neo4j_or_exit(
             _env("DOO_NEO4J_URI", "bolt://localhost:7687"),
             _env("DOO_NEO4J_USER", "neo4j"),
             _env("DOO_NEO4J_PASSWORD", "password"),

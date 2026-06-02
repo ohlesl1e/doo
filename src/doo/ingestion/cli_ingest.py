@@ -44,13 +44,13 @@ def _build_intake_deps() -> IntakeDeps:
 
     import redis
 
+    from doo.cli_env import connect_neo4j_or_exit
     from doo.infra.blobs import BlobClient
-    from doo.infra.neo4j_driver import Neo4jClient
     from doo.infra.streams import RedisStreamLike, StreamClient
     from doo.ingestion.intake import IntakeDeps
     from doo.ontology.graph_state import Neo4jGraphState
 
-    neo4j = Neo4jClient.connect(
+    neo4j = connect_neo4j_or_exit(
         _env("DOO_NEO4J_URI", "bolt://localhost:7687"),
         _env("DOO_NEO4J_USER", "neo4j"),
         _env("DOO_NEO4J_PASSWORD", "password"),
