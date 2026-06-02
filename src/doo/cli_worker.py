@@ -21,14 +21,47 @@ the credentials, which you must export to match compose.
 from __future__ import annotations
 
 import os
+from collections import Counter
 from collections.abc import Callable
 from typing import Annotated, cast
 
 import typer
 
+from doo.events.l2 import L2Event, ParseFailure
 from doo.observability.logging import configure_logging, get_logger
 
 log = get_logger(__name__)
+
+
+def _truncate(text: str, limit: int = 160) -> str:
+    collapsed = " ".join(text.split())
+    return collapsed if len(collapsed) <= limit else collapsed[: limit - 3] + "..."
+
+
+def _report_parse_failures(failures: list[ParseFailure]) -> None:
+    """Print a grouped-by-kind summary of the ParseFailures from a drain, so a
+    HAR that didn't ingest explains itself without a Neo4j query."""
+
+    if not failures:
+        return
+    typer.echo("")
+    typer.secho(
+        f"{len(failures)} parse failure(s) — entries that did not ingest:",
+        fg=typer.colors.YELLOW,
+    )
+    by_kind: Counter[str] = Counter(f.error_kind for f in failures)
+    sample: dict[str, ParseFailure] = {}
+    for f in failures:
+        sample.setdefault(f.error_kind, f)
+    for kind, count in by_kind.most_common():
+        s = sample[kind]
+        where = f" [{s.location_hint}]" if s.location_hint else ""
+        typer.secho(f"  {kind} x{count}: {_truncate(s.error_message)}{where}", fg=typer.colors.YELLOW)
+    typer.secho(
+        "  full detail: MATCH (f:ParseFailure) "
+        "RETURN f.error_kind, f.error_message, f.location_hint",
+        fg=typer.colors.YELLOW,
+    )
 
 
 def _env(name: str, default: str) -> str:
@@ -136,9 +169,25 @@ def register_worker(app: typer.Typer) -> None:
         from doo.ontology.l3_worker import run_l3_worker
 
         runtime = _WorkerRuntime()
+        failures: list[ParseFailure] = []
 
-        def _run_l2(block_ms: int) -> int:
-            return run_l2_worker(runtime.l2_deps, max_messages=batch, block_ms=block_ms)
+        def _collect(events: list[L2Event]) -> None:
+            failures.extend(e for e in events if isinstance(e, ParseFailure))
+
+        def _stream(events: list[L2Event]) -> None:
+            for e in events:
+                if isinstance(e, ParseFailure):
+                    where = f" [{e.location_hint}]" if e.location_hint else ""
+                    typer.secho(
+                        f"  parse failure [{e.error_kind}]{where}: {_truncate(e.error_message)}",
+                        fg=typer.colors.YELLOW,
+                        err=True,
+                    )
+
+        def _run_l2(block_ms: int, on_events: Callable[[list[L2Event]], None]) -> int:
+            return run_l2_worker(
+                runtime.l2_deps, max_messages=batch, block_ms=block_ms, on_events=on_events
+            )
 
         def _run_l3(block_ms: int) -> int:
             return run_l3_worker(runtime.l3_deps, max_messages=batch, block_ms=block_ms)
@@ -146,17 +195,18 @@ def register_worker(app: typer.Typer) -> None:
         try:
             if once:
                 extracted, committed = _drain_once(
-                    run_l2=lambda: _run_l2(500), run_l3=lambda: _run_l3(500)
+                    run_l2=lambda: _run_l2(500, _collect), run_l3=lambda: _run_l3(500)
                 )
                 typer.echo(
                     f"drained: {extracted} envelope(s) extracted, "
                     f"{committed} L2 event(s) committed"
                 )
+                _report_parse_failures(failures)
                 return
             typer.echo("worker running — consuming ingest -> l2-events -> l3-events (Ctrl-C to stop)")
             try:
                 while True:
-                    _run_l2(1000)
+                    _run_l2(1000, _stream)
                     _run_l3(1000)
             except KeyboardInterrupt:
                 typer.echo("\nstopped")

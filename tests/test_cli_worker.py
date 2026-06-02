@@ -8,10 +8,34 @@ onto the root CLI.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from uuid import uuid4
+
 from typer.testing import CliRunner
 
 from doo.cli import app
-from doo.cli_worker import _drain_once
+from doo.cli_worker import _drain_once, _report_parse_failures, _truncate
+from doo.events.l2 import ParseFailure
+from doo.ids import EngagementId, L2EventId, ObservationId, SourceId
+
+
+def _parse_failure(kind: str, msg: str, where: str | None = "log") -> ParseFailure:
+    return ParseFailure(
+        event_id=L2EventId("e" * 32),
+        trace_id="a" * 32,  # type: ignore[arg-type]
+        span_id="b" * 16,  # type: ignore[arg-type]
+        engagement_id=EngagementId("eng-x"),
+        envelope_event_id=uuid4(),
+        source="har",
+        source_id=SourceId("0|t"),
+        ingested_at=datetime.now(UTC),
+        observed_at=datetime.now(UTC),
+        confidence=1.0,
+        observation_id=ObservationId("eng-x:har:pf:0|t"),
+        error_kind=kind,  # type: ignore[arg-type]
+        error_message=msg,
+        location_hint=where,
+    )
 
 
 def test_drain_once_continues_until_both_passes_are_idle() -> None:
@@ -33,3 +57,29 @@ def test_worker_run_command_is_registered() -> None:
     result = CliRunner().invoke(app, ["worker", "--help"])
     assert result.exit_code == 0
     assert "run" in result.output
+
+
+def test_truncate_collapses_whitespace_and_limits_length() -> None:
+    assert _truncate("a   b\nc", 100) == "a b c"
+    out = _truncate("x" * 300, 50)
+    assert len(out) == 50
+    assert out.endswith("...")
+
+
+def test_report_parse_failures_groups_by_kind(capsys) -> None:
+    _report_parse_failures(
+        [
+            _parse_failure("decode_error", "HAR blob is not valid JSON at char 100"),
+            _parse_failure("missing_required_field", "entry missing startedDateTime", "log.entries[9]"),
+            _parse_failure("missing_required_field", "entry missing startedDateTime", "log.entries[12]"),
+        ]
+    )
+    out = capsys.readouterr().out
+    assert "3 parse failure(s)" in out
+    assert "decode_error x1" in out
+    assert "missing_required_field x2" in out
+
+
+def test_report_parse_failures_empty_prints_nothing(capsys) -> None:
+    _report_parse_failures([])
+    assert capsys.readouterr().out == ""

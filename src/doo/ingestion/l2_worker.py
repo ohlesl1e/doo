@@ -14,7 +14,7 @@ core (no stream, no loop).
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -127,11 +127,14 @@ def run_l2_worker(
     consumer_name: str = "l2-1",
     max_messages: int | None = None,
     block_ms: int = 1000,
+    on_events: Callable[[list[L2Event]], None] | None = None,
 ) -> int:
     """Consume `ingest` and process envelopes until `max_messages` (or forever).
 
     Returns the number of messages processed. `max_messages` bounds the loop for
-    tests / one-shot CLI drains; `None` runs indefinitely.
+    tests / one-shot CLI drains; `None` runs indefinitely. `on_events`, when
+    given, is called with each envelope's emitted `L2Event`s (so callers can,
+    e.g., surface `ParseFailure`s) — invoked before the message is acked.
     """
 
     deps.streams.ensure_group(INGEST_STREAM, L2_CONSUMER_GROUP)
@@ -145,7 +148,9 @@ def run_l2_worker(
             # Validate from JSON so str-encoded UUID / datetime fields coerce
             # under the envelope's strict config (dict-mode strict would reject).
             envelope = IngestionEnvelope.model_validate_json(json.dumps(payload))
-            process_envelope(deps, envelope)
+            events = process_envelope(deps, envelope)
+            if on_events is not None:
+                on_events(events)
             deps.streams.ack(INGEST_STREAM, L2_CONSUMER_GROUP, message_id)
             processed += 1
             if max_messages is not None and processed >= max_messages:
