@@ -6,9 +6,9 @@ doo ingests passive testing data (Burp traffic, HAR files, recon output), builds
 
 ## Status
 
-**Slice 1 complete** — the full HAR → graph pipeline. Drop in a HAR file and get an engagement-isolated Neo4j graph of the target: canonicalised hosts, templated endpoints, aggregated parameters, declared/discovered/anonymous principals, request/response bodies in object storage, and response artifacts — with provenance on every node and secrets hashed at the L2 boundary. CI (lint + types + the full testcontainer suite) is in place.
+**Slice 1 complete** — the full HAR → graph pipeline. Drop in a HAR file and get an engagement-isolated Neo4j graph of the target: canonicalised hosts, templated endpoints, aggregated parameters, declared/discovered/anonymous principals, request/response bodies in object storage, and promoted values (`ObservedValue`) — with provenance on every node and secrets hashed at the L2 boundary. CI (lint + types + the full testcontainer suite) is in place.
 
-See **[`docs/running.md`](docs/running.md)** to run it.
+See [**Running doo**](#running-doo) below to run it.
 
 ## Design principles
 
@@ -56,28 +56,98 @@ Design docs:
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — five-layer architecture, tech stack, build order, layer contracts.
 - [`ONTOLOGY.md`](ONTOLOGY.md) — graph schema (six-step draft, all done).
 - [`CONTEXT.md`](CONTEXT.md) — domain language.
-- [`docs/running.md`](docs/running.md) — how to run the pipeline locally.
-- [`docs/adr/`](docs/adr/) — architecture decision records (0001–0021).
+- [`docs/adr/`](docs/adr/) — architecture decision records (0001–0025).
 - [`docs/grill-queue.md`](docs/grill-queue.md) — open design decisions tracking.
 - [`docs/agents/`](docs/agents/) — agent skill docs (issue tracker, triage labels, domain docs).
 
-## Quickstart
+## Running doo
+
+Drop a HAR in, get an engagement-isolated Neo4j graph of the target. There is no active testing yet — this is the ingestion → graph half of the pipeline.
+
+### Prerequisites
+
+- **Docker** — for the Neo4j / Redis / MinIO stack and the testcontainer-based tests.
+- **Python 3.12** and a venv:
 
 ```sh
-docker compose up -d --wait          # Neo4j + Redis + MinIO
+python -m venv .venv
 .venv/bin/pip install -e '.[dev]'
-cp .env.example .env                 # connection config; doo auto-loads it
-
-# turn a HAR into a graph:
-.venv/bin/doo engagement start --config tests/fixtures/yaml/acme-test.yaml
-.venv/bin/doo ingest har --engagement acme-test tests/fixtures/har/comprehensive.har
-.venv/bin/doo worker run --once
-# then explore http://localhost:7474  (neo4j / doo-dev-password)
 ```
 
-Full walkthrough, command reference, and troubleshooting: **[`docs/running.md`](docs/running.md)**.
+(Examples call binaries as `.venv/bin/doo`; activate the venv if you prefer bare `doo`.)
 
-Run the tests (testcontainers — no compose stack needed):
+### 1. Start the stack
+
+```sh
+docker compose up -d --wait      # Neo4j (7474/7687), Redis (6379), MinIO (9000/9001)
+```
+
+Web UIs:
+- **Neo4j Browser** — http://localhost:7474 — `neo4j` / `doo-dev-password`
+- **MinIO Console** — http://localhost:9001 — `doo-dev` / `doo-dev-password`
+
+### 2. Configure the connection env
+
+The CLI reads `DOO_*` env vars, and its built-in defaults do **not** match the compose credentials — so set them, easiest via the committed template:
+
+```sh
+cp .env.example .env
+```
+
+`doo` auto-loads `.env` from the current directory, so running from the repo root needs no manual exports (an explicit `export` still wins).
+
+### 3. Ingest a HAR → graph
+
+```sh
+# acme-test.yaml declares a Principal whose token is ${DOO_TEST_TOKEN_A}:
+export DOO_TEST_TOKEN_A=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1dWlkLWFhYSIsImV4cCI6NDEwMjQ0NDgwMH0.g32AFQCk2wGfExJCjL61A7bgUXAqwvfY1AF0-w5I-K0
+
+.venv/bin/doo engagement start --config tests/fixtures/yaml/acme-test.yaml
+.venv/bin/doo ingest har --engagement acme-test tests/fixtures/har/comprehensive.har
+.venv/bin/doo worker run --once     # drains the pipeline and builds the graph
+```
+
+`engagement start` is idempotent (diff-and-confirm on a material change; `--apply` skips the prompt). `ingest har` is **L1 only** — it queues the HAR; `worker run` (L2+L3) builds the graph and prints a summary, including a grouped report of any entries that failed to parse. Drop in your own capture with `--engagement acme-test path/to.har` — scope does not gate ingestion, so out-of-scope hosts land too. `doo worker run` (no `--once`) leaves a daemon running; `doo engagement keepalive <id>` runs the external kill-switch lease.
+
+### Exploring the graph
+
+In **Neo4j Browser** (http://localhost:7474):
+
+```cypher
+MATCH (n {engagement_id:'acme-test'}) RETURN labels(n)[0] AS label, count(*) ORDER BY label;
+MATCH (e:Endpoint {engagement_id:'acme-test'}) RETURN e.method, e.path_template;
+MATCH (:RequestObservation)-[:YIELDED_VALUE]->(v:ObservedValue) RETURN v.kind, v.value LIMIT 50;
+```
+
+Request/response bodies live in MinIO; the graph holds `BlobRef`s.
+
+### Command reference
+
+| Command | What it does |
+|---|---|
+| `doo engagement start --config <yaml> [--apply]` | Create/re-attach an engagement (idempotent; diff+confirm on material changes) |
+| `doo engagement status <id>` | Print an engagement's properties + Scope hash |
+| `doo engagement keepalive <id>` | Run the external kill-switch lease keeper |
+| `doo ingest har --engagement <id> <har>` | L1: upload the HAR + queue an envelope |
+| `doo worker run [--once] [--batch N]` | L2+L3: drain the streams into the graph |
+
+### Troubleshooting
+
+- **`AuthError … unauthorized`** — wrong/absent Neo4j password. The CLI default is `password`; compose uses `doo-dev-password`. Set `DOO_NEO4J_PASSWORD` (or `cp .env.example .env`).
+- **`Cannot reach Neo4j …`** — the stack isn't up: `docker compose up -d --wait`.
+- **A HAR ingested but no Host/Endpoint appeared** — `ingest har` only does L1; run `doo worker run --once` to build the graph.
+- **`worker run` reports parse failures / `decode_error`** — the HAR isn't valid JSON (often a truncated export). Confirm with `python -m json.tool your.har > /dev/null`, then re-export. Malformed *entries* become `ParseFailure` nodes; the rest still ingest.
+- **Large HARs are slow** — endpoint inference and value promotion run once at the end of the drain (resumable).
+
+### Teardown
+
+```sh
+docker compose down -v     # -v also wipes the graph + blobs
+```
+
+### Running the tests
+
+The suite uses testcontainers (it starts its own throwaway Neo4j/Redis/MinIO, so the compose stack isn't required) and an `opa` binary for the dual-path Scope test. See [`docs/contributing-testing.md`](docs/contributing-testing.md).
 
 ```sh
 .venv/bin/pytest -q
