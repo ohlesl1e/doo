@@ -12,7 +12,7 @@ file-level where a story is covered broadly across a module's cases.
 | 3 | Declare an Engagement in YAML | `tests/test_loader.py` (config parse + apply) |
 | 4 | Declared test accounts → `Principal` tier=declared + provenance | `tests/test_loader.py` (principals); `tests/test_pipeline_e2e.py::test_bearer_har_reconciles_to_declared_principal_no_raw_token` |
 | 5 | JWT cross-checked against `known_signals` at load | `tests/test_loader.py` (JWT sub/jwt_sub mismatch fails loudly) |
-| 6 | Raw tokens never persisted to the graph | `tests/test_pipeline_e2e.py::test_bearer_har_reconciles_…`, `…::test_bodies_har_…`, `…::test_response_artifacts_full_pipeline_…`; `tests/e2e/test_slice1_full.py::test_slice1_comprehensive_pipeline` |
+| 6 | Raw tokens never persisted to the graph | `tests/test_pipeline_e2e.py::test_bearer_har_reconciles_…`, `…::test_bodies_har_…`, `…::test_response_values_full_pipeline_…`; `tests/test_observed_value_e2e.py`; `tests/e2e/test_slice1_full.py::test_slice1_comprehensive_pipeline` |
 | 7 | External `engagement-keepalive` lease | `tests/test_keepalive.py` |
 | 8 | Upload a HAR via a single command | `tests/test_intake_api.py`, `tests/test_intake_unit.py`; CLI `doo ingest har` |
 | 9 | Unique `trace_id` propagated L1→L2→L3 | `tests/test_trace_propagation.py` |
@@ -32,7 +32,7 @@ file-level where a story is covered broadly across a module's cases.
 | 23 | Observation vs inference layers kept distinct (ADR-0001) | `tests/test_templating_e2e.py` (retraction keeps ROs); `tests/test_l2_events.py` |
 | 24 | Anonymous singleton AuthContext + Principal | `tests/test_pipeline_e2e.py::test_anon_har_full_pipeline`; `tests/e2e/test_slice1_full.py` (anon count == 1) |
 | 25 | Bodies in object storage, hashes referenced from graph | `tests/test_har_bodies.py`, `tests/test_pipeline_e2e.py::test_bodies_har_full_pipeline_blobs_params_and_secrets` |
-| 26 | Secret-shaped values → hash+length+preview only | `tests/test_response_artifacts.py`, `tests/test_pipeline_e2e.py::test_response_artifacts_full_pipeline_…` |
+| 26 | Secret-shaped values → hash+length+preview only | `tests/test_candidate_extraction.py`, `tests/test_value_canonicalisation.py`, `tests/test_pipeline_e2e.py::test_response_values_full_pipeline_…`, `tests/test_observed_value_e2e.py` |
 | 27 | Out-of-scope hosts still ingested (ADR-0020) | `tests/test_scope_dual_path.py`, `tests/test_scope.py` (scope governs dispatch/query, not ingestion) |
 | 28 | Single `is_in_scope` helper for all in-scope filtering | `tests/test_scope.py`, `tests/test_scope_dual_path.py` |
 | 29 | `trace_id`/`span_id` through envelope→L2→l3-events (ADR-0018) | `tests/test_trace_propagation.py`, `tests/test_l3_events.py` |

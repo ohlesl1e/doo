@@ -12,7 +12,7 @@ Every fact in the graph is either something we **observed** or something we **in
 | --- | --- | --- |
 | **RequestObservation** | → | **Endpoint** |
 | **Parameter** | → | **ParameterSemantic** |
-| **ResponseArtifact** | → | **Asset** |
+| **RequestObservation** (its inline value occurrences) | → | **ObservedValue** / **Asset** |
 
 ### Target surface
 
@@ -45,20 +45,20 @@ _Avoid_: Argument, Input, Field.
 An inferred meaning for a `Parameter` — e.g. "this `org_id` is probably a tenant identifier." Inference layer; created when extraction's enrichment recognizes a pattern, with `confidence` reflecting how sure. Distinct from `Parameter` because inference is separate from observation.
 _Avoid_: ParameterType, ParameterMeaning.
 
-**ResponseArtifact**:
-A raw thing observed in a response — an identifier, URL, error message, internal hostname, or technology fingerprint — recorded with provenance. The observation layer; the catch-all lives here.
-_Avoid_: Asset (that is the inferred entity, not the raw observation), Leak.
+**value candidate** (inline, not a node):
+A raw value occurrence extracted from a response — an identifier, URL, email, internal hostname, or secret-shaped string — recorded *inline* on the `RequestObservation` that surfaced it (its `value_hash`, `kind`, location, extractor, and `role = "output"`), with provenance. The catch-all observation grain; replaces the retired `ResponseArtifact` node (ADR-0023). Most stay inline forever; the interesting ones are promoted to an `ObservedValue` by the flush-time promotion pass. A response's **technology fingerprint** (`Server` / `X-Powered-By`) and **5xx error excerpt** are one-per-response diagnostics, recorded as `RequestObservation` properties (`server_fingerprint`, `error_excerpt`) — never values, never promoted.
+_Avoid_: ResponseArtifact (retired), Asset (that is the inferred lead).
 
 **Asset**:
 An inferred backend resource that is referenced but not yet directly addressable — a leaked bucket name, an internal hostname, a database identifier — treated as a testing lead. The inference layer; created by a promotion step that carries confidence.
-_Avoid_: ResponseArtifact (that is the raw observation), Lead, Resource.
+_Avoid_: value candidate / ObservedValue (those are the observation grain and the cross-context value node), Lead, Resource.
 
 **ParseFailure**:
-A first-class observation that L2 could not turn a particular blob (or a particular entry within one) into a `RequestObservation` or `ResponseArtifact`. Carries provenance back to the originating L1 envelope, the error kind (`malformed_blob`, `schema_mismatch`, `missing_required_field`, `decode_error`), an error message, and a location hint. Becomes a node in the graph so audit can see what didn't make it through — failure is never silently dropped. Re-extraction with a fixed parser may supersede a `ParseFailure` (the new commit produces real observations; the prior `ParseFailure` is marked `status = "retracted"`).
+A first-class observation that L2 could not turn a particular blob (or a particular entry within one) into a `RequestObservation`. Carries provenance back to the originating L1 envelope, the error kind (`malformed_blob`, `schema_mismatch`, `missing_required_field`, `decode_error`), an error message, and a location hint. Becomes a node in the graph so audit can see what didn't make it through — failure is never silently dropped. Re-extraction with a fixed parser may supersede a `ParseFailure` (the new commit produces real observations; the prior `ParseFailure` is marked `status = "retracted"`).
 _Avoid_: error, dead-letter (those name infrastructure; `ParseFailure` is the domain term for "we observed an input we couldn't interpret").
 
 **ObservedValue**:
-A *promoted* value found in observations — an identifier, URL, email, hostname, JWT, or secret-shaped string — tracked as a node so cross-context matches ("this value leaked in a response also appears as a request input to another `Endpoint`") become a single graph traversal. Inference layer; evidenced by the `ResponseArtifact`s and `RequestObservation`s that contained the value. Only **promoted** values become nodes (shape match, multiplicity ≥2, or LLM proposal); junk strings stay inline on the originating observation. For `kind ∈ {token, secret}`, the node stores **`value_hash` + length + first-N chars only** — never the full value. The graph is not a credential store.
+A *promoted* value found in observations — an identifier, URL, email, hostname, JWT, or secret-shaped string — tracked as a node so cross-context matches ("this value leaked in a response also appears as a request input to another `Endpoint`") become a single graph traversal. Inference layer; reached directly from the `RequestObservation`s that yielded or sent the value (the inline value candidates), via `YIELDED_VALUE` / `SENT_VALUE` edges (ADR-0023 amends ADR-0009; no intermediate `ResponseArtifact`). Only **promoted** values become nodes — promotion fires on the shape-allowlist (`kind ∈ {secret, token, internal_hostname, email}`), on multiplicity ≥2, on leak-to-input, or on LLM proposal; junk strings (single-occurrence list ids / URLs) stay inline candidate occurrences. For `kind ∈ {token, secret}`, the node stores **`value_hash` + length + first-N chars only** — never the full value. The graph is not a credential store.
 _Avoid_: Token, Value (unqualified — those are the inline observations; `ObservedValue` is the promoted entity).
 
 ### Identity & access
@@ -146,7 +146,7 @@ An explicit edge from every inference to each observation that fed it. Makes lin
 
 ## Relationships
 
-- A **ResponseArtifact** may **evidence** one or more **Assets** (an Asset can be evidenced by several ResponseArtifacts).
+- An **ObservedValue** (or the `RequestObservation` that yielded it) may **evidence** one or more **Assets** (an Asset can be evidenced by several).
 - A **RequestObservation** is grouped under an **Endpoint** by a revisable `HIT` inference — concrete path on the observation, template on the Endpoint. Re-templating re-groups these edges; it never moves observations.
 - An **AuthContext** belongs to exactly one **Principal**; a Principal has many AuthContexts.
 - A **Principal** **`OF_TENANT`** zero or more **Tenant**s; cardinality is **M:N** (multi-org membership is normal).
@@ -158,16 +158,15 @@ An explicit edge from every inference to each observation that fed it. Makes lin
 - A **TestCase** **`EXECUTED_AS`** zero or more **RequestObservation**s (with `source = "agent"`). Cardinality 0..N — retries and parameter sweeps add edges, they do not create new TestCases. A TestCase with no `EXECUTED_AS` edge is proposed-but-not-executed; with ≥1, it has run.
 - A **TestCase** **`IN_ENGAGEMENT`** exactly one **Engagement**. Same content + same Engagement → same node; different Engagement → different node (the Engagement id is part of the TestCase identity hash).
 - An **AuthContext** **`OF_PRINCIPAL`** exactly one **Principal**; a Principal has zero or more AuthContexts.
-- A **RequestObservation** **`YIELDED`** zero or more **ResponseArtifact**s (one per identifier/URL/error message/fingerprint extracted from the response).
-- A **ResponseArtifact** **`CONTAINS_VALUE`** zero or more **ObservedValue**s.
+- A **RequestObservation** **`YIELDED_VALUE`** zero or more **ObservedValue**s — one edge per promoted value occurrence surfaced in the response; the edge properties `location` and `extractor` record where in the response it was found and which versioned rule found it. Non-promoted value occurrences stay inline on the observation (`value_candidates`), not edges (ADR-0023).
 - A **RequestObservation** **`SENT_VALUE`** zero or more **ObservedValue**s; the edge property `parameter_name` records *which* parameter carried the value.
 - An **Asset** may **`SAME_VALUE_AS`** an **ObservedValue** when both refer to the same underlying string (ADR-0011). Optional, M:N, used for cross-pivot queries between lead-status and cross-context-value views.
 - An **Endpoint** **`HAS_PARAMETER`** zero or more **Parameter**s; each Parameter has exactly one Endpoint. Enables `ParameterSemantic -DERIVED_FROM-> Parameter`.
 - A **TestCase** has **exactly one** of `TARGETS_ENDPOINT` (to an Endpoint, route-level test), `TARGETS_PARAMETER` (to a Parameter node, parameter-level test), or `TARGETS_BOUNDARY` (to a TrustBoundary). Three-way XOR, matching the three-way XOR in the TestCase identity hash.
 - A **Finding** **`AFFECTS`** one or more **Endpoint**s and/or **TrustBoundary**s (polymorphic, M:N, **not** XOR — a single Finding can affect both, e.g. a cross-tenant data leak affecting specific Endpoints *and* the tenant boundary). Plus the existing `REFERENCES` to TestCase(s).
 - An **Asset** may be **promoted** to a **Host** or **Endpoint** once it becomes reachable.
-- Promotion is an inference: it carries provenance and confidence, and is retractable. The evidencing **ResponseArtifact**s survive retraction.
-- A technology fingerprint stays a **ResponseArtifact** forever — it is never promoted to an **Asset**.
+- Promotion is an inference: it carries provenance and confidence, and is retractable. The evidencing **RequestObservation**s (and their inline value candidates) survive retraction.
+- A technology fingerprint and a 5xx error excerpt stay inline `RequestObservation` properties forever — they are never values and never promoted to an **ObservedValue** or **Asset**.
 
 ## Identity rules
 
@@ -189,11 +188,11 @@ An explicit edge from every inference to each observation that fed it. Makes lin
 ## Example dialogue
 
 > **Dev:** "`internal-billing-prod.corp.example` showed up in three different 500 bodies. Three nodes or one?"
-> **Domain expert:** "Three **ResponseArtifact**s — three real observations, each with its own provenance. One **Asset**, evidenced by all three, because we *infer* they point at the same backend resource. If we later reach it, that Asset gets promoted to a **Host**."
+> **Domain expert:** "Three value occurrences — three real observations, recorded inline on the three `RequestObservation`s with their own provenance, and (because the hostname clears the shape-allowlist) promoted to **one `ObservedValue`** deduped by `value_hash`, with three `YIELDED_VALUE` edges. One **Asset**, evidenced by that value, because we *infer* they point at the same backend resource. If we later reach it, that Asset gets promoted to a **Host**."
 
 ## Flagged ambiguities
 
-- **"Asset" vs "ResponseArtifact"** — the original entity catalog let both claim "internal hostname in an error message." Resolved: **ResponseArtifact** is the observation layer (raw, catch-all, always created), **Asset** is the inference layer (curated lead, created only by a promotion step with confidence). This kills the "Asset becomes a dumping ground" risk — the dumping ground is ResponseArtifact, and that is fine.
+- **"Asset" vs the value-observation grain** — the original entity catalog let both claim "internal hostname in an error message." Resolved in two steps: first that the observation layer is a per-extraction **ResponseArtifact** node and **Asset** is the inference lead; then (ADR-0023) that the per-extraction node was the wrong grain — a real 72 MB HAR minted 277k of them — so the raw value occurrence is now recorded **inline** on the `RequestObservation` (a *value candidate*), and only promoted ones become **`ObservedValue`** nodes. **Asset** stays the curated inference lead. The "dumping ground" is now an inline array, not 277k nodes.
 - **What a TrustBoundary is drawn between** — "Principal" alone made capability differences within one Principal (OAuth scope, MFA step-up) invisible, which the "auth state transitions not exercised" coverage query needs. Resolved: two tiers — _identity_ boundaries between **Principal**s, _capability_ boundaries between **AuthContext**s of the same Principal.
 - **How explicit Payloads should be** — the draft leaned "maximalist" (a node per payload string) on the belief that OPA evaluates graph state. It doesn't — OPA evaluates the proposed request (see ADR-0003). Resolved: the first-class concept is **PayloadClass** (a tag carried on the request); the **Payload** instance is a property/reference; a reusable payload library is deferred until we build one.
 - **The mixed path position** — `/users/123`, `/users/me`, `/users/settings` route off one position but are three things. Resolved: literal sub-routes (`settings`) are their own **Endpoint**s and win over the parameter; `me`/`current`/`self` are **self-reference values** of `{user_id}`, flagged for IDOR. Because **Endpoint** identity is a revisable inference (ADR-0004), early mis-templating self-corrects without node surgery.
