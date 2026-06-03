@@ -1,0 +1,55 @@
+name: CI
+
+# Slice-1 CI safety net (T8): lint + type-check + the full pytest suite, including
+# the testcontainer-backed integration tests (Neo4j Community / Redis / MinIO) and
+# the OPA dual-path Scope test. Runs on PRs and on pushes to main.
+#
+# The integration tests use `testcontainers`, which talks to the Docker daemon that
+# GitHub's ubuntu-latest runners provide out of the box — so no `services:` block is
+# needed; the tests start and tear down their own containers. Neo4j runs **Community**
+# per ADR-0021 (the schema bootstrap is edition-aware and skips the Enterprise-only
+# existence constraints on Community).
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install project + dev deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Install OPA (for the dual-path Scope test)
+        run: |
+          curl -fsSL -o /usr/local/bin/opa \
+            https://openpolicyagent.org/downloads/latest/opa_linux_amd64_static
+          chmod +x /usr/local/bin/opa
+          opa version
+
+      - name: Lint (ruff)
+        run: ruff check src tests
+
+      - name: Type-check (mypy, strict)
+        run: mypy src
+
+      - name: Tests (unit + testcontainer integration + dual-path)
+        run: pytest -q

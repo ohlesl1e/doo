@@ -139,6 +139,94 @@ Planner (LLM)     →    Validator (deterministic)    →    Executor (MCP tools
 - **Modes:** auto / review / dry-run. Default to review for production targets.
 - **Kill switch outside the agent process** — a signal the agent can't suppress. Separate process holding a lease, feature flag the dispatcher checks, or similar. The agent must not be in charge of being able to stop itself.
 
+**Kill-switch lease (MVP mechanism):**
+
+- Backend: a Redis key (`engagement:{id}:lease`) with a TTL, piggybacking on the same Redis used for L1 streams.
+- Lifecycle: the loader writes `value = "active"` with TTL (default `60s`). A separate **engagement-keepalive** process — started explicitly by the tester after setup, never auto-spawned by the loader — refreshes the lease every `30s`. The dispatcher reads the lease before each HTTP send as part of its stateful-guard sequence (per ADR-0003): missing, expired, or `value != "active"` → fail closed, deny the request.
+- Tester kills by SIGTERM-ing the keepalive (lease expires within TTL), `DEL`-ing the key (instant), or `SET ... "killed"` (instant with an explicit reason logged).
+- Trust split: **the agent process has read-only access to the lease key.** Only the keepalive can refresh it; only the tester (or ops) can delete or override. Enforced by Redis ACLs in deployed setups; honour-system in single-Redis dev. This is the same sibling-process trust pattern used by the auth helper (ADR-0014).
+- Convention: production-target engagements drop TTL to `30s` / refresh `15s` or tighter. Too tight causes false kills on Redis latency spikes; 60/30 is balanced for staging.
+- The mechanism choice (Redis) is reversible — file lock, etcd, or a dedicated watchdog all satisfy the trust split. What is not reversible is the trust split itself: kill-switch authority is outside the agent process, period.
+
+**Engagement setup:** the `Engagement`, its `Scope`, declared `Principal`s + their `AuthContext`s, and the kill-switch lease parameters are configured from a YAML `EngagementConfig` loaded by a Pydantic-typed loader. The loader is the only declarative seam allowed under the "black-box only" hard rule — see ADR-0012 for what may and may not appear in it.
+
+## Layer contracts (L1 → L2 → L3)
+
+The boundaries between layers are Pydantic models with `extra = "forbid"`. Schema evolution is by stop-the-world deploy; no embedded `schema_version` field. Long-term audit is satisfied by re-running current parsers against historic blobs in object storage, not by replaying historic in-flight messages.
+
+### L1 → L2: `IngestionEnvelope`
+
+L1 puts one envelope on the `ingest` Redis Stream per arrival. L1 validates the envelope only; blob content is opaque at L1. Malformed blobs flow through and surface as `ParseFailure` observations from L2.
+
+| Field | Type | Notes |
+|---|---|---|
+| `event_id` | `UUID` (uuid7) | Unique per emission; distinct from `idempotency_key`. |
+| `trace_id` | `str` (W3C 16-byte hex) | One trace per arrival (per HAR file / Logger++ stream connection / agent batch). Generated at intake. Propagated through L2 and L3 events. See ADR-0018. |
+| `span_id` | `str` (W3C 8-byte hex) | Root span for the intake operation. L2/L3 spans derive children. |
+| `engagement_id` | `EngagementId` | Set by intake; envelope-required. |
+| `source` | `Literal[...]` (closed) | Closed enum forces the "is this a tester-side fact?" conversation per ADR-0012 when adding sources. |
+| `source_version` | `str \| None` | Tool version when known; free-string. |
+| `blob_ref` | `str` | Object-storage key. |
+| `blob_format` | `str` | `"har-1.2"`, `"burp-streamed-v1"`, `"nuclei-jsonl-v3"`, ...; selects parser at L2. |
+| `blob_sha256` | `str` | Integrity + idempotency input. |
+| `idempotency_key` | `str` | `sha256(f"{source}\|{blob_sha256}\|{engagement_id}")`. Collapses re-uploads within an engagement; the same blob in a different engagement is a different logical observation set. |
+| `received_at` | `datetime` | UTC. |
+| `producer_id` | `str` | L1 component instance (e.g. `"har-upload-cli"`, `"logger++-shim-1"`). |
+| `bytes_size` | `int` | Lets L2 choose stream vs. whole-load. |
+
+Producer-facing intake APIs (HTTP multipart for HAR, NDJSON for streamed events, ES bulk protocol for the Logger++ shim) are per-source. The intake handler is the only place that touches the wire format; it constructs the canonical envelope.
+
+### L2 → L3: `L2Event` (tagged union)
+
+Discriminator: `kind`. Three variants:
+
+- **`RequestObservation`** (`kind = "request_observation"`) — one observed HTTP exchange. Carries provenance (`source`, `source_id`, `ingested_at`), event time (`observed_at`), confidence (per ADR-0005), the exchange (`method`, `HostRef`, `concrete_path`, `query_string`), parsed input lists (`headers`, `cookies`, `query_params`, `body_params`), body references (`BlobRef`), the response side, and an `AuthContextCue` (hashes only — never raw tokens, per ADR-0015).
+- **`ResponseArtifact`** (`kind = "response_artifact"`) — one discrete thing extracted from a response (identifier, URL, hostname, email, error message, fingerprint, internal path, secret-shaped). Back-references its `RequestObservation` via `request_observation_id`. For `kind ∈ {secret_shaped, token}`: carries `value_hash` + `value_length` + `value_preview` only; otherwise carries the raw substring (per ADR-0015 and ADR-0009).
+- **`ParseFailure`** (`kind = "parse_failure"`) — first-class observation of a blob L2 couldn't parse. Carries `envelope_event_id` back-ref, error kind/message, and a location hint. Becomes a `ParseFailure` node in the graph so audit can see what didn't make it through.
+
+`AuthContextCue` shape: `bearer_token_hash`, `cookie_session_hashes`, `api_key_headers`, `basic_auth_user_hash`, `bearer_claims` (JWT decoded without verification), `is_anonymous`. Raw tokens are read by the dispatcher from a separate secret store keyed by AuthContext id, populated from env-var references at setup per ADR-0012.
+
+`HostRef` shape: `scheme` (`http` / `https`), `canonical_hostname` (lowercased, IDN ToASCII, trailing dot stripped), `port` (None when equal to scheme default; explicit when non-default), `is_ip_literal`. Matches the canonicalisation rule in CONTEXT.md.
+
+`BlobRef` shape: `key`, `sha256`, `content_type`, `size_bytes`, `encoding`.
+
+Parameter aggregation is **not** L2's job — `Parameter` nodes are an emergent aggregate L3 builds across many `RequestObservation`s sharing the same `(endpoint_id, name, location)`.
+
+### L3 commit interface
+
+```
+async def commit(event: L2Event) -> CommitResult
+async def commit_batch(events: list[L2Event]) -> list[CommitResult]
+```
+
+`CommitResult` carries `commit_id`, `accepted` (false on idempotency hit), the lists of `nodes_created`/`nodes_updated`/`edges_created`/`edges_removed`, a `retemplating_triggered` flag, and the `events_emitted` refs.
+
+Idempotency is keyed semantically on `(event_kind, source, source_id, engagement_id)` per ADR-0016 — distinct from L1's blob-hash key and from L2's emission `event_id`. Re-running L2 against historic blobs (parser bug-fix replay) is a no-op against existing commits.
+
+Entity resolution at commit time: `Host` (canonicalisation-keyed), `AuthContext` (auth_hash-keyed, reconciled to declared Principal per ADR-0010), `Endpoint` (revisable inference per ADR-0004; may trigger re-templating), `Parameter` (aggregated by `(endpoint_id, name, location)`), `ObservedValue` (promoted per ADR-0009).
+
+Read API is separate from the write API; consumers query Neo4j directly.
+
+### L3 → consumers: `l3-events` stream
+
+L3 emits **low-level structural events** on a separate Redis Stream `l3-events`, with consumer groups per subscriber (`planner`, `coverage`, `audit`). Consumers compose business meaning by filtering on `node_type` / `edge_type`.
+
+Event kinds (discriminator `kind`):
+
+- `node_created` — `node_type`, `node_id`, `properties` snapshot.
+- `node_updated` — `node_type`, `node_id`, `changed_properties` (name → `{old, new}`).
+- `edge_created` — `edge_type`, `from_node`, `to_node`, `properties`.
+- `edge_removed` — `edge_type`, `from_node`, `to_node`, `reason ∈ {retemplating, reconciliation, retraction}`.
+- `reconciliation` — multi-step atomic merge (per ADR-0010 for Principals, the same mechanic for Tenants and Assets per ADR-0008 / ADR-0011): `survivor_id`, `retracted_id`, `reason`. Emitted as one event because consumers need it atomically.
+
+All events carry `commit_id` for lineage; the chain is `l3-event → commit → L2 event → L1 envelope → raw blob in object storage`. Full provenance traversal.
+
+Every `L2Event` and every `l3-events` payload also carries `trace_id` (W3C 16-byte hex) and `span_id` (W3C 8-byte hex). The intake-side `trace_id` propagates unchanged through L2 and L3; each layer derives a child `span_id` for its phase. Structured-log lines across L1/L2/L3 include the same IDs. The OpenTelemetry SDK is not enabled in slice 1; the conventions are in place so that turning it on later is a configuration change, not a data migration. See ADR-0018.
+
+### Engagement scoping
+
+Every node mutated by L3 carries an `engagement_id` matching the inbound `L2Event.payload.engagement_id`. L3 enforces this at commit time: scoped nodes must not be created with a different engagement_id, and edges between scoped nodes must agree on engagement_id. Edges from a scoped node to a shared structural node (`Engagement`, `Scope`) are the only cross-class connections allowed. See ADR-0017 for the full model, including Neo4j uniqueness constraints and query conventions.
+
 ## Cross-cutting: observability and audit
 
 Not a sixth layer — a cross-cutting concern. Every layer emits structured events to a central log. OpenTelemetry is the obvious tool.

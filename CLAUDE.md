@@ -71,9 +71,9 @@ Build vertically through one slice before broadening. Do not scaffold all five l
 
 ## What to do at the start of a session
 
-1. Read `ARCHITECTURE.md` and `ONTOLOGY.md`.
-2. Check open questions in `ONTOLOGY.md` — three are still unresolved (Asset, TrustBoundary, Payload granularity).
-3. Confirm which slice we're working on. If unclear, ask before generating code.
+1. Read `ARCHITECTURE.md`, `ONTOLOGY.md`, `CONTEXT.md` (domain language), and `docs/adr/` (decisions to date — 0001 through 0020).
+2. Check `docs/grill-queue.md` — the prioritised list of design decisions still open before MVP code can land confidently.
+3. Confirm which slice we're working on (per the five-layer build order). If unclear, ask before generating code.
 
 ## What NOT to do
 
@@ -86,14 +86,9 @@ Build vertically through one slice before broadening. Do not scaffold all five l
 
 ## Outstanding design work
 
-The ontology is mid-design. Steps 2-6 not started:
-- Relationship catalog
-- Identity rules (path templating)
-- Cross-cutting properties (provenance, confidence, time)
-- Invariants
-- Query patterns
+The ontology (`ONTOLOGY.md`) is complete: all six steps drafted, all three originally-open questions resolved (Asset / TrustBoundary / Payload), 20 ADRs recorded.
 
-Finish these before significant code investment in L3.
+Slice-1 implementation contracts are settled (G1 and G2 closed); see PRD in GitHub issue #2 and tracer issues #3–#10. Remaining design items tracked in **`docs/grill-queue.md`** — G3 write-path timing and G4 blob layout, deliberately deferred to be grilled against the slice-1 prototype.
 
 ## Agent skills
 
