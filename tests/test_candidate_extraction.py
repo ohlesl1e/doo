@@ -16,6 +16,8 @@ import hashlib
 from datetime import UTC, datetime
 from uuid import uuid4
 
+import jwt as pyjwt
+
 from doo.canonical.value_objects import BlobRef
 from doo.canonical.values import hash_for
 from doo.events.envelope import IngestionEnvelope
@@ -128,6 +130,64 @@ def test_jwt_is_secret_kind_hash_preview_no_raw_value() -> None:
     assert jwt.value_preview == SESSION_JWT[:8]
     # The raw JWT appears nowhere in the candidate.
     assert SESSION_JWT not in repr(jwt)
+
+
+_CLAIM_SK = "claims-signing-key-at-least-32-bytes-long!!"
+
+
+def test_jwt_claims_emit_sub_identifier_and_email_alongside_secret() -> None:
+    """ADR-0025: a JWT yields the hash-only `secret` AND value candidates for its
+    identity claims — `sub` -> identifier, `email` -> email — carrying raw values."""
+
+    token = pyjwt.encode(
+        {"sub": "user-42", "email": "alice@corp.example.com", "exp": 4102444800},
+        _CLAIM_SK,
+        algorithm="HS256",
+    )
+    cands = extract_candidates(
+        f'{{"access_token": "{token}"}}'.encode(), content_type="application/json"
+    )
+
+    # The token is still a hash-only secret.
+    secret = next(c for c in cands if c.extractor == "regex:jwt_v1")
+    assert secret.kind == "secret"
+    assert secret.value is None
+
+    claims = [c for c in cands if c.extractor == "jwt-claims:identity_v1"]
+    sub = next(c for c in claims if c.kind == "identifier")
+    email = next(c for c in claims if c.kind == "email")
+    # Claims are non-secret: raw value carried (the leak-to-input pivot needs it).
+    assert sub.value == "user-42"
+    assert sub.value_hash == hash_for("identifier", "user-42")
+    assert email.value == "alice@corp.example.com"
+    assert email.role == "output"
+    # No raw token bytes ride along on a claim candidate.
+    assert token not in repr(sub)
+    assert token not in repr(email)
+
+
+def test_jwt_without_sub_emits_no_sub_candidate() -> None:
+    token = pyjwt.encode(
+        {"email": "bob@corp.example.com", "exp": 4102444800}, _CLAIM_SK, algorithm="HS256"
+    )
+    cands = extract_candidates(
+        f'{{"id_token": "{token}"}}'.encode(), content_type="application/json"
+    )
+    claims = [c for c in cands if c.extractor == "jwt-claims:identity_v1"]
+    assert {c.kind for c in claims} == {"email"}
+    assert all(c.kind != "identifier" for c in claims)
+
+
+def test_malformed_jwt_does_not_crash_extraction() -> None:
+    # Matches the JWT regex (eyJ + three base64url segments) but the header/payload
+    # are not valid base64url JSON, so the decode must fail closed, not raise.
+    malformed = "eyJBBBBBBBB.eyJCCCCCCCC.DDDDDDDDDD"
+    cands = extract_candidates(
+        f'{{"token": "{malformed}"}}'.encode(), content_type="application/json"
+    )
+    # The secret candidate is still produced; no claim candidates, no exception.
+    assert any(c.extractor == "regex:jwt_v1" for c in cands)
+    assert not [c for c in cands if c.extractor == "jwt-claims:identity_v1"]
 
 
 def test_aws_key_is_secret_kind() -> None:

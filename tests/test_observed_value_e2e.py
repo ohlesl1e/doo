@@ -17,6 +17,7 @@ import hashlib
 import json
 from collections.abc import Iterator
 
+import jwt as pyjwt
 import pytest
 
 from doo.infra.blobs import BlobClient
@@ -400,6 +401,67 @@ def test_observed_value_promotion_end_to_end(
     assert _JWT not in blob
     # The raw opaque token likewise lands in no node property (hash-only, ADR-0015).
     assert RECURRING_OPAQUE not in blob
+
+
+def test_jwt_sub_leaks_to_input_promotes_one_observed_value(
+    neo4j_client, redis_client, blob_client
+) -> None:
+    """ADR-0025 + ADR-0023: a JWT `sub` that surfaces in a response (decoded as an
+    `identifier` value) and is later sent as a request input promotes to ONE
+    `ObservedValue` carrying both a `YIELDED_VALUE` (producer) and a `SENT_VALUE`
+    (consumer) edge — the sub-leaks-to-input pivot. The token stays hash-only."""
+
+    eid = "eng-ov-jwtsub"
+    _seed_engagement(neo4j_client, eid)
+
+    sub = "acct-leak-7"  # not UUID-/high-entropy-shaped -> plain identifier both sides
+    token = pyjwt.encode(
+        {"sub": sub, "email": "leak@corp.example.com", "exp": 4102444800},
+        "e2e-signing-key-at-least-32-bytes-long!!",
+        algorithm="HS256",
+    )
+    entries = [
+        _entry(
+            "https://api.example.com/login",
+            minute=1, second=0, status=200, ctype="application/json",
+            body=json.dumps({"access_token": token}),
+        ),
+        _input_entry(
+            f"https://api.example.com/profile?actor={sub}",
+            minute=1, second=1,
+            query=[{"name": "actor", "value": sub}],
+        ),
+    ]
+    har = json.dumps({"log": {"version": "1.2", "entries": entries}}).encode()
+    _run_pipeline(
+        neo4j=neo4j_client, redis_client=redis_client, blob_client=blob_client,
+        engagement_id=eid, har_bytes=har, filename="jwt_sub_leak.har",
+    )
+
+    pivot = neo4j_client.execute_read(
+        "MATCH (v:ObservedValue {engagement_id: $eid, value: $sub}) "
+        "OPTIONAL MATCH (prod:RequestObservation)-[:YIELDED_VALUE]->(v) "
+        "OPTIONAL MATCH (cons:RequestObservation)-[s:SENT_VALUE]->(v) "
+        "RETURN v.kind AS kind, count(DISTINCT v) AS vc, "
+        "       collect(DISTINCT prod.concrete_path) AS produced, "
+        "       collect(DISTINCT cons.concrete_path) AS consumed, "
+        "       collect(DISTINCT s.parameter_name) AS params",
+        eid=eid,
+        sub=sub,
+    )
+    assert pivot[0]["vc"] == 1
+    assert pivot[0]["kind"] == "identifier"
+    assert pivot[0]["produced"] == ["/login"]  # decoded from the response JWT claim
+    assert pivot[0]["consumed"] == ["/profile"]
+    assert pivot[0]["params"] == ["actor"]
+
+    # The token (and its signature) never lands raw in any node property (ADR-0015).
+    nodes = neo4j_client.execute_read(
+        "MATCH (n {engagement_id: $eid}) RETURN properties(n) AS props", eid=eid
+    )
+    blob = json.dumps([n["props"] for n in nodes], default=str)
+    assert token not in blob
+    assert token.split(".")[2] not in blob
 
 
 def test_observed_value_reingest_is_idempotent(

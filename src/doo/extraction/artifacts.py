@@ -37,6 +37,8 @@ import re
 from collections.abc import Iterator
 from dataclasses import dataclass
 
+import jwt
+
 from doo.canonical.values import CandidateKind, hash_for, is_secret_kind
 from doo.ids import Sha256Hex
 
@@ -156,6 +158,17 @@ _BEARER_RE = re.compile(r"\bBearer\s+([A-Za-z0-9._\-+/=]{12,})")
 # alone do not trip it — those are caught by UUID / identifier rules instead).
 _HIGH_ENTROPY_RE = re.compile(r"\b[A-Za-z0-9_\-]{32,}\b")
 
+# JWT identity claims surfaced as values (ADR-0025). The token itself is the
+# secret (the signature); these decoded claims are not — a `sub` that leaks in a
+# response token and is later sent as a request input is the textbook
+# leak-to-input pivot. `sub` -> `identifier` (signal-gated promotion), `email` ->
+# `email` (allowlisted). `preferred_username` is the common OIDC user handle.
+_JWT_CLAIM_KINDS: dict[str, CandidateKind] = {
+    "sub": "identifier",
+    "email": "email",
+    "preferred_username": "identifier",
+}
+
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 
 # JSON field names that carry identifiers (the json-walk:id-fields_v1 rule).
@@ -266,6 +279,51 @@ def _iter_regex(
         )
 
 
+def _decode_jwt_claims(token: str) -> dict[str, object]:
+    """Decode a JWT *without verification* (claim peek only, never a trust call).
+
+    `verify_signature=False`, `verify_exp=False` (ADR-0015 / ADR-0025): we read
+    claims for entity resolution, we never act on the token's authority. Any
+    non-JWT / malformed string yields `{}` rather than raising, so extraction
+    never crashes on a string that merely looked JWT-shaped to the regex.
+    """
+
+    try:
+        decoded = jwt.decode(token, options={"verify_signature": False, "verify_exp": False})
+    except jwt.PyJWTError:
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def _jwt_claim_candidates(
+    token: str, *, byte_start: int, byte_end: int
+) -> Iterator[CandidateOccurrence]:
+    """Emit a JWT's identity claims as (non-secret) value candidates (ADR-0025).
+
+    Only the claims in `_JWT_CLAIM_KINDS` are surfaced, and only when scalar and
+    non-empty. These carry the raw value (not hash-only) — the leak-to-input pivot
+    matches on the value across roles, so the value must survive. A malformed or
+    claim-less token yields nothing.
+    """
+
+    claims = _decode_jwt_claims(token)
+    for claim, kind in _JWT_CLAIM_KINDS.items():
+        raw = claims.get(claim)
+        # Scalar identity claims only; bool is an int subclass but never an id.
+        if not isinstance(raw, str | int) or isinstance(raw, bool):
+            continue
+        value = str(raw).strip()
+        if not value:
+            continue
+        yield _candidate(
+            kind,
+            value,
+            extractor="jwt-claims:identity_v1",
+            byte_start=byte_start,
+            byte_end=byte_end,
+        )
+
+
 def _extract_secrets_from_body(text: str) -> Iterator[CandidateOccurrence]:
     """Secret-shape extractors over the body. Higher-precision shapes run first.
 
@@ -298,6 +356,13 @@ def _extract_secrets_from_body(text: str) -> Iterator[CandidateOccurrence]:
 
     for m in _JWT_RE.finditer(text):
         yield from _emit(m, "regex:jwt_v1")
+        # ADR-0025: the token's identity claims are values too (sub/email/...),
+        # emitted alongside the hash-only secret. Shares the token's byte span;
+        # the distinct value_hash keeps each claim's semantic key separate.
+        cs = m.start()
+        bs = len(text[:cs].encode("utf-8"))
+        be = bs + len(m.group(0).encode("utf-8"))
+        yield from _jwt_claim_candidates(m.group(0), byte_start=bs, byte_end=be)
     for m in _AWS_ACCESS_KEY_RE.finditer(text):
         yield from _emit(m, "regex:aws_access_key_v1")
     for m in _STRIPE_KEY_RE.finditer(text):
