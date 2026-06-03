@@ -64,8 +64,11 @@ def test_hash_is_stable_across_calls() -> None:
 def test_secret_kinds_flagged() -> None:
     assert is_secret_kind("secret")
     assert is_secret_kind("token")
+    # opaque_token is secret-for-storage (ADR-0024): hash-only, raw never carried.
+    assert is_secret_kind("opaque_token")
     assert not is_secret_kind("email")
     assert not is_secret_kind("internal_hostname")
+    assert not is_secret_kind("identifier")
 
 
 def test_normalize_value_refuses_secret_kinds() -> None:
@@ -74,6 +77,9 @@ def test_normalize_value_refuses_secret_kinds() -> None:
         normalize_value("secret", "AKIAIOSFODNN7EXAMPLE")
     with pytest.raises(ValueError, match="secret"):
         normalize_value("token", "eyJ.a.b")
+    # opaque_token is hash-only too: normalising it would recover the raw value.
+    with pytest.raises(ValueError, match="secret"):
+        normalize_value("opaque_token", "Ab3Cd9Ef2Gh5Ij8Kl1Mn4Op7Qr0St6Uv")
 
 
 def test_secret_value_hash_is_over_raw_bytes() -> None:
@@ -98,4 +104,5 @@ def test_candidate_kinds_vocabulary_closed() -> None:
         "identifier",
         "secret",
         "token",
+        "opaque_token",
     }

@@ -269,14 +269,23 @@ def _iter_regex(
 def _extract_secrets_from_body(text: str) -> Iterator[CandidateOccurrence]:
     """Secret-shape extractors over the body. Higher-precision shapes run first.
 
-    The generic high-entropy net runs last and skips spans already claimed so a
-    JWT is not also reported as a high-entropy blob.
+    The structured detectors (JWT, AWS, Stripe, Bearer continuation) emit
+    `secret` — high-precision, always-promoted (ADR-0023 shape-allowlist). The
+    generic high-entropy net runs last, skips spans already claimed (so a JWT is
+    not also reported as a high-entropy blob), and emits `opaque_token`
+    (ADR-0024): hash-only for storage but NOT always-promoted — it becomes a node
+    only on multiplicity ≥2 or leak-to-input. This stops a capture full of
+    ETags / content hashes / signed-URL tokens flooding the graph as `secret`s.
     """
 
     claimed: list[tuple[int, int]] = []
 
     def _emit(
-        m: re.Match[str], extractor: str, group: int = 0
+        m: re.Match[str],
+        extractor: str,
+        *,
+        kind: CandidateKind = "secret",
+        group: int = 0,
     ) -> Iterator[CandidateOccurrence]:
         value = m.group(group)
         cs = m.start(group)
@@ -284,7 +293,7 @@ def _extract_secrets_from_body(text: str) -> Iterator[CandidateOccurrence]:
         be = bs + len(value.encode("utf-8"))
         claimed.append((cs, cs + len(value)))
         yield _candidate(
-            "secret", value, extractor=extractor, byte_start=bs, byte_end=be
+            kind, value, extractor=extractor, byte_start=bs, byte_end=be
         )
 
     for m in _JWT_RE.finditer(text):
@@ -302,7 +311,7 @@ def _extract_secrets_from_body(text: str) -> Iterator[CandidateOccurrence]:
             continue  # already reported as a more-specific secret shape
         if not _high_entropy(m.group(0)):
             continue
-        yield from _emit(m, "regex:high_entropy_token_v1")
+        yield from _emit(m, "regex:high_entropy_token_v1", kind="opaque_token")
 
 
 def _walk_json_ids(
@@ -427,11 +436,15 @@ _FULL_UUID_RE = re.compile(rf"^(?:{_UUID_RE.pattern})$", re.IGNORECASE)
 def classify_input_kind(name: str, value: str) -> CandidateKind:
     """Classify a request-parameter value's `CandidateKind` (deterministic, #16).
 
-    Secret-conventional names and JWT-shaped values classify as `secret` (their raw
-    value is then hashed, never carried; ADR-0015). Otherwise the value is matched
-    against the same shape rules the response extractors use, anchored to the whole
-    value. Anything unclassified falls back to `identifier` — the high-cardinality
-    catch-all that promotes only on cross-context signal (leak-to-input / multiplicity).
+    Secret-conventional names and the structured shapes (JWT / AWS / Stripe)
+    classify as `secret` (their raw value is then hashed, never carried;
+    ADR-0015). Otherwise the value is matched against the same shape rules the
+    response extractors use, anchored to the whole value. A generic high-entropy
+    blob (no recognised structure) classifies as `opaque_token` (ADR-0024):
+    hash-only for storage but gated for promotion — a high-entropy request param
+    becomes a node only on multiplicity ≥2 or leak-to-input, not on shape.
+    Anything else falls back to `identifier` — the high-cardinality catch-all
+    that promotes only on cross-context signal (leak-to-input / multiplicity).
     """
 
     if name.lower() in _SECRET_INPUT_NAMES and value:
@@ -450,6 +463,8 @@ def classify_input_kind(name: str, value: str) -> CandidateKind:
         return "url"
     if _FULL_UUID_RE.match(value):
         return "identifier"
+    if _HIGH_ENTROPY_RE.fullmatch(value) and _high_entropy(value):
+        return "opaque_token"
     return "identifier"
 
 

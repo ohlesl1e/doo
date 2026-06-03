@@ -8,9 +8,14 @@ whether it clears a promotion signal (ADR-0023).
 
 Three promotion signals are active after #16:
 
-- **Shape-allowlist** (#14): a value whose `kind ∈ {secret, token,
-  internal_hostname, email}` promotes on shape alone, even at a single
-  occurrence — these are rare and inherently interesting.
+- **Shape-allowlist** (#14, narrowed by ADR-0024): a value whose `kind ∈
+  {secret, internal_hostname, email}` promotes on shape alone, even at a single
+  occurrence — these are rare and inherently interesting. `secret` is reserved
+  for the high-precision structured detectors (JWT / AWS / Stripe). A generic
+  high-entropy blob is `opaque_token` — secret-for-storage (hash-only) but
+  **not** on this allowlist, so it promotes only on a cross-context signal
+  (multiplicity ≥2 or leak-to-input), not on shape. This decouples
+  secrecy-for-storage from promotion-worthiness (one flag once conflated both).
 - **Multiplicity ≥2** (#15): a value occurring across **≥2 distinct
   observations** promotes regardless of kind — a recurring identifier (a tenant
   / account id seen in several responses) is tractable context even though its
@@ -35,11 +40,14 @@ from collections.abc import Sequence
 
 from doo.canonical.values import CandidateKind
 
-# Kinds that promote on shape alone (ADR-0023 shape-allowlist), even at a single
-# occurrence. Everything else needs a cross-context signal — multiplicity (#15)
-# or, later, leak-to-input.
+# Kinds that promote on shape alone (ADR-0023 shape-allowlist, narrowed by
+# ADR-0024), even at a single occurrence. Everything else — including
+# `opaque_token` (hash-only for storage but not always-promoted) — needs a
+# cross-context signal: multiplicity (#15) or leak-to-input (#16). `token` and
+# `opaque_token` are deliberately absent: only the high-precision structured
+# `secret` detectors warrant a node on shape alone.
 SHAPE_ALLOWLIST: frozenset[CandidateKind] = frozenset(
-    ("secret", "token", "internal_hostname", "email")
+    ("secret", "internal_hostname", "email")
 )
 
 # The multiplicity signal fires at this many distinct observations (ADR-0023).

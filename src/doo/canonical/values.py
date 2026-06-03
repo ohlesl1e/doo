@@ -39,18 +39,30 @@ CandidateKind = Literal[
     "identifier",
     "secret",
     "token",
+    "opaque_token",
 ]
 
 CANDIDATE_KINDS: tuple[CandidateKind, ...] = get_args(CandidateKind)
 
 # Kinds whose raw value must never enter the graph (ADR-0015): only the
 # `value_hash` + length + preview are carried. The raw bytes live only in the
-# response-body blob.
-SECRET_CANDIDATE_KINDS: frozenset[CandidateKind] = frozenset(("secret", "token"))
+# response-body blob. This is **secrecy-for-storage** — independent of
+# promotion-worthiness (the shape-allowlist in `canonical/promotion.py`). An
+# `opaque_token` (a generic high-entropy blob) is hash-only here so an
+# unrecognised real credential never lands raw, yet it is NOT always-promoted
+# (ADR-0024): it becomes a node only on multiplicity ≥2 or leak-to-input.
+SECRET_CANDIDATE_KINDS: frozenset[CandidateKind] = frozenset(
+    ("secret", "token", "opaque_token")
+)
 
 
 def is_secret_kind(kind: CandidateKind) -> bool:
-    """True if `kind`'s raw value must be hashed, never carried (ADR-0015)."""
+    """True if `kind`'s raw value must be hashed, never carried (ADR-0015).
+
+    Governs **storage** only (secrecy-for-storage), not promotion: `opaque_token`
+    is secret-for-storage but gated for promotion (ADR-0024). Promotion is decided
+    independently by `kind_is_allowlisted` in `canonical/promotion.py`.
+    """
 
     return kind in SECRET_CANDIDATE_KINDS
 

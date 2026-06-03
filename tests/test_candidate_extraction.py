@@ -138,6 +138,62 @@ def test_aws_key_is_secret_kind() -> None:
     assert secret.value_hash == hashlib.sha256(AWS_KEY.encode()).hexdigest()
 
 
+def test_generic_high_entropy_blob_is_opaque_token_not_secret() -> None:
+    # A long base64url/hex blob with no recognised structure (an ETag / signed-URL
+    # token) is `opaque_token` (ADR-0024): hash-only for storage but not promoted on
+    # shape. It must NOT be classified `secret`.
+    blob = "Ab3Cd9Ef2Gh5Ij8Kl1Mn4Op7Qr0St6Uv"  # 33 chars, mixed classes
+    cands = extract_candidates(
+        f'{{"etag": "{blob}"}}'.encode(), content_type="application/json"
+    )
+    tok = next(c for c in cands if c.extractor == "regex:high_entropy_token_v1")
+    assert tok.kind == "opaque_token"
+    # Still hash-only for storage (ADR-0015): no raw value, hash + preview carried.
+    assert tok.is_secret  # secret-for-storage predicate
+    assert tok.value is None
+    assert tok.value_hash == hashlib.sha256(blob.encode()).hexdigest()
+    assert tok.value_preview == blob[:8]
+    assert blob not in repr(tok)
+    # No structured detector mislabels it as `secret`.
+    assert not any(c.kind == "secret" for c in cands)
+
+
+def test_structured_secrets_stay_secret_not_opaque_token() -> None:
+    # JWT, AWS, Stripe keep emitting `secret` (the always-promoted shape-allowlist).
+    jwt = extract_candidates(
+        f'{{"t": "{SESSION_JWT}"}}'.encode(), content_type="application/json"
+    )
+    assert next(c for c in jwt if c.extractor == "regex:jwt_v1").kind == "secret"
+    aws = extract_candidates(b"AKIAIOSFODNN7EXAMPLE", content_type="text/plain")
+    assert next(c for c in aws if c.extractor == "regex:aws_access_key_v1").kind == "secret"
+    stripe = extract_candidates(
+        b"sk_live_abc123ABC456def789X", content_type="text/plain"
+    )
+    s = next(c for c in stripe if c.extractor == "regex:stripe_key_v1")
+    assert s.kind == "secret"
+
+
+def test_high_entropy_request_param_input_is_opaque_token() -> None:
+    # classify_input_kind maps a high-entropy request param to `opaque_token`
+    # (ADR-0024): hash-only, gated for promotion (not on shape).
+    blob = "Zx9Yw8Vu7Ts6Rq5Po4Nm3Lk2Ji1Hg0Fe"
+    c = extract_input_candidate("sig", blob, extractor="request-param:query_v1")
+    assert c.kind == "opaque_token"
+    assert c.role == "input"
+    assert c.is_secret  # secret-for-storage
+    assert c.value is None
+    assert c.value_hash == hash_for("opaque_token", blob)
+    assert c.value_preview == blob[:8]
+    assert blob not in repr(c)
+
+
+def test_plain_identifier_input_stays_identifier_not_opaque_token() -> None:
+    # A non-high-entropy param value (a slug / plain id) is still `identifier`, not
+    # opaque_token — the high-entropy gate requires mixed character classes.
+    c = extract_input_candidate("page", "next-page", extractor="request-param:query_v1")
+    assert c.kind == "identifier"
+
+
 def test_extract_candidates_does_not_return_diagnostics() -> None:
     # Fingerprint/error are NOT values; extract_candidates never emits them.
     cands = extract_candidates(

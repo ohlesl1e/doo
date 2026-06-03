@@ -17,19 +17,24 @@ from doo.canonical.promotion import (
     kind_is_allowlisted,
     should_promote,
 )
-from doo.canonical.values import CANDIDATE_KINDS, CandidateKind
+from doo.canonical.values import (
+    CANDIDATE_KINDS,
+    SECRET_CANDIDATE_KINDS,
+    CandidateKind,
+    is_secret_kind,
+)
 
 
 @pytest.mark.parametrize(
     "kind",
-    ["secret", "token", "internal_hostname", "email"],
+    ["secret", "internal_hostname", "email"],
 )
 def test_allowlisted_kinds_promote_on_single_occurrence(kind: CandidateKind) -> None:
     assert kind_is_allowlisted(kind)
     assert should_promote([kind])
 
 
-@pytest.mark.parametrize("kind", ["identifier", "url", "ip_address"])
+@pytest.mark.parametrize("kind", ["identifier", "url", "ip_address", "opaque_token"])
 def test_high_cardinality_kinds_do_not_promote_at_single_occurrence(
     kind: CandidateKind,
 ) -> None:
@@ -60,7 +65,7 @@ def test_mixed_occurrences_promote_if_any_allowlisted() -> None:
 # --- Multiplicity branch (#15) -------------------------------------------------
 
 
-@pytest.mark.parametrize("kind", ["identifier", "url", "ip_address"])
+@pytest.mark.parametrize("kind", ["identifier", "url", "ip_address", "opaque_token"])
 def test_non_allowlisted_value_in_two_observations_promotes(
     kind: CandidateKind,
 ) -> None:
@@ -70,7 +75,7 @@ def test_non_allowlisted_value_in_two_observations_promotes(
     assert should_promote([kind, kind], distinct_observations=2)
 
 
-@pytest.mark.parametrize("kind", ["identifier", "url", "ip_address"])
+@pytest.mark.parametrize("kind", ["identifier", "url", "ip_address", "opaque_token"])
 def test_non_allowlisted_value_twice_in_one_observation_does_not_promote(
     kind: CandidateKind,
 ) -> None:
@@ -165,10 +170,10 @@ def test_roles_default_empty_keeps_kinds_only_behaviour() -> None:
     assert should_promote(["internal_hostname"])
 
 
-def test_allowlist_is_exactly_the_four_shape_kinds() -> None:
-    assert SHAPE_ALLOWLIST == frozenset(
-        {"secret", "token", "internal_hostname", "email"}
-    )
+def test_allowlist_is_exactly_the_three_shape_kinds() -> None:
+    # ADR-0024 narrowed the allowlist: `token` and `opaque_token` are out, so a
+    # generic high-entropy blob no longer promotes on shape alone.
+    assert SHAPE_ALLOWLIST == frozenset({"secret", "internal_hostname", "email"})
 
 
 def test_every_candidate_kind_has_a_defined_decision() -> None:
@@ -176,3 +181,41 @@ def test_every_candidate_kind_has_a_defined_decision() -> None:
     for kind in CANDIDATE_KINDS:
         assert kind_is_allowlisted(kind) == (kind in SHAPE_ALLOWLIST)
         assert should_promote([kind]) == (kind in SHAPE_ALLOWLIST)
+
+
+# --- ADR-0024: storage and promotion are independent predicates ----------------
+
+
+def test_storage_and_promotion_sets_are_the_adr0024_split() -> None:
+    # secret-for-storage (hash-only, ADR-0015) and always-promote (shape) are now
+    # two distinct sets that overlap only on `secret`.
+    assert SECRET_CANDIDATE_KINDS == frozenset({"secret", "token", "opaque_token"})
+    assert SHAPE_ALLOWLIST == frozenset({"secret", "internal_hostname", "email"})
+    # The only kind that is BOTH secret-for-storage and always-promoted is `secret`.
+    assert SECRET_CANDIDATE_KINDS & SHAPE_ALLOWLIST == frozenset({"secret"})
+
+
+def test_opaque_token_is_secret_for_storage_but_not_promoted_on_shape() -> None:
+    # The decoupling, concretely: an opaque_token is hash-only for storage yet does
+    # NOT promote on shape — only on a cross-context signal.
+    assert is_secret_kind("opaque_token")
+    assert not kind_is_allowlisted("opaque_token")
+    assert not should_promote(["opaque_token"])  # single occurrence -> no node
+    assert should_promote(["opaque_token", "opaque_token"], distinct_observations=2)
+    assert should_promote(["opaque_token"], roles=["output", "input"])
+
+
+def test_secret_is_both_secret_for_storage_and_always_promoted() -> None:
+    # A structured secret (JWT / AWS / Stripe) promotes on shape alone, at one
+    # occurrence, AND is hash-only for storage.
+    assert is_secret_kind("secret")
+    assert kind_is_allowlisted("secret")
+    assert should_promote(["secret"])
+
+
+def test_token_is_secret_for_storage_but_no_longer_promoted_on_shape() -> None:
+    # `token` stays hash-only for storage but ADR-0024 removed it from the
+    # always-promote allowlist.
+    assert is_secret_kind("token")
+    assert not kind_is_allowlisted("token")
+    assert not should_promote(["token"])
