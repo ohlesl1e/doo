@@ -62,8 +62,9 @@ def run_l3_worker(
             process_l2_event(deps, event)
             deps.streams.ack(L2_EVENTS_STREAM, L3_CONSUMER_GROUP, message_id)
             processed += 1
-            if max_messages is not None and processed >= max_messages:
-                break
+        # `max_messages` is checked at the batch boundary (the `while` head), never
+        # mid-batch: breaking inside the loop would leave the rest of an already-
+        # delivered read batch unacked, stranding it in the consumer PEL.
         if not got_any and max_messages is not None:
             break
     return processed
