@@ -292,12 +292,18 @@ def declared_principal_identity_key(label: str) -> str:
     return f"declared:{label}"
 
 
-def discovered_principal_identity_key(auth_hash: Sha256Hex) -> str:
-    """Synthetic-fallback `identity_key` for a discovered Principal (ADR-0010 step 5).
+def discovered_principal_identity_key(
+    auth_hash: Sha256Hex, *, jwt_sub: str | None = None
+) -> str:
+    """`identity_key` for a discovered (undeclared) Principal (ADR-0010 step 5; ADR-0025).
 
-    Deterministic over the first observed AuthContext's `auth_hash`, so
-    re-ingesting the same traffic converges to the same synthetic Principal
-    (needed for replay / audit reproducibility).
+    Keyed on the **stable JWT `sub`** when one was decoded from the cue, so a
+    user's reissued tokens (new `iat`/`exp`/signature -> new `auth_hash`) collapse
+    to a single discovered Principal. Falls back to the per-credential `auth_hash`
+    only when there is no stable signal (an opaque / non-JWT bearer). Deterministic
+    either way, so re-ingesting the same traffic converges to the same Principal.
     """
 
+    if jwt_sub:
+        return f"discovered:jwt_sub:{jwt_sub}"
     return f"discovered:{auth_hash}"

@@ -214,8 +214,13 @@ def resolve_auth_context(
             unmerged=False,
         )
 
-    # No match → synthetic discovered Principal (step 5), low confidence, unmerged.
-    p_key = discovered_principal_identity_key(auth_hash)
+    # No match → discovered Principal (step 5), low confidence, unmerged. Keyed on
+    # the JWT `sub` when present so a user's reissued tokens collapse to one
+    # Principal (ADR-0025); else on the per-credential auth_hash.
+    cue_sub = cue.bearer_claims.get("sub")
+    p_key = discovered_principal_identity_key(
+        auth_hash, jwt_sub=cue_sub if isinstance(cue_sub, str) and cue_sub else None
+    )
     p_id = principal_id(engagement_id, p_key)
     _write_discovered_principal_and_auth_context(
         client,
