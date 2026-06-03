@@ -22,7 +22,10 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # The suite is mostly testcontainer-backed integration (Neo4j/Redis/MinIO per
+    # test class); it outgrew the original 10-minute budget as slices landed.
+    # Shared/session-scoped containers to bring this back down is a follow-up.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
