@@ -457,12 +457,13 @@ def test_bodies_har_full_pipeline_blobs_params_and_secrets(
     assert "hunter2" not in blob  # the form password value is suppressed too
 
 
-def test_response_artifacts_full_pipeline_exact_n_and_yielded_edges(
+def test_response_values_full_pipeline_promotion_and_yielded_edges(
     neo4j_client, redis_client, blob_client
 ) -> None:
-    """T6 end-to-end: the response-artifact fixture lands exactly N ResponseArtifact
-    nodes, each YIELDED from its parent RO with a matching engagement_id; the
-    acceptance-criterion hostname/JWT/Server artifacts have the expected shape."""
+    """ADR-0023 end-to-end: the fixture promotes exactly the allowlisted values to
+    `ObservedValue`s (zero `ResponseArtifact`s), each `YIELDED_VALUE` from its
+    parent RO with a matching engagement_id; secrets are hash-only; diagnostics are
+    inline RO properties."""
 
     eid = "eng-e2e-ra"
     _seed_engagement(neo4j_client, eid)
@@ -475,56 +476,72 @@ def test_response_artifacts_full_pipeline_exact_n_and_yielded_edges(
         filename="response_artifacts.har",
     )
 
-    # 5 entries -> 5 RequestObservations; the fixture yields exactly 7 artifacts:
-    # hostname + error_message (500), JWT secret_shaped, Server fingerprint,
-    # url + hostname (internal URL), AWS secret_shaped.
+    # 5 entries -> 5 RequestObservations; ZERO ResponseArtifacts (retired).
     assert _count(neo4j_client, "RequestObservation", eid) == 5
-    assert _count(neo4j_client, "ResponseArtifact", eid) == 7
+    assert _count(neo4j_client, "ResponseArtifact", eid) == 0
 
-    # Every ResponseArtifact is YIELDED from a RequestObservation; the edge and
-    # both endpoints share the engagement_id (ADR-0017).
-    yielded = neo4j_client.execute_read(
-        "MATCH (r:RequestObservation {engagement_id: $eid})-[y:YIELDED]->"
-        "(a:ResponseArtifact {engagement_id: $eid}) "
-        "WHERE y.engagement_id = $eid AND r.engagement_id = a.engagement_id "
-        "RETURN count(a) AS c",
+    # Allowlisted values promote: two internal hostnames (billing + admin.internal)
+    # and two secrets (JWT + AWS key). URLs / ids do NOT promote.
+    assert _count(neo4j_client, "ObservedValue", eid) == 4
+    kinds = neo4j_client.execute_read(
+        "MATCH (v:ObservedValue {engagement_id: $eid}) "
+        "RETURN v.kind AS k, count(*) AS c ORDER BY k",
         eid=eid,
     )
-    assert yielded[0]["c"] == 7
+    kind_counts = {r["k"]: r["c"] for r in kinds}
+    assert kind_counts == {"internal_hostname": 2, "secret": 2}
 
-    # Acceptance: the internal hostname artifact.
+    # Every ObservedValue is YIELDED_VALUE from a RequestObservation; the edge and
+    # both endpoints share the engagement_id (ADR-0017).
+    yielded = neo4j_client.execute_read(
+        "MATCH (r:RequestObservation {engagement_id: $eid})-[y:YIELDED_VALUE]->"
+        "(v:ObservedValue {engagement_id: $eid}) "
+        "WHERE y.engagement_id = $eid AND r.engagement_id = v.engagement_id "
+        "RETURN count(DISTINCT v) AS c, count(y) AS edges",
+        eid=eid,
+    )
+    assert yielded[0]["c"] == 4
+    assert yielded[0]["edges"] >= 4
+
+    # Acceptance: the internal hostname value, with a YIELDED_VALUE edge carrying
+    # location + extractor.
     host = neo4j_client.execute_read(
-        "MATCH (a:ResponseArtifact {engagement_id: $eid, artifact_kind: 'hostname', "
+        "MATCH (:RequestObservation {engagement_id: $eid})-[y:YIELDED_VALUE]->"
+        "(v:ObservedValue {engagement_id: $eid, kind: 'internal_hostname', "
         "value: 'internal-billing.corp.example'}) "
-        "RETURN a.extractor AS ex, a.location_section AS sec",
+        "RETURN y.extractor AS ex, y.location AS loc",
         eid=eid,
     )
     assert host and host[0]["ex"] == "regex:internal_hostname_v1"
-    assert host[0]["sec"] == "body"
+    assert host[0]["loc"].startswith("body:")
 
-    # Acceptance: the JWT secret-shape carries hash+preview, value is null.
-    jwt_art = neo4j_client.execute_read(
-        "MATCH (a:ResponseArtifact {engagement_id: $eid, artifact_kind: 'secret_shaped'}) "
-        "WHERE a.extractor = 'regex:jwt_v1' "
-        "RETURN a.value AS v, a.value_hash AS h, a.value_length AS len, a.value_preview AS prev",
-        eid=eid,
-    )
+    # Acceptance: the JWT secret carries hash+preview, value is null.
     import hashlib as _hl
 
-    assert jwt_art and jwt_art[0]["v"] is None
-    assert jwt_art[0]["h"] == _hl.sha256(_RA_SESSION_JWT.encode()).hexdigest()
-    assert jwt_art[0]["len"] == len(_RA_SESSION_JWT.encode())
-    assert jwt_art[0]["prev"] == _RA_SESSION_JWT[:8]
+    jwt_val = neo4j_client.execute_read(
+        "MATCH (v:ObservedValue {engagement_id: $eid, kind: 'secret', "
+        "value_hash: $h}) RETURN v.value AS v, v.value_length AS len, v.value_preview AS prev",
+        eid=eid,
+        h=_hl.sha256(_RA_SESSION_JWT.encode()).hexdigest(),
+    )
+    assert jwt_val and jwt_val[0]["v"] is None
+    assert jwt_val[0]["len"] == len(_RA_SESSION_JWT.encode())
+    assert jwt_val[0]["prev"] == _RA_SESSION_JWT[:8]
 
-    # Acceptance: the Server fingerprint (header section).
+    # Acceptance: the Server fingerprint is an inline RO property, not a node.
     fp = neo4j_client.execute_read(
-        "MATCH (a:ResponseArtifact {engagement_id: $eid, artifact_kind: 'fingerprint'}) "
-        "RETURN a.location_section AS sec, a.location_header_name AS hn, a.value AS v",
+        "MATCH (r:RequestObservation {engagement_id: $eid, concrete_path: '/health'}) "
+        "RETURN r.server_fingerprint AS sf",
         eid=eid,
     )
-    assert fp and fp[0]["sec"] == "header"
-    assert fp[0]["hn"] == "Server"
-    assert fp[0]["v"] == "nginx/1.21.6"
+    assert fp and fp[0]["sf"] == "nginx/1.21.6"
+    # The 500 body's error excerpt is an inline RO property.
+    err = neo4j_client.execute_read(
+        "MATCH (r:RequestObservation {engagement_id: $eid, concrete_path: '/billing/report'}) "
+        "RETURN r.error_excerpt AS ee",
+        eid=eid,
+    )
+    assert err and err[0]["ee"] and "internal-billing.corp.example" in err[0]["ee"]
 
     # ADR-0015: neither the raw JWT nor the AWS key appears in ANY node property.
     import json as _j
@@ -548,12 +565,12 @@ def test_response_artifacts_full_pipeline_exact_n_and_yielded_edges(
     assert _RA_SESSION_JWT.encode() in body
 
 
-def test_response_artifacts_reingest_idempotent_no_duplicates(
+def test_response_values_reingest_idempotent_no_duplicates(
     neo4j_client, redis_client, blob_client
 ) -> None:
-    """T6 idempotency: re-ingesting the same response does NOT double-create
-    ResponseArtifacts, despite the random UUID7 artifact_id. The deterministic,
-    secret-free source_id collapses the re-delivery at the ADR-0016 SETNX."""
+    """ADR-0023 idempotency: re-ingesting the same response does NOT double-create
+    `ObservedValue`s or `YIELDED_VALUE` edges. The promotion pass is identity-keyed
+    on `(engagement_id, value_hash)` and the edge MERGE on (location, extractor)."""
 
     eid = "eng-e2e-ra-idem"
     _seed_engagement(neo4j_client, eid)
@@ -566,9 +583,17 @@ def test_response_artifacts_reingest_idempotent_no_duplicates(
             har_bytes=RESPONSE_ARTIFACTS_HAR.read_bytes(),
             filename="response_artifacts.har",
         )
-    # Second ingest collapses: still exactly 7 ResponseArtifacts, 5 ROs.
-    assert _count(neo4j_client, "ResponseArtifact", eid) == 7
+    # Second ingest collapses: still exactly 4 ObservedValues, 5 ROs, 0 artifacts.
+    assert _count(neo4j_client, "ObservedValue", eid) == 4
+    assert _count(neo4j_client, "ResponseArtifact", eid) == 0
     assert _count(neo4j_client, "RequestObservation", eid) == 5
+    edges = neo4j_client.execute_read(
+        "MATCH (:RequestObservation {engagement_id: $eid})-[y:YIELDED_VALUE]->"
+        "(:ObservedValue {engagement_id: $eid}) RETURN count(y) AS c",
+        eid=eid,
+    )
+    # 4 promoted values, each yielded by exactly one observation -> 4 edges, stable.
+    assert edges[0]["c"] == 4
 
 
 def test_unknown_engagement_4xx_nothing_lands(neo4j_client, redis_client, blob_client) -> None:

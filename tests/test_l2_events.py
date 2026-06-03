@@ -1,7 +1,8 @@
 """L2Event tagged-union tests.
 
 Strict mode + extra=forbid on every variant. ADR-0015 secrets discipline
-enforced on ResponseArtifact. HostRef canonicalisation enforced.
+enforced on the inline `ValueCandidate` (ADR-0023; the `ResponseArtifact` variant
+is retired). HostRef canonicalisation enforced.
 """
 
 from __future__ import annotations
@@ -14,11 +15,10 @@ from pydantic import TypeAdapter, ValidationError
 
 from doo.canonical.value_objects import AuthContextCue, BlobRef, HostRef
 from doo.events.l2 import (
-    ArtifactLocation,
     L2Event,
     ParseFailure,
     RequestObservation,
-    ResponseArtifact,
+    ValueCandidate,
 )
 
 
@@ -75,91 +75,97 @@ def test_request_observation_rejects_relative_path() -> None:
         RequestObservation(**bad)
 
 
-def _body_location() -> ArtifactLocation:
-    return ArtifactLocation(section="body", byte_offset_start=0, byte_offset_end=4)
-
-
-def test_response_artifact_secret_kind_forbids_raw_value() -> None:
-    base = _base_l2_kwargs()
+def test_value_candidate_secret_kind_forbids_raw_value() -> None:
     with pytest.raises(ValidationError) as exc_info:
-        ResponseArtifact(
-            **base,
-            artifact_id="018f-uuid7",
-            request_observation_id="ro-1",
-            artifact_kind="token",
-            location=_body_location(),
+        ValueCandidate(
+            value_hash="a" * 64,
+            kind="token",
             extractor="regex:jwt_v1",
             value="eyJraWQiOi...",  # raw value forbidden for secret kinds (ADR-0015)
+            value_length=512,
         )
     assert "secret" in str(exc_info.value).lower() or "forbidden" in str(exc_info.value).lower()
 
 
-def test_response_artifact_secret_kind_requires_hash() -> None:
-    base = _base_l2_kwargs()
-    # Carrying hash+length is valid.
-    ra = ResponseArtifact(
-        **base,
-        artifact_id="018f-uuid7",
-        request_observation_id="ro-1",
-        artifact_kind="token",
-        location=_body_location(),
-        extractor="regex:jwt_v1",
+def test_value_candidate_secret_kind_carries_hash_preview_only() -> None:
+    vc = ValueCandidate(
         value_hash="a" * 64,
+        kind="token",
+        extractor="regex:jwt_v1",
         value_length=512,
         value_preview="eyJraWQi",
+        byte_start=0,
+        byte_end=512,
     )
-    assert ra.value is None
-    assert ra.value_hash == "a" * 64
+    assert vc.value is None
+    assert vc.value_hash == "a" * 64
+    assert vc.role == "output" and vc.section == "body"
 
 
-def test_response_artifact_non_secret_kind_requires_raw_value() -> None:
-    base = _base_l2_kwargs()
+def test_value_candidate_secret_kind_requires_length() -> None:
     with pytest.raises(ValidationError):
-        ResponseArtifact(
-            **base,
-            artifact_id="018f-uuid7",
-            request_observation_id="ro-1",
-            artifact_kind="email",
-            location=_body_location(),
+        ValueCandidate(
+            value_hash="a" * 64,
+            kind="secret",
+            extractor="regex:jwt_v1",
+            # value_length missing
+        )
+
+
+def test_value_candidate_non_secret_kind_requires_raw_value() -> None:
+    with pytest.raises(ValidationError):
+        ValueCandidate(
+            value_hash="a" * 64,
+            kind="email",
             extractor="regex:email_v1",
             # value missing
         )
-    # Non-secret kind with a value is fine.
-    ra = ResponseArtifact(
-        **base,
-        artifact_id="018f-uuid7b",
-        request_observation_id="ro-1",
-        artifact_kind="email",
-        location=_body_location(),
+    vc = ValueCandidate(
+        value_hash="a" * 64,
+        kind="email",
         extractor="regex:email_v1",
         value="alice@example.com",
     )
-    assert ra.value == "alice@example.com"
+    assert vc.value == "alice@example.com"
 
 
-def test_response_artifact_non_secret_kind_rejects_hash_fields() -> None:
-    base = _base_l2_kwargs()
+def test_value_candidate_header_section_requires_name() -> None:
     with pytest.raises(ValidationError):
-        ResponseArtifact(
-            **base,
-            artifact_id="018f-uuid7",
-            request_observation_id="ro-1",
-            artifact_kind="email",
-            location=_body_location(),
-            extractor="regex:email_v1",
-            value="alice@example.com",
+        ValueCandidate(
             value_hash="a" * 64,
+            kind="internal_hostname",
+            extractor="x",
+            value="host.corp.example",
+            section="header",  # header section requires header_name
         )
 
 
-def test_artifact_location_header_forbids_body_offsets() -> None:
+def test_value_candidate_rejects_bad_hash() -> None:
     with pytest.raises(ValidationError):
-        ArtifactLocation(section="header", header_name="Server", byte_offset_start=0)
+        ValueCandidate(
+            value_hash="nothex",
+            kind="email",
+            extractor="regex:email_v1",
+            value="alice@example.com",
+        )
 
 
-def test_artifact_location_header_requires_name() -> None:
-    with pytest.raises(ValidationError):
-        ArtifactLocation(section="header")
+def test_request_observation_carries_inline_candidates_and_diagnostics() -> None:
+    kw = _ro_kwargs()
+    kw["value_candidates"] = (
+        ValueCandidate(
+            value_hash="a" * 64,
+            kind="internal_hostname",
+            extractor="regex:internal_hostname_v1",
+            value="host.corp.example",
+        ),
+    )
+    kw["server_fingerprint"] = "nginx/1.21.6"
+    kw["error_excerpt"] = "boom"
+    ro = RequestObservation(**kw)
+    assert ro.value_candidates[0].kind == "internal_hostname"
+    assert ro.server_fingerprint == "nginx/1.21.6"
+    assert ro.error_excerpt == "boom"
 
 
 def test_parse_failure_constructs_with_required_fields() -> None:

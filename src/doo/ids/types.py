@@ -20,10 +20,10 @@ ScopeContentHash = NewType("ScopeContentHash", str)
 
 # Observation / inference node ids.
 ObservationId = NewType("ObservationId", str)
-"""A `RequestObservation` or `ResponseArtifact` or `ParseFailure` node id."""
+"""A `RequestObservation` or `ParseFailure` node id."""
 
-ResponseArtifactId = NewType("ResponseArtifactId", str)
-"""A `ResponseArtifact` node id."""
+ObservedValueId = NewType("ObservedValueId", str)
+"""An `ObservedValue` node id, derived from `(engagement_id, value_hash)` (ADR-0009)."""
 
 ParameterId = NewType("ParameterId", str)
 """A `Parameter` node id."""

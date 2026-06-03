@@ -37,6 +37,7 @@ from doo.ids import (
     AuthContextId,
     EngagementId,
     HostId,
+    ObservedValueId,
     ParameterId,
     PrincipalId,
     Sha256Hex,
@@ -255,6 +256,18 @@ def auth_context_id(engagement_id: EngagementId, auth_hash: Sha256Hex) -> AuthCo
     """Stable `AuthContext` node id over `(engagement_id, auth_hash)`."""
 
     return AuthContextId(_hash_tuple(engagement_id, auth_hash))
+
+
+def observed_value_id(
+    engagement_id: EngagementId, value_hash: Sha256Hex
+) -> ObservedValueId:
+    """Stable `ObservedValue` node id over `(engagement_id, value_hash)` (ADR-0009).
+
+    Matches the `ObservedValue` uniqueness constraint in `ontology/schema.py`, so
+    the same value in one engagement converges to one node (the promotion dedup).
+    """
+
+    return ObservedValueId(_hash_tuple(engagement_id, value_hash))
 
 
 def anonymous_principal_identity_key() -> str:

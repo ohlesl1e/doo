@@ -14,9 +14,11 @@ Cypher:
   anonymous traffic keeps the anonymous singleton.
 - **T5** bodies: the POST JSON body lands in MinIO and aggregates body
   `Parameter`s; the in-body refresh token never reaches the graph.
-- **T6** response artifacts: the 500 body yields the internal hostname, the
-  `/session` JSON yields a secret-shaped JWT (hash+preview only), the `Server`
-  header yields a fingerprint — each `YIELDED` from its parent observation.
+- **ADR-0023** response values: the 500 body yields the internal hostname and an
+  inline `error_excerpt`; the `/session` JSON yields a secret-shaped JWT
+  `ObservedValue` (hash+preview only) and an inline `server_fingerprint` — the two
+  promoted values each `YIELDED_VALUE` from their parent observation; zero
+  `ResponseArtifact`s.
 - **ADR-0015**: no raw token bytes (bearer / refresh / access) appear in any
   Neo4j node property — only in the MinIO blobs.
 
@@ -165,35 +167,59 @@ def test_slice1_comprehensive_pipeline(neo4j_client, redis_client, blob_client) 
     assert {"username", "email", "tier"} <= names
     assert "refresh_token" in names  # the param exists; its raw value is suppressed
 
-    # --- T6: response artifacts. ---
+    # --- ADR-0023: response values promote to ObservedValue; diagnostics inline. ---
+    assert _count(neo4j_client, "ResponseArtifact", _EID) == 0
     hostname = neo4j_client.execute_read(
-        "MATCH (a:ResponseArtifact {engagement_id: $eid, artifact_kind: 'hostname', "
-        "value: 'internal-billing.corp.example'}) RETURN a.location_section AS sec",
+        "MATCH (:RequestObservation {engagement_id: $eid})-[y:YIELDED_VALUE]->"
+        "(v:ObservedValue {engagement_id: $eid, kind: 'internal_hostname', "
+        "value: 'internal-billing.corp.example'}) RETURN y.location AS loc, y.extractor AS ex",
         eid=_EID,
     )
-    assert hostname and hostname[0]["sec"] == "body"
+    assert hostname and hostname[0]["loc"].startswith("body:")
+    assert hostname[0]["ex"] == "regex:internal_hostname_v1"
     secret_jwt = neo4j_client.execute_read(
-        "MATCH (a:ResponseArtifact {engagement_id: $eid, artifact_kind: 'secret_shaped'}) "
-        "WHERE a.extractor = 'regex:jwt_v1' "
-        "RETURN a.value AS v, a.value_hash AS h, a.value_preview AS prev",
+        "MATCH (v:ObservedValue {engagement_id: $eid, kind: 'secret'}) "
+        "RETURN v.value AS v, v.value_hash AS h, v.value_preview AS prev",
         eid=_EID,
     )
     assert secret_jwt and secret_jwt[0]["v"] is None and secret_jwt[0]["h"]
+    # The Server fingerprint is an inline RequestObservation property (not a node).
     fingerprint = neo4j_client.execute_read(
-        "MATCH (a:ResponseArtifact {engagement_id: $eid, artifact_kind: 'fingerprint'}) "
-        "RETURN a.location_header_name AS hn, a.value AS v",
+        "MATCH (r:RequestObservation {engagement_id: $eid, concrete_path: '/session'}) "
+        "RETURN r.server_fingerprint AS sf",
         eid=_EID,
     )
-    assert fingerprint and fingerprint[0]["hn"] == "Server"
-    assert fingerprint[0]["v"] == "nginx/1.21.6"
-    # Every ResponseArtifact is YIELDED from a RequestObservation.
+    assert fingerprint and fingerprint[0]["sf"] == "nginx/1.21.6"
+    # The 500 body's error excerpt is an inline property.
+    error = neo4j_client.execute_read(
+        "MATCH (r:RequestObservation {engagement_id: $eid, concrete_path: '/report'}) "
+        "RETURN r.error_excerpt AS ee",
+        eid=_EID,
+    )
+    assert error and error[0]["ee"] and "internal-billing.corp.example" in error[0]["ee"]
+    # ADR-0023: response-output values reach ObservedValue via YIELDED_VALUE;
+    # request-input values via SENT_VALUE (#16). 2 outputs (internal-billing
+    # hostname + access_token JWT) + 2 allowlisted inputs (the POST body email +
+    # refresh_token secret) = 4 ObservedValues, every one with a provenance edge.
     yielded = neo4j_client.execute_read(
-        "MATCH (:RequestObservation {engagement_id: $eid})-[:YIELDED]->"
-        "(a:ResponseArtifact {engagement_id: $eid}) RETURN count(a) AS c",
+        "MATCH (:RequestObservation {engagement_id: $eid})-[:YIELDED_VALUE]->"
+        "(v:ObservedValue {engagement_id: $eid}) RETURN count(DISTINCT v) AS c",
         eid=_EID,
     )
-    assert yielded[0]["c"] == _count(neo4j_client, "ResponseArtifact", _EID)
-    assert yielded[0]["c"] >= 3
+    assert yielded[0]["c"] == 2  # internal-billing hostname + access_token JWT (outputs)
+    sent = neo4j_client.execute_read(
+        "MATCH (:RequestObservation {engagement_id: $eid})-[:SENT_VALUE]->"
+        "(v:ObservedValue {engagement_id: $eid}) RETURN count(DISTINCT v) AS c",
+        eid=_EID,
+    )
+    assert sent[0]["c"] == 2  # POST body email + refresh_token (allowlisted inputs)
+    reached = neo4j_client.execute_read(
+        "MATCH (v:ObservedValue {engagement_id: $eid}) "
+        "WHERE (:RequestObservation)-[:YIELDED_VALUE|SENT_VALUE]->(v) "
+        "RETURN count(DISTINCT v) AS c",
+        eid=_EID,
+    )
+    assert reached[0]["c"] == _count(neo4j_client, "ObservedValue", _EID)  # every OV has provenance
 
     # --- ADR-0015: no raw token bytes anywhere in the graph. ---
     blob = _all_node_props_blob(neo4j_client)
@@ -226,7 +252,7 @@ def test_slice1_comprehensive_reingest_is_idempotent(
                     "RequestObservation",
                     "Endpoint",
                     "Parameter",
-                    "ResponseArtifact",
+                    "ObservedValue",
                     "ParseFailure",
                     "Principal",
                     "AuthContext",

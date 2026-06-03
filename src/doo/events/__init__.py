@@ -2,7 +2,8 @@
 
 L1 -> L2: `IngestionEnvelope` (one per arrival on the `ingest` stream).
 L2 -> L3: `L2Event` discriminated union over `RequestObservation` /
-`ResponseArtifact` / `ParseFailure`.
+`ParseFailure` (the `ResponseArtifact` variant is retired; ADR-0023 — values are
+inline `ValueCandidate`s on the observation, promoted at flush).
 L3 -> consumers: `L3Event` discriminated union of structural events.
 
 Plus slice-4 hedge contracts (`TestCase`, `Finding`, `EXECUTED_AS`) — the
@@ -18,8 +19,7 @@ from doo.events.l2 import (
     ParseFailure,
     ParseFailureKind,
     RequestObservation,
-    ResponseArtifact,
-    ResponseArtifactKind,
+    ValueCandidate,
 )
 from doo.events.l3 import (
     EdgeCreated,
@@ -61,10 +61,9 @@ __all__ = [
     "PayloadClass",
     "Reconciliation",
     "RequestObservation",
-    "ResponseArtifact",
-    "ResponseArtifactKind",
     "SOURCE_KINDS",
     "SourceKind",
     "TestCase",
     "TestClass",
+    "ValueCandidate",
 ]

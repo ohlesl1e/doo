@@ -55,7 +55,6 @@ SHARED_NODE_LABELS: tuple[str, ...] = ("Engagement", "Scope")
 # `engagement_id` in its identity tuple.
 ENGAGEMENT_SCOPED_NODE_LABELS: tuple[str, ...] = (
     "RequestObservation",
-    "ResponseArtifact",
     "ParseFailure",
     "Endpoint",
     "Parameter",
@@ -111,7 +110,6 @@ def schema_statements() -> tuple[SchemaStatement, ...]:
     scoped_identity: dict[str, tuple[str, ...]] = {
         # Observation layer.
         "RequestObservation": ("engagement_id", "observation_id"),
-        "ResponseArtifact": ("engagement_id", "artifact_id"),
         "ParseFailure": ("engagement_id", "observation_id"),
         # Inference layer.
         "Endpoint": ("engagement_id", "method", "host_id", "path_template"),

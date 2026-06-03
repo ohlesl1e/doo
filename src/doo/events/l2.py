@@ -1,4 +1,10 @@
-"""L2 -> L3 events: `RequestObservation` / `ResponseArtifact` / `ParseFailure`.
+"""L2 -> L3 events: `RequestObservation` / `ParseFailure`.
+
+Response extraction does NOT emit a node per value (the retired `ResponseArtifact`;
+ADR-0023). Each `RequestObservation` records its extracted value occurrences
+inline (`value_candidates`, `output` role) plus one-per-response diagnostics
+(`server_fingerprint`, `error_excerpt`). A deferred promotion pass at flush mints
+an `ObservedValue` only for values clearing the shape-allowlist.
 
 Discriminator: `kind`. Each variant carries the trace_id / span_id propagated
 from the originating `IngestionEnvelope` (per ADR-0018), plus provenance fields
@@ -18,11 +24,11 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from doo.canonical.value_objects import AuthContextCue, BlobRef, HostRef
+from doo.canonical.values import CandidateKind, is_secret_kind
 from doo.ids import (
     EngagementId,
     L2EventId,
     ObservationId,
-    ResponseArtifactId,
     Sha256Hex,
     SourceId,
     SpanId,
@@ -87,6 +93,75 @@ class BodyParam(BaseModel):
     # RFC 6901 JSON Pointer for JSON-body leaves; None for flat bodies.
     json_pointer: str | None = None
     value: str | None = None
+
+
+ValueRole = Literal["output", "input"]
+ValueSection = Literal["body", "header"]
+
+
+class ValueCandidate(BaseModel):
+    """One extracted value occurrence, recorded inline on a `RequestObservation`.
+
+    Supersedes the per-extraction `ResponseArtifact` node (ADR-0023): candidates
+    are arrays on one observation, not N nodes. A deferred promotion pass at flush
+    aggregates these by `value_hash` (engagement-scoped) and mints an
+    `ObservedValue` for kinds in the shape-allowlist.
+
+    `role` is `output` for values surfaced in a response; `input` for values
+    *sent* as request parameters (path/query/body) — the leak-to-input branch
+    (#16, ADR-0023). `section` is `body` or `header`.
+
+    `parameter_name` is set for `input`-role candidates: the name of the request
+    parameter (query key, body-leaf name) that carried the value. It feeds the
+    `SENT_VALUE {parameter_name}` edge from the consuming request to the promoted
+    `ObservedValue`. Output candidates leave it `None` (they carry a structural
+    location — `header_name` / `json_pointer` / byte offsets — instead).
+
+    Secret discipline (ADR-0015): for `secret` / `token` kinds, `value` is null and
+    only `value_hash` + `value_length` + `value_preview` (first 8 chars) are
+    carried; the raw value lives only in the response/request-body blob. Non-secret
+    kinds carry the raw `value` and a `value_hash` over its normalised form.
+    """
+
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    value_hash: Sha256Hex
+    kind: CandidateKind
+    extractor: str = Field(min_length=1)
+    role: ValueRole = "output"
+    section: ValueSection = "body"
+    value: str | None = None
+    value_length: int | None = Field(default=None, ge=0)
+    value_preview: str | None = None
+    header_name: str | None = None
+    json_pointer: str | None = None
+    byte_start: int | None = Field(default=None, ge=0)
+    byte_end: int | None = Field(default=None, ge=0)
+    # Set for input-role candidates: the request parameter that carried the value
+    # (the `SENT_VALUE.parameter_name`). None for output candidates.
+    parameter_name: str | None = None
+
+    @model_validator(mode="after")
+    def _shape(self) -> Self:
+        if not _SHA256_RE.match(self.value_hash):
+            raise ValueError("value_hash must be 64 lowercase hex chars")
+        if is_secret_kind(self.kind):
+            if self.value is not None:
+                raise ValueError(
+                    f"kind={self.kind!r}: raw `value` is forbidden; carry "
+                    "value_hash + value_length + value_preview only (ADR-0015)"
+                )
+            if self.value_length is None:
+                raise ValueError(f"kind={self.kind!r}: value_length required for secrets")
+        else:
+            if self.value is None:
+                raise ValueError(f"kind={self.kind!r}: `value` is required for non-secret kinds")
+        if self.section == "header":
+            if not self.header_name:
+                raise ValueError("header candidates must carry a header_name")
+        if self.role == "input" and not self.parameter_name:
+            raise ValueError("input candidates must carry a parameter_name")
+        return self
 
 
 class L2EventBase(BaseModel):
@@ -156,143 +231,19 @@ class RequestObservation(L2EventBase):
     response_size_bytes: int = Field(ge=0)
     duration_ms: int | None = Field(default=None, ge=0)
 
+    # ADR-0023: extracted value occurrences (inline, replacing ResponseArtifact
+    # nodes) + one-per-response diagnostics (inline, replacing fingerprint/error
+    # nodes). The promotion pass at flush turns allowlisted candidates into
+    # `ObservedValue`s; diagnostics become RequestObservation node properties.
+    value_candidates: tuple[ValueCandidate, ...] = ()
+    server_fingerprint: str | None = None
+    error_excerpt: str | None = None
+
     @model_validator(mode="after")
     def _validate(self) -> Self:
         _check_trace_span(self.trace_id, self.span_id)
         if not self.concrete_path.startswith("/"):
             raise ValueError("concrete_path must be absolute (start with /)")
-        return self
-
-
-ResponseArtifactKind = Literal[
-    "identifier",
-    "ip_address",
-    "url",
-    "hostname",
-    "email",
-    "error_message",
-    "fingerprint",
-    "internal_path",
-    "secret_shaped",
-    "token",
-]
-
-# Where in the response an artifact was found. `body` artifacts carry byte
-# offsets into the (decoded) response body; `header` artifacts carry the source
-# header name. The two are mutually exclusive — see `ArtifactLocation`.
-ArtifactSection = Literal["body", "header"]
-
-# Kinds whose raw value must never enter the graph (ADR-0015): only the
-# value_hash + value_length + value_preview are carried; the raw bytes live only
-# in the MinIO response-body blob.
-SECRET_ARTIFACT_KINDS: frozenset[str] = frozenset(("secret_shaped", "token"))
-
-
-class ArtifactLocation(BaseModel):
-    """Structured pointer to where a `ResponseArtifact` was extracted from.
-
-    `section = "header"` artifacts carry `header_name` (the source header).
-    `section = "body"` artifacts carry byte offsets into the *decoded* response
-    body and, for structured (JSON) bodies, an RFC 6901 `json_pointer` to the
-    leaf the value came from. Offsets are over the same raw bytes that were
-    content-addressed and uploaded to object storage (T5), so a consumer can
-    re-derive the exact substring from the blob without it ever being copied into
-    a graph property for secret kinds (ADR-0015).
-    """
-
-    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
-
-    section: ArtifactSection
-    header_name: str | None = None
-    json_pointer: str | None = None
-    byte_offset_start: int | None = Field(default=None, ge=0)
-    byte_offset_end: int | None = Field(default=None, ge=0)
-
-    @model_validator(mode="after")
-    def _section_shape(self) -> Self:
-        if self.section == "header":
-            if not self.header_name:
-                raise ValueError("header artifacts must carry a header_name")
-            if (
-                self.json_pointer is not None
-                or self.byte_offset_start is not None
-                or self.byte_offset_end is not None
-            ):
-                raise ValueError("header artifacts must not carry body offsets / json_pointer")
-        else:  # body
-            if self.header_name is not None:
-                raise ValueError("body artifacts must not carry a header_name")
-            if (
-                self.byte_offset_start is not None
-                and self.byte_offset_end is not None
-                and self.byte_offset_end < self.byte_offset_start
-            ):
-                raise ValueError("byte_offset_end must be >= byte_offset_start")
-        return self
-
-
-class ResponseArtifact(L2EventBase):
-    """One discrete thing extracted deterministically from a response (T6).
-
-    The artifact's node identity is `(engagement_id, artifact_id)` with
-    `artifact_id` a UUID7. Node identity is therefore *not* idempotent on its own
-    — re-ingestion must be collapsed by the ADR-0016 semantic key, which is built
-    from the deterministic `source_id` the extractor stamps (derived from the
-    parent RO's source_id + extractor + location + value/value_hash). So a
-    re-delivered identical artifact short-circuits at the commit `SETNX` before
-    the random `artifact_id` node is ever written.
-
-    `request_observation_id` back-references the parent `RequestObservation`; the
-    L3 commit draws a `YIELDED` edge RO -> ResponseArtifact carrying
-    `engagement_id`.
-
-    Per ADR-0015: for `secret_shaped` / `token` kinds, only `value_hash`,
-    `value_length`, `value_preview` (first 8 chars) are carried. For other kinds,
-    the raw substring is carried in `value`. Both populated is invalid.
-    """
-
-    kind: Literal["response_artifact"] = "response_artifact"
-    artifact_id: ResponseArtifactId
-    request_observation_id: ObservationId
-    artifact_kind: ResponseArtifactKind
-    location: ArtifactLocation
-    # Versioned rule name, per CONTEXT.md (`regex:internal_hostname_v1`,
-    # `json-walk:id-fields_v1`). A rule change bumps the version suffix and is an
-    # independent extractor; it does not retract or re-mean prior artifacts.
-    extractor: str = Field(min_length=1)
-    # Non-secret kinds: raw value lives here.
-    value: str | None = None
-    # Secret-shaped kinds: hashed shape only (ADR-0015).
-    value_hash: Sha256Hex | None = None
-    value_length: int | None = Field(default=None, ge=0)
-    value_preview: str | None = None
-
-    @model_validator(mode="after")
-    def _secret_discipline(self) -> Self:
-        _check_trace_span(self.trace_id, self.span_id)
-        is_secret_kind = self.artifact_kind in SECRET_ARTIFACT_KINDS
-        if is_secret_kind:
-            if self.value is not None:
-                raise ValueError(
-                    f"artifact_kind={self.artifact_kind!r}: raw `value` is forbidden; "
-                    "carry value_hash + value_length + value_preview only (ADR-0015)"
-                )
-            if self.value_hash is None or self.value_length is None:
-                raise ValueError(
-                    f"artifact_kind={self.artifact_kind!r}: value_hash and value_length required"
-                )
-            if not _SHA256_RE.match(self.value_hash):
-                raise ValueError("value_hash must be 64 lowercase hex chars")
-        else:
-            if self.value is None:
-                raise ValueError(
-                    f"artifact_kind={self.artifact_kind!r}: `value` is required for non-secret kinds"
-                )
-            if self.value_hash is not None or self.value_length is not None:
-                raise ValueError(
-                    f"artifact_kind={self.artifact_kind!r}: non-secret kinds must not carry "
-                    "value_hash / value_length (those are the secret-shape fields)"
-                )
         return self
 
 
@@ -325,7 +276,9 @@ class ParseFailure(L2EventBase):
 
 
 # Discriminated union over `kind`. Pydantic v2 enforces the discriminator.
+# `ResponseArtifact` retired (ADR-0023): values are inline candidates + a
+# promotion pass; `RequestObservation` and `ParseFailure` remain.
 L2Event = Annotated[
-    RequestObservation | ResponseArtifact | ParseFailure,
+    RequestObservation | ParseFailure,
     Field(discriminator="kind"),
 ]

@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Protocol
 
-from doo.events.l2 import L2Event, ParseFailure, RequestObservation, ResponseArtifact
+from doo.events.l2 import L2Event, ParseFailure, RequestObservation
 from doo.events.l3 import (
     EdgeCreated,
     L3Event,
@@ -40,10 +40,10 @@ from doo.infra.neo4j_driver import Neo4jClient
 from doo.infra.streams import L3_EVENTS_STREAM, StreamClient
 from doo.observability.ids import new_span_id, new_trace_id
 from doo.observability.logging import bind_correlation, get_logger
+from doo.ontology.promotion import PromotionResult, promote_values
 from doo.ontology.resolve import (
     commit_parse_failure,
     commit_request_observation,
-    commit_response_artifact,
     resolve_auth_context,
     resolve_host,
 )
@@ -104,13 +104,16 @@ class CommitResult:
 
 @dataclass(frozen=True, slots=True)
 class FlushResult:
-    """Outcome of a `flush()`: how many dirty cohorts were re-templated and the
-    Endpoint/Parameter nodes touched (ADR-0022)."""
+    """Outcome of a `flush()`: dirty cohorts re-templated + the Endpoint/Parameter
+    nodes touched (ADR-0022), plus the `ObservedValue`s promoted from inline value
+    candidates and the `YIELDED_VALUE` edges wired (ADR-0023)."""
 
     cohorts: int = 0
     endpoints: int = 0
     parameters: int = 0
     retracted: int = 0
+    observed_values: int = 0
+    yielded_value_edges: int = 0
 
 
 class CommitOrchestrator:
@@ -165,8 +168,6 @@ class CommitOrchestrator:
 
         if isinstance(event, RequestObservation):
             result = self._commit_request_observation(event, commit_id, span_id)
-        elif isinstance(event, ResponseArtifact):
-            result = self._commit_response_artifact(event, commit_id, span_id)
         elif isinstance(event, ParseFailure):
             result = self._commit_parse_failure(event, commit_id, span_id)
         else:  # pragma: no cover - the union is exhaustive above
@@ -248,23 +249,27 @@ class CommitOrchestrator:
     # --- Deferred endpoint inference (ADR-0022): flush ----------------------
 
     def flush(self) -> FlushResult:
-        """Re-template every cohort that has un-HIT observations (ADR-0022).
+        """Re-template dirty cohorts and promote inline value candidates (ADR-0022/0023).
 
-        `commit` leaves each `RequestObservation` un-HIT; this is the deferred
-        endpoint-inference step. It finds every `(engagement_id, method, host_id)`
-        cohort containing an un-HIT observation and runs the cohort re-templating
-        once — attaching `HIT`s, creating/retracting `Endpoint`s, aggregating
-        `Parameter`s — emitting the resulting structural `l3-events`.
+        `commit` leaves each `RequestObservation` un-HIT and its extracted values
+        inline; this is the deferred-inference step. It:
 
-        Dirtiness is derived from the graph (un-HIT observation), so flush is
-        crash-safe: a worker that died mid-drain just leaves un-HIT observations,
-        and the next flush (e.g. on startup) re-templates them. Idempotent: a
-        fully-templated graph has no dirty cohorts, so flush is a no-op.
+        - finds every `(engagement_id, method, host_id)` cohort with an un-HIT
+          observation and re-templates it (attaching `HIT`s, creating/retracting
+          `Endpoint`s, aggregating `Parameter`s); and
+        - promotes inline value candidates into `ObservedValue`s for every affected
+          engagement, wiring `YIELDED_VALUE` edges (the ADR-0023 promotion pass).
+
+        Both steps emit structural `l3-events`. Dirtiness is derived from the graph,
+        so flush is crash-safe and idempotent: a fully-templated, fully-promoted
+        graph has no dirty cohorts and re-promotes nothing (identity-keyed MERGEs).
         """
 
         dirty = self._find_dirty_cohorts()
         cohorts = endpoints = parameters = retracted = 0
+        engagements: set[EngagementId] = set()
         for engagement_id, method, host_node_id in dirty:
+            engagements.add(engagement_id)
             now = datetime.now(UTC)
             retemplate = retemplate_cohort(
                 self._neo4j,
@@ -285,20 +290,100 @@ class CommitOrchestrator:
             endpoints += len(retemplate.endpoint_ids)
             parameters += len(retemplate.parameter_ids)
             retracted += len(retemplate.retracted_endpoint_ids)
-        if cohorts:
+
+        # --- ADR-0023 promotion pass: inline value candidates -> ObservedValue. ---
+        observed_values = yielded_value_edges = 0
+        for engagement_id in sorted(engagements):
+            now = datetime.now(UTC)
+            promotion = promote_values(
+                self._neo4j,
+                engagement_id=engagement_id,
+                observed_at=now,
+                ingested_at=now,
+            )
+            trace_id = new_trace_id()
+            span_id = new_span_id()
+            commit_id = CommitId(new_span_id() + new_span_id())
+            for l3_event in self._promotion_events(
+                promotion, engagement_id, trace_id, span_id, commit_id
+            ):
+                self._streams.publish(L3_EVENTS_STREAM, l3_event.model_dump(mode="json"))
+            observed_values += len(promotion.promoted)
+            yielded_value_edges += promotion.edges
+
+        if cohorts or observed_values:
             log.info(
                 "flush.applied",
                 cohorts=cohorts,
                 endpoints=endpoints,
                 parameters=parameters,
                 retracted=retracted,
+                observed_values=observed_values,
+                yielded_value_edges=yielded_value_edges,
             )
         return FlushResult(
             cohorts=cohorts,
             endpoints=endpoints,
             parameters=parameters,
             retracted=retracted,
+            observed_values=observed_values,
+            yielded_value_edges=yielded_value_edges,
         )
+
+    def _promotion_events(
+        self,
+        promotion: PromotionResult,
+        engagement_id: EngagementId,
+        trace_id: str,
+        span_id: str,
+        commit_id: CommitId,
+    ) -> tuple[L3Event, ...]:
+        """`l3-events` for one engagement's promotion pass: a `node_created` per
+        `ObservedValue` and an `edge_created` per `YIELDED_VALUE` (ADR-0023)."""
+
+        events: list[L3Event] = []
+        for pv in promotion.promoted:
+            events.append(
+                NodeCreated(
+                    commit_id=commit_id,
+                    trace_id=trace_id,  # type: ignore[arg-type]
+                    span_id=span_id,  # type: ignore[arg-type]
+                    engagement_id=engagement_id,
+                    emitted_at=datetime.now(UTC),
+                    node_type="ObservedValue",
+                    node_id=str(pv.observed_value_id),
+                    properties={"via": "promotion", "kind": pv.kind},
+                )
+            )
+            for observation_id in pv.yielded_from:
+                events.append(
+                    EdgeCreated(
+                        commit_id=commit_id,
+                        trace_id=trace_id,  # type: ignore[arg-type]
+                        span_id=span_id,  # type: ignore[arg-type]
+                        engagement_id=engagement_id,
+                        emitted_at=datetime.now(UTC),
+                        edge_type="YIELDED_VALUE",
+                        from_node=observation_id,
+                        to_node=str(pv.observed_value_id),
+                        properties={"engagement_id": engagement_id},
+                    )
+                )
+            for observation_id in pv.sent_from:
+                events.append(
+                    EdgeCreated(
+                        commit_id=commit_id,
+                        trace_id=trace_id,  # type: ignore[arg-type]
+                        span_id=span_id,  # type: ignore[arg-type]
+                        engagement_id=engagement_id,
+                        emitted_at=datetime.now(UTC),
+                        edge_type="SENT_VALUE",
+                        from_node=observation_id,
+                        to_node=str(pv.observed_value_id),
+                        properties={"engagement_id": engagement_id},
+                    )
+                )
+        return tuple(events)
 
     def _find_dirty_cohorts(self) -> list[tuple[EngagementId, str, HostId]]:
         """Distinct `(engagement, method, host)` cohorts with un-HIT observations."""
@@ -378,44 +463,6 @@ class CommitOrchestrator:
             properties={"via": "flush"},
         )
 
-    def _commit_response_artifact(
-        self, artifact: ResponseArtifact, commit_id: CommitId, span_id: str
-    ) -> CommitResult:
-        """Commit a `ResponseArtifact` node + its `YIELDED` edge from the parent RO.
-
-        Idempotency is already enforced upstream by the semantic-key `SETNX` in
-        `commit` (the artifact's deterministic `source_id`), so by the time we are
-        here this is a first-delivery commit. The MERGE in `commit_response_artifact`
-        is still identity-keyed for correctness under any unexpected replay.
-        """
-
-        commit_response_artifact(self._neo4j, artifact=artifact)
-        l3_events: tuple[L3Event, ...] = (
-            self._node_created(
-                "ResponseArtifact", str(artifact.artifact_id), artifact, commit_id, span_id
-            ),
-            EdgeCreated(
-                commit_id=commit_id,
-                trace_id=artifact.trace_id,
-                span_id=span_id,  # type: ignore[arg-type]
-                engagement_id=artifact.engagement_id,
-                emitted_at=datetime.now(UTC),
-                edge_type="YIELDED",
-                from_node=str(artifact.request_observation_id),
-                to_node=str(artifact.artifact_id),
-                properties={"engagement_id": artifact.engagement_id},
-            ),
-        )
-        return CommitResult(
-            commit_id=commit_id,
-            engagement_id=artifact.engagement_id,
-            event_kind=artifact.kind,
-            source_id=artifact.source_id,
-            idempotent_noop=False,
-            node_ids=(str(artifact.artifact_id),),
-            l3_events=l3_events,
-        )
-
     def _commit_parse_failure(
         self, pf: ParseFailure, commit_id: CommitId, span_id: str
     ) -> CommitResult:
@@ -439,7 +486,7 @@ class CommitOrchestrator:
     def _node_created(
         node_type: str,
         node_id: str,
-        event: RequestObservation | ParseFailure | ResponseArtifact,
+        event: RequestObservation | ParseFailure,
         commit_id: CommitId,
         span_id: str,
     ) -> NodeCreated:

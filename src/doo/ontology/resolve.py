@@ -9,8 +9,10 @@ single `RequestObservation` implies, all engagement-scoped per ADR-0017:
 - `resolve_auth_context` — anonymous singleton only: exactly one anonymous
   AuthContext + one anonymous Principal per engagement (CONTEXT.md / ADR-0010).
 - `commit_request_observation` — the RequestObservation node plus its non-`HIT`
-  structural edges (`OBSERVED_UNDER` to AuthContext, `ON_HOST` to Host). The
-  revisable `HIT` -> Endpoint grouping is owned by `ontology/templating.py`.
+  structural edges (`OBSERVED_UNDER` to AuthContext, `ON_HOST` to Host), and its
+  inline value candidates + diagnostics (ADR-0023). The revisable `HIT` -> Endpoint
+  grouping is owned by `ontology/templating.py`; `ObservedValue` promotion is owned
+  by the flush-time promotion pass (`ontology/promotion.py`).
 - `commit_parse_failure` — the ParseFailure node with a back-ref edge to the
   envelope (recorded as a property; the envelope is an L1 artifact, not a graph
   node, so the back-ref is `envelope_event_id`).
@@ -38,14 +40,13 @@ from doo.canonical.identity import (
     principal_id,
 )
 from doo.canonical.value_objects import AuthContextCue, HostRef
-from doo.events.l2 import ParseFailure, RequestObservation, ResponseArtifact
+from doo.events.l2 import ParseFailure, RequestObservation
 from doo.ids import (
     AuthContextId,
     EngagementId,
     HostId,
     ObservationId,
     PrincipalId,
-    ResponseArtifactId,
     Sha256Hex,
 )
 from doo.infra.neo4j_driver import Neo4jClient
@@ -563,6 +564,13 @@ def commit_request_observation(
     property type, so the small `BlobRef` serialises as a JSON string holding the
     hash + metadata + storage key (the raw body lives only in object storage;
     ADR-0015 / CLAUDE.md hard rule).
+
+    Extracted value occurrences (ADR-0023) are stored inline as a list of
+    JSON-serialised `ValueCandidate`s (`value_candidates`); the flush-time
+    promotion pass aggregates them by `value_hash` into `ObservedValue`s. Secret
+    candidates carry only hash + length + preview, never a raw value (ADR-0015).
+    One-per-response diagnostics (`server_fingerprint`, `error_excerpt`) are inline
+    scalar properties, not nodes.
     """
 
     props = cross_cutting(
@@ -583,6 +591,7 @@ def commit_request_observation(
     response_body_ref = (
         obs.response_body_ref.model_dump_json() if obs.response_body_ref is not None else None
     )
+    value_candidates = [vc.model_dump_json() for vc in obs.value_candidates]
     client.execute_write(
         """
         MERGE (r:RequestObservation {engagement_id: $engagement_id,
@@ -594,6 +603,9 @@ def commit_request_observation(
                       r.request_body_ref = $request_body_ref,
                       r.response_body_ref = $response_body_ref,
                       r.response_status = $response_status,
+                      r.value_candidates = $value_candidates,
+                      r.server_fingerprint = $server_fingerprint,
+                      r.error_excerpt = $error_excerpt,
                       r.envelope_event_id = $envelope_event_id,
                       r += $props
         ON MATCH SET r.last_seen = $props.last_seen
@@ -613,87 +625,15 @@ def commit_request_observation(
         request_body_ref=request_body_ref,
         response_body_ref=response_body_ref,
         response_status=obs.response_status,
+        value_candidates=value_candidates,
+        server_fingerprint=obs.server_fingerprint,
+        error_excerpt=obs.error_excerpt,
         envelope_event_id=str(obs.envelope_event_id),
         host_id=host_node_id,
         auth_context_id=auth_context_node_id,
         props=props,
     )
     return obs.observation_id
-
-
-def commit_response_artifact(
-    client: Neo4jClient, *, artifact: ResponseArtifact
-) -> ResponseArtifactId:
-    """MERGE the `ResponseArtifact` node + its `YIELDED` edge from the parent RO (T6).
-
-    Identity is `(engagement_id, artifact_id)` with `artifact_id` a UUID7. Node
-    identity alone is *not* idempotent (the UUID7 is random); re-ingestion is
-    collapsed upstream by the ADR-0016 semantic key built from the artifact's
-    deterministic `source_id`, so a re-delivered identical artifact never reaches
-    this write. The MERGE is still on the full identity tuple for correctness.
-
-    The `YIELDED` edge points RO -> ResponseArtifact and carries `engagement_id`
-    on both endpoints and on the edge, so a consumer can confirm the artifact and
-    its parent share an engagement (ADR-0017). The structured `location` is stored
-    flat (`location_section`, `location_header_name`, `location_json_pointer`,
-    byte offsets) since Neo4j has no struct type.
-
-    Secret discipline (ADR-0015): for secret kinds, only `value_hash`,
-    `value_length`, `value_preview` are set; `value` is null. The raw secret never
-    becomes a node property — it lives only in the response-body blob.
-    """
-
-    props = cross_cutting(
-        source=artifact.source,
-        source_id=artifact.source_id,
-        observed_at=artifact.observed_at,
-        ingested_at=artifact.ingested_at,
-        confidence=artifact.confidence,
-    )
-    loc = artifact.location
-    client.execute_write(
-        """
-        MATCH (r:RequestObservation {engagement_id: $engagement_id,
-                                     observation_id: $request_observation_id})
-        MERGE (a:ResponseArtifact {engagement_id: $engagement_id,
-                                   artifact_id: $artifact_id})
-        ON CREATE SET a.id = $artifact_id,
-                      a.request_observation_id = $request_observation_id,
-                      a.artifact_kind = $artifact_kind,
-                      a.extractor = $extractor,
-                      a.location_section = $location_section,
-                      a.location_header_name = $location_header_name,
-                      a.location_json_pointer = $location_json_pointer,
-                      a.byte_offset_start = $byte_offset_start,
-                      a.byte_offset_end = $byte_offset_end,
-                      a.value = $value,
-                      a.value_hash = $value_hash,
-                      a.value_length = $value_length,
-                      a.value_preview = $value_preview,
-                      a.envelope_event_id = $envelope_event_id,
-                      a += $props
-        ON MATCH SET a.last_seen = $props.last_seen
-        MERGE (r)-[y:YIELDED]->(a)
-        ON CREATE SET y.engagement_id = $engagement_id
-        """,
-        engagement_id=artifact.engagement_id,
-        artifact_id=artifact.artifact_id,
-        request_observation_id=artifact.request_observation_id,
-        artifact_kind=artifact.artifact_kind,
-        extractor=artifact.extractor,
-        location_section=loc.section,
-        location_header_name=loc.header_name,
-        location_json_pointer=loc.json_pointer,
-        byte_offset_start=loc.byte_offset_start,
-        byte_offset_end=loc.byte_offset_end,
-        value=artifact.value,
-        value_hash=artifact.value_hash,
-        value_length=artifact.value_length,
-        value_preview=artifact.value_preview,
-        envelope_event_id=str(artifact.envelope_event_id),
-        props=props,
-    )
-    return artifact.artifact_id
 
 
 def commit_parse_failure(client: Neo4jClient, *, pf: ParseFailure) -> ObservationId:
