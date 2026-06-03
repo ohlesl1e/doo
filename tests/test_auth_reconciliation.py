@@ -205,6 +205,79 @@ def test_unknown_sub_creates_discovered_unmerged_principal(neo4j_client) -> None
     assert rows[0]["c"] == 1
 
 
+def test_reissued_unknown_tokens_same_sub_collapse_to_one_discovered_principal(
+    neo4j_client,
+) -> None:
+    """ADR-0025: an *undeclared* user whose JWT is reissued each request (new
+    `iat`/`exp`/signature → new token → new auth_hash) collapses to ONE discovered
+    Principal keyed on `discovered:jwt_sub:{sub}`, with one AuthContext per token.
+
+    This is the 46→~1 fix: before, each reissued token minted a fresh discovered
+    Principal keyed on the per-token auth_hash.
+    """
+
+    eid = "eng-recon-reissue"
+    _seed_declared_principal(neo4j_client, eid)  # declares uuid-aaa, NOT uuid-zzz
+
+    # Three reissued tokens for the same undeclared user (sub uuid-zzz), each with a
+    # distinct jti/exp so the bytes — and thus the auth_hash — differ every time.
+    for i in range(3):
+        token = jwt.encode(
+            {"sub": "uuid-zzz", "jti": f"reissue-{i}", "exp": 4102444800 + i},
+            SIGNING_KEY,
+            algorithm="HS256",
+        )
+        cue = extract_auth_context_cue(
+            {"headers": [{"name": "Authorization", "value": f"Bearer {token}"}], "cookies": []}
+        )
+        resolved = _resolve(neo4j_client, eid, cue)
+        assert resolved.principal_tier == "discovered"
+        assert resolved.unmerged is True
+
+    # Exactly one discovered Principal for uuid-zzz (keyed on the sub, not the token).
+    pcount = neo4j_client.execute_read(
+        "MATCH (p:Principal {engagement_id: $eid, tier: 'discovered'}) "
+        "WHERE p.is_anonymous = false AND p.unmerged = true "
+        "AND p.identity_key = 'discovered:jwt_sub:uuid-zzz' RETURN count(p) AS c",
+        eid=eid,
+    )
+    assert pcount[0]["c"] == 1
+    # But three distinct AuthContexts (one per reissued token) attach to it — the
+    # per-token validity windows are preserved as signal (AuthContexts stay per-token).
+    acs = neo4j_client.execute_read(
+        "MATCH (ac:AuthContext {engagement_id: $eid})-[:OF_PRINCIPAL]->"
+        "(p:Principal {identity_key: 'discovered:jwt_sub:uuid-zzz'}) RETURN count(ac) AS c",
+        eid=eid,
+    )
+    assert acs[0]["c"] == 3
+
+
+def test_opaque_bearer_without_sub_falls_back_to_per_credential_principal(
+    neo4j_client,
+) -> None:
+    """ADR-0025 fallback: a non-JWT bearer (no decodable `sub`) keeps the prior
+    per-credential discovered Principal — two distinct opaque tokens → two Principals."""
+
+    eid = "eng-recon-opaque"
+    _seed_declared_principal(neo4j_client, eid)
+    for value in ("opaque-token-one", "opaque-token-two"):
+        cue = extract_auth_context_cue(
+            {"headers": [{"name": "Authorization", "value": f"Bearer {value}"}], "cookies": []}
+        )
+        resolved = _resolve(neo4j_client, eid, cue)
+        assert resolved.unmerged is True
+
+    # No sub to key on → each opaque credential is its own discovered Principal,
+    # keyed on the auth_hash (unchanged pre-ADR-0025 behaviour).
+    pcount = neo4j_client.execute_read(
+        "MATCH (p:Principal {engagement_id: $eid, tier: 'discovered'}) "
+        "WHERE p.is_anonymous = false AND p.identity_key STARTS WITH 'discovered:' "
+        "AND NOT p.identity_key STARTS WITH 'discovered:jwt_sub:' RETURN count(p) AS c",
+        eid=eid,
+    )
+    assert pcount[0]["c"] == 2
+
+
 def test_anonymous_singleton_preserved(neo4j_client) -> None:
     eid = "eng-recon-anon"
     _seed_declared_principal(neo4j_client, eid)

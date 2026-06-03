@@ -10,10 +10,11 @@ from doo.canonical.identity import (
     compute_anonymous_auth_hash,
     compute_auth_hash,
     derive_har_source_id,
+    discovered_principal_identity_key,
     endpoint_id,
     host_id,
 )
-from doo.ids import EngagementId
+from doo.ids import EngagementId, Sha256Hex
 
 ENG = EngagementId("eng-1")
 
@@ -98,3 +99,29 @@ def test_host_id_is_engagement_scoped() -> None:
 
 def test_derive_har_source_id_shape() -> None:
     assert derive_har_source_id(3, "2026-05-01T10:00:00.000Z") == "3|2026-05-01T10:00:00.000Z"
+
+
+# --- discovered Principal identity key (ADR-0025) ---------------------------
+
+_AUTH_HASH = Sha256Hex("a" * 64)
+
+
+def test_discovered_principal_key_falls_back_to_auth_hash_without_sub() -> None:
+    # No stable signal (opaque / non-JWT bearer) → per-credential key, unchanged.
+    assert discovered_principal_identity_key(_AUTH_HASH) == f"discovered:{_AUTH_HASH}"
+    assert discovered_principal_identity_key(_AUTH_HASH, jwt_sub=None) == f"discovered:{_AUTH_HASH}"
+
+
+def test_discovered_principal_key_prefers_jwt_sub() -> None:
+    assert (
+        discovered_principal_identity_key(_AUTH_HASH, jwt_sub="uuid-aaa")
+        == "discovered:jwt_sub:uuid-aaa"
+    )
+
+
+def test_discovered_principal_key_converges_across_reissued_tokens() -> None:
+    # Same user (sub), two reissued tokens → two distinct auth_hashes, but one key,
+    # so the discovered Principal collapses to one (ADR-0025).
+    key1 = discovered_principal_identity_key(Sha256Hex("b" * 64), jwt_sub="uuid-aaa")
+    key2 = discovered_principal_identity_key(Sha256Hex("c" * 64), jwt_sub="uuid-aaa")
+    assert key1 == key2 == "discovered:jwt_sub:uuid-aaa"
