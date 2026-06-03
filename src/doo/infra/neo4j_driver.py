@@ -30,9 +30,20 @@ class Neo4jClient:
 
     @classmethod
     def connect(cls, uri: str, user: str, password: str) -> Neo4jClient:
-        """Open a driver to `uri` with basic auth and verify connectivity."""
+        """Open a driver to `uri` with basic auth and verify connectivity.
 
-        driver = GraphDatabase.driver(uri, auth=(user, password))
+        `UNRECOGNIZED` notifications are disabled: our queries legitimately
+        reference property keys (e.g. `e.kill_switch`) that don't yet exist in
+        the store on a fresh database, which Neo4j otherwise flags with a noisy
+        plan-time "property does not exist" warning. The values are stored and
+        read correctly; only the cosmetic notification is suppressed.
+        """
+
+        driver = GraphDatabase.driver(
+            uri,
+            auth=(user, password),
+            notifications_disabled_classifications=["UNRECOGNIZED"],
+        )
         driver.verify_connectivity()
         return cls(driver)
 
