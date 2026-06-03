@@ -120,13 +120,24 @@ def test_first_commit_writes_nodes_and_emits_l3_events() -> None:
     orch, neo4j, _idem, streams = _orchestrator()
     result = orch.commit(_observation())
     assert result.idempotent_noop is False
-    # Host, Endpoint, AuthContext+Principal, RequestObservation -> writes happened.
+    # Host, AuthContext, Principal, RequestObservation -> writes happened.
     assert len(neo4j.writes) >= 3
-    # Five NodeCreated events emitted on l3-events.
-    assert len(streams.published) == 5
+    # Four NodeCreated events at commit; Endpoint/Parameter are deferred to flush
+    # (ADR-0022), so they are NOT emitted here.
+    assert len(streams.published) == 4
     assert all(s == "l3-events" for s, _ in streams.published)
     # trace_id propagated into the emitted L3 events.
     assert all(p["trace_id"] == TRACE for _, p in streams.published)
+
+
+def test_commit_defers_endpoint_inference_to_flush() -> None:
+    """Per ADR-0022, committing an observation emits only the observation-side
+    nodes; the Endpoint/Parameter inference waits for `flush()`."""
+
+    orch, _neo4j, _idem, streams = _orchestrator()
+    orch.commit(_observation())
+    node_types = {p["node_type"] for _, p in streams.published}
+    assert node_types == {"Host", "AuthContext", "Principal", "RequestObservation"}
 
 
 def test_redelivery_of_same_semantic_key_is_noop() -> None:

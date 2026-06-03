@@ -35,10 +35,10 @@ from doo.events.l3 import (
     NodeUpdated,
     PropertyChange,
 )
-from doo.ids import CommitId, EngagementId
+from doo.ids import CommitId, EngagementId, HostId
 from doo.infra.neo4j_driver import Neo4jClient
 from doo.infra.streams import L3_EVENTS_STREAM, StreamClient
-from doo.observability.ids import new_span_id
+from doo.observability.ids import new_span_id, new_trace_id
 from doo.observability.logging import bind_correlation, get_logger
 from doo.ontology.resolve import (
     commit_parse_failure,
@@ -100,6 +100,17 @@ class CommitResult:
     idempotent_noop: bool
     node_ids: tuple[str, ...] = ()
     l3_events: tuple[L3Event, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True, slots=True)
+class FlushResult:
+    """Outcome of a `flush()`: how many dirty cohorts were re-templated and the
+    Endpoint/Parameter nodes touched (ADR-0022)."""
+
+    cohorts: int = 0
+    endpoints: int = 0
+    parameters: int = 0
+    retracted: int = 0
 
 
 class CommitOrchestrator:
@@ -195,35 +206,24 @@ class CommitOrchestrator:
             ingested_at=obs.ingested_at,
             cue=obs.auth_context_cue,
         )
-        # Commit the observation node + its non-HIT edges first, so the
-        # re-templating pass sees it in the cohort it reads back.
+        # Commit the observation node + its non-HIT edges. Endpoint inference
+        # (HIT grouping, path templating, Parameter aggregation) is DEFERRED to
+        # `flush()` per ADR-0022: the observation is left un-HIT, which is exactly
+        # what marks its cohort dirty. Commit stays O(1); flush re-templates the
+        # cohort once per drain instead of once per observation (was O(N^2)).
         commit_request_observation(
             self._neo4j,
             obs=obs,
             host_node_id=host_node_id,
             auth_context_node_id=auth.auth_context_id,
         )
-        # Endpoint identity is a revisable inference (ADR-0004): re-template the
-        # whole (method, host) cohort, which owns Endpoint creation, HIT
-        # re-grouping, and Parameter aggregation.
-        retemplate = retemplate_cohort(
-            self._neo4j,
-            engagement_id=obs.engagement_id,
-            method=obs.method,
-            host_node_id=host_node_id,
-            observed_at=obs.observed_at,
-            ingested_at=obs.ingested_at,
-            primary_concrete_path=obs.concrete_path,
-        )
-
-        base_node_ids = (
+        node_ids = (
             host_node_id,
             str(auth.auth_context_id),
             str(auth.principal_id),
             str(obs.observation_id),
         )
-        node_ids = base_node_ids + retemplate.endpoint_ids + retemplate.parameter_ids
-        l3_events = (
+        l3_events: tuple[L3Event, ...] = (
             self._node_created("Host", host_node_id, obs, commit_id, span_id),
             self._node_created(
                 "AuthContext", str(auth.auth_context_id), obs, commit_id, span_id
@@ -234,7 +234,7 @@ class CommitOrchestrator:
             self._node_created(
                 "RequestObservation", str(obs.observation_id), obs, commit_id, span_id
             ),
-        ) + self._templating_events(retemplate, obs, commit_id, span_id)
+        )
         return CommitResult(
             commit_id=commit_id,
             engagement_id=obs.engagement_id,
@@ -245,34 +245,107 @@ class CommitOrchestrator:
             l3_events=l3_events,
         )
 
-    def _templating_events(
+    # --- Deferred endpoint inference (ADR-0022): flush ----------------------
+
+    def flush(self) -> FlushResult:
+        """Re-template every cohort that has un-HIT observations (ADR-0022).
+
+        `commit` leaves each `RequestObservation` un-HIT; this is the deferred
+        endpoint-inference step. It finds every `(engagement_id, method, host_id)`
+        cohort containing an un-HIT observation and runs the cohort re-templating
+        once — attaching `HIT`s, creating/retracting `Endpoint`s, aggregating
+        `Parameter`s — emitting the resulting structural `l3-events`.
+
+        Dirtiness is derived from the graph (un-HIT observation), so flush is
+        crash-safe: a worker that died mid-drain just leaves un-HIT observations,
+        and the next flush (e.g. on startup) re-templates them. Idempotent: a
+        fully-templated graph has no dirty cohorts, so flush is a no-op.
+        """
+
+        dirty = self._find_dirty_cohorts()
+        cohorts = endpoints = parameters = retracted = 0
+        for engagement_id, method, host_node_id in dirty:
+            now = datetime.now(UTC)
+            retemplate = retemplate_cohort(
+                self._neo4j,
+                engagement_id=engagement_id,
+                method=method,
+                host_node_id=host_node_id,
+                observed_at=now,
+                ingested_at=now,
+            )
+            trace_id = new_trace_id()
+            span_id = new_span_id()
+            commit_id = CommitId(new_span_id() + new_span_id())
+            for l3_event in self._flush_events(
+                retemplate, engagement_id, trace_id, span_id, commit_id
+            ):
+                self._streams.publish(L3_EVENTS_STREAM, l3_event.model_dump(mode="json"))
+            cohorts += 1
+            endpoints += len(retemplate.endpoint_ids)
+            parameters += len(retemplate.parameter_ids)
+            retracted += len(retemplate.retracted_endpoint_ids)
+        if cohorts:
+            log.info(
+                "flush.applied",
+                cohorts=cohorts,
+                endpoints=endpoints,
+                parameters=parameters,
+                retracted=retracted,
+            )
+        return FlushResult(
+            cohorts=cohorts,
+            endpoints=endpoints,
+            parameters=parameters,
+            retracted=retracted,
+        )
+
+    def _find_dirty_cohorts(self) -> list[tuple[EngagementId, str, HostId]]:
+        """Distinct `(engagement, method, host)` cohorts with un-HIT observations."""
+
+        rows = self._neo4j.execute_read(
+            """
+            MATCH (r:RequestObservation)-[:ON_HOST]->(h:Host)
+            WHERE NOT (r)-[:HIT]->(:Endpoint)
+            RETURN DISTINCT r.engagement_id AS eng, r.method AS method, h.id AS host_id
+            """
+        )
+        return [
+            (EngagementId(str(r["eng"])), str(r["method"]), HostId(str(r["host_id"])))
+            for r in rows
+        ]
+
+    def _flush_events(
         self,
         retemplate: RetemplateResult,
-        obs: RequestObservation,
-        commit_id: CommitId,
+        engagement_id: EngagementId,
+        trace_id: str,
         span_id: str,
+        commit_id: CommitId,
     ) -> tuple[L3Event, ...]:
-        """Translate a re-templating result into l3-events.
-
-        `node_created` for every Endpoint/Parameter MERGEd this pass, and
-        `node_updated` carrying `{path_template: {old, new}}` for each Endpoint
-        whose template was revised by fresh evidence (ADR-0004 re-templating).
-        Re-emitting NodeCreated for already-present nodes is acceptable —
-        consumers treat l3-events as idempotent structural facts.
-        """
+        """`l3-events` for one flushed cohort: NodeCreated per Endpoint/Parameter,
+        NodeUpdated per revised `path_template` (ADR-0004 re-templating)."""
 
         events: list[L3Event] = []
         for eid in retemplate.endpoint_ids:
-            events.append(self._node_created("Endpoint", eid, obs, commit_id, span_id))
+            events.append(
+                self._flush_node_created(
+                    "Endpoint", eid, engagement_id, trace_id, span_id, commit_id
+                )
+            )
         for pid in retemplate.parameter_ids:
-            events.append(self._node_created("Parameter", pid, obs, commit_id, span_id))
+            events.append(
+                self._flush_node_created(
+                    "Parameter", pid, engagement_id, trace_id, span_id, commit_id
+                )
+            )
         for change in retemplate.template_changes:
             events.append(
                 NodeUpdated(
                     commit_id=commit_id,
-                    trace_id=obs.trace_id,
+                    trace_id=trace_id,  # type: ignore[arg-type]
                     span_id=span_id,  # type: ignore[arg-type]
-                    engagement_id=obs.engagement_id,
+                    engagement_id=engagement_id,
                     emitted_at=datetime.now(UTC),
                     node_type="Endpoint",
                     node_id=change.endpoint_id,
@@ -284,6 +357,26 @@ class CommitOrchestrator:
                 )
             )
         return tuple(events)
+
+    @staticmethod
+    def _flush_node_created(
+        node_type: str,
+        node_id: str,
+        engagement_id: EngagementId,
+        trace_id: str,
+        span_id: str,
+        commit_id: CommitId,
+    ) -> NodeCreated:
+        return NodeCreated(
+            commit_id=commit_id,
+            trace_id=trace_id,  # type: ignore[arg-type]
+            span_id=span_id,  # type: ignore[arg-type]
+            engagement_id=engagement_id,
+            emitted_at=datetime.now(UTC),
+            node_type=node_type,
+            node_id=node_id,
+            properties={"via": "flush"},
+        )
 
     def _commit_response_artifact(
         self, artifact: ResponseArtifact, commit_id: CommitId, span_id: str

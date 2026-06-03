@@ -190,6 +190,9 @@ def _run_pipeline(
         max_messages=50,
         block_ms=500,
     )
+    # Deferred endpoint inference (ADR-0022): re-template the dirty cohorts once,
+    # the way `doo worker run` does at end of drain.
+    orchestrator.flush()
 
 
 def _count(neo4j: Neo4jClient, label: str, engagement_id: str) -> int:

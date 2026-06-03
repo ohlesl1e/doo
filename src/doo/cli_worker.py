@@ -192,14 +192,20 @@ def register_worker(app: typer.Typer) -> None:
         def _run_l3(block_ms: int) -> int:
             return run_l3_worker(runtime.l3_deps, max_messages=batch, block_ms=block_ms)
 
+        orchestrator = runtime.l3_deps.orchestrator
         try:
             if once:
                 extracted, committed = _drain_once(
                     run_l2=lambda: _run_l2(500, _collect), run_l3=lambda: _run_l3(500)
                 )
+                # Deferred endpoint inference (ADR-0022): re-template the cohorts
+                # this drain touched (and any left un-HIT by a prior crashed run).
+                flushed = orchestrator.flush()
                 typer.echo(
                     f"drained: {extracted} envelope(s) extracted, "
-                    f"{committed} L2 event(s) committed"
+                    f"{committed} L2 event(s) committed; "
+                    f"templated {flushed.endpoints} endpoint(s) / "
+                    f"{flushed.parameters} parameter(s) across {flushed.cohorts} cohort(s)"
                 )
                 _report_parse_failures(failures)
                 return
@@ -208,6 +214,7 @@ def register_worker(app: typer.Typer) -> None:
                 while True:
                     _run_l2(1000, _stream)
                     _run_l3(1000)
+                    orchestrator.flush()  # re-template dirty cohorts each pass
             except KeyboardInterrupt:
                 typer.echo("\nstopped")
         finally:
