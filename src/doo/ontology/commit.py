@@ -369,6 +369,20 @@ class CommitOrchestrator:
                         properties={"engagement_id": engagement_id},
                     )
                 )
+            for observation_id in pv.sent_from:
+                events.append(
+                    EdgeCreated(
+                        commit_id=commit_id,
+                        trace_id=trace_id,  # type: ignore[arg-type]
+                        span_id=span_id,  # type: ignore[arg-type]
+                        engagement_id=engagement_id,
+                        emitted_at=datetime.now(UTC),
+                        edge_type="SENT_VALUE",
+                        from_node=observation_id,
+                        to_node=str(pv.observed_value_id),
+                        properties={"engagement_id": engagement_id},
+                    )
+                )
         return tuple(events)
 
     def _find_dirty_cohorts(self) -> list[tuple[EngagementId, str, HostId]]:

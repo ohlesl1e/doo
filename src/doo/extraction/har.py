@@ -59,6 +59,7 @@ from doo.extraction.artifacts import (
     ResponseDiagnostics,
     extract_candidates,
     extract_diagnostics,
+    extract_input_candidate,
 )
 from doo.ids import (
     EngagementId,
@@ -251,8 +252,8 @@ def _parse_entry(
         response_status, response_size = _response_shape(response)
 
         # --- T5: bodies -> object storage, body params extracted. ---
-        request_body_ref, request_body_params = _extract_request_body(
-            request, envelope.engagement_id, body_uploader
+        request_body_ref, request_body_params, body_input_candidates = (
+            _extract_request_body(request, envelope.engagement_id, body_uploader)
         )
         response_body_ref, response_body_bytes, response_content_type = (
             _extract_response_body(response, envelope.engagement_id, body_uploader)
@@ -262,12 +263,19 @@ def _parse_entry(
             f"{envelope.engagement_id}:{_SOURCE}:{source_id}"
         )
         # --- ADR-0023: inline value candidates + diagnostics (replaces T6 nodes). ---
-        value_candidates, diagnostics = _extract_response_values(
+        output_candidates, diagnostics = _extract_response_values(
             response=response,
             response_body_bytes=response_body_bytes,
             response_content_type=response_content_type,
             response_status=response_status,
         )
+        # #16 leak-to-input: request-parameter values as `input`-role candidates
+        # (query keys + body leaves), hashed via the same canonicalisation.
+        input_candidates = tuple(
+            _to_value_candidate(o)
+            for o in (*_query_input_candidates(query_params), *body_input_candidates)
+        )
+        value_candidates = (*output_candidates, *input_candidates)
         yield RequestObservation(
             event_id=_new_l2_event_id(),
             trace_id=envelope.trace_id,
@@ -581,18 +589,20 @@ def _extract_request_body(
     request: dict[str, object],
     engagement_id: str,
     body_uploader: BodyUploader | None,
-) -> tuple[BlobRef | None, tuple[BodyParam, ...]]:
+) -> tuple[BlobRef | None, tuple[BodyParam, ...], tuple[CandidateOccurrence, ...]]:
     """Upload a request body to object storage and parse its parameters.
 
-    Returns `(request_body_ref, body_params)`. No body -> `(None, ())` with **no**
-    object created. The body text comes from `postData.text`, or is reconstructed
-    from `postData.params` for form-encoded entries. Body-param parsing is
-    content-type driven (form / JSON / multipart / other).
+    Returns `(request_body_ref, body_params, input_candidates)`. No body ->
+    `(None, (), ())` with **no** object created. The body text comes from
+    `postData.text`, or is reconstructed from `postData.params` for form-encoded
+    entries. Body-param parsing is content-type driven (form / JSON / multipart /
+    other). The `input_candidates` are the `input`-role value occurrences over the
+    raw body-leaf values (#16, the leak-to-input pivot).
     """
 
     post = request.get("postData")
     if not isinstance(post, dict):
-        return None, ()
+        return None, (), ()
 
     headers = _header_map(request)
     fallback_mime = post.get("mimeType") if isinstance(post.get("mimeType"), str) else None
@@ -601,19 +611,19 @@ def _extract_request_body(
 
     raw = _request_body_bytes(post, base_mime)
     if raw is None:
-        return None, ()
+        return None, (), ()
 
-    body_params = _parse_body_params(raw, base_mime, content_type)
+    body_params, input_candidates = _parse_body_params(raw, base_mime, content_type)
 
     if body_uploader is None:
-        return None, body_params
+        return None, body_params, input_candidates
     ref = body_uploader.put_body(
         EngagementId(engagement_id),
         raw=raw,
         content_type=content_type,
         encoding=_content_encoding(headers),
     )
-    return ref, body_params
+    return ref, body_params, input_candidates
 
 
 def _request_body_bytes(post: dict[str, object], base_mime: str) -> bytes | None:
@@ -733,7 +743,32 @@ def _to_value_candidate(occ: CandidateOccurrence) -> ValueCandidate:
         json_pointer=occ.json_pointer,
         byte_start=occ.byte_start,
         byte_end=occ.byte_end,
+        parameter_name=occ.parameter_name,
     )
+
+
+_QUERY_INPUT_EXTRACTOR = "request-param:query_v1"
+
+
+def _query_input_candidates(
+    query_params: tuple[ObservedParameter, ...],
+) -> list[CandidateOccurrence]:
+    """`input`-role candidates for a request's query parameter values (#16).
+
+    One per query param carrying a non-empty value; classified + hashed via the
+    same canonicalisation as response outputs (secret-shaped suppressed to
+    hash+preview only). Blank-valued params contribute no value occurrence.
+    """
+
+    out: list[CandidateOccurrence] = []
+    for param in query_params:
+        if param.value:
+            out.append(
+                extract_input_candidate(
+                    param.name, param.value, extractor=_QUERY_INPUT_EXTRACTOR
+                )
+            )
+    return out
 
 
 def _extract_response_values(
@@ -768,8 +803,8 @@ def _extract_response_values(
 
 def _parse_body_params(
     raw: bytes, base_mime: str, content_type: str
-) -> tuple[BodyParam, ...]:
-    """Parse a request body into `BodyParam`s, content-type driven.
+) -> tuple[tuple[BodyParam, ...], tuple[CandidateOccurrence, ...]]:
+    """Parse a request body into `BodyParam`s + `input`-role value candidates.
 
     - `application/x-www-form-urlencoded` -> one BodyParam per `name=value` pair,
       `json_pointer=None`.
@@ -779,28 +814,45 @@ def _parse_body_params(
       parts (those with a `filename` or non-text content type) are skipped.
     - any other content type -> no BodyParams (the body is still uploaded).
 
-    Known-secret-shape leaf values are emitted with `value=None` (ADR-0015): the
-    parameter's existence is recorded, but the raw token is not — it lives only in
-    the uploaded body.
-
-    # TODO(secret-shape-bodies): emit a hashed secret shape (value_hash +
-    # value_length, like `ResponseArtifact`) for suppressed leaves so the planner
-    # can reason about "a refresh token flows here" without seeing the token. That
-    # extraction is deferred to a future slice; for now the value is simply dropped.
+    Alongside each `BodyParam`, an `input`-role `CandidateOccurrence` is emitted
+    over the *raw* leaf value (ADR-0023, #16) — hashed via the same `hash_for` as
+    response outputs so a leaked-then-resent value collapses to one `value_hash`
+    (the leak-to-input pivot). Secret-shaped leaf values are suppressed on the
+    `BodyParam` (`value=None`; ADR-0015) but still produce a *secret* input
+    candidate carrying hash + length + preview only — never the raw token.
     """
 
+    body_params: list[BodyParam] = []
+    inputs: list[CandidateOccurrence] = []
     if base_mime == _FORM_CONTENT_TYPE:
-        return _parse_form_body(raw, content_type)
-    if base_mime == "application/json" or base_mime.endswith("+json"):
-        return _parse_json_body(raw, content_type)
-    if base_mime == "multipart/form-data":
-        return _parse_multipart_body(raw, content_type)
-    return ()
+        _parse_form_body(raw, content_type, body_params, inputs)
+    elif base_mime == "application/json" or base_mime.endswith("+json"):
+        _parse_json_body(raw, content_type, body_params, inputs)
+    elif base_mime == "multipart/form-data":
+        _parse_multipart_body(raw, content_type, body_params, inputs)
+    return tuple(body_params), tuple(inputs)
 
 
-def _body_param(name: str, value: str, json_pointer: str | None, content_type: str) -> BodyParam:
-    """Build a `BodyParam`, suppressing the raw value for secret-shaped leaves."""
+_BODY_INPUT_EXTRACTOR = "request-param:body_v1"
 
+
+def _body_param(
+    name: str,
+    value: str,
+    json_pointer: str | None,
+    content_type: str,
+    inputs: list[CandidateOccurrence],
+) -> BodyParam:
+    """Build a `BodyParam` + its `input` candidate, suppressing secret raw values.
+
+    The raw `value` always feeds the input `CandidateOccurrence` (secret discipline
+    is applied inside `extract_input_candidate`); only the `BodyParam.value` is
+    blanked for secret-shaped leaves.
+    """
+
+    inputs.append(
+        extract_input_candidate(name, value, extractor=_BODY_INPUT_EXTRACTOR)
+    )
     safe_value: str | None = None if _is_secret_shaped(name, value) else value
     return BodyParam(
         name=name,
@@ -810,27 +862,33 @@ def _body_param(name: str, value: str, json_pointer: str | None, content_type: s
     )
 
 
-def _parse_form_body(raw: bytes, content_type: str) -> tuple[BodyParam, ...]:
-    """One `BodyParam` per `name=value` pair in a form-urlencoded body."""
+def _parse_form_body(
+    raw: bytes,
+    content_type: str,
+    out: list[BodyParam],
+    inputs: list[CandidateOccurrence],
+) -> None:
+    """One `BodyParam` (+ input candidate) per `name=value` pair, form-urlencoded."""
 
     text = raw.decode("utf-8", errors="replace")
-    out: list[BodyParam] = []
     for name, value in parse_qsl(text, keep_blank_values=True):
         if name:
-            out.append(_body_param(name, value, None, _FORM_CONTENT_TYPE))
-    return tuple(out)
+            out.append(_body_param(name, value, None, _FORM_CONTENT_TYPE, inputs))
 
 
-def _parse_json_body(raw: bytes, content_type: str) -> tuple[BodyParam, ...]:
-    """One `BodyParam` per JSON leaf, addressed by an RFC 6901 JSON Pointer."""
+def _parse_json_body(
+    raw: bytes,
+    content_type: str,
+    out: list[BodyParam],
+    inputs: list[CandidateOccurrence],
+) -> None:
+    """One `BodyParam` (+ input candidate) per JSON leaf, addressed by RFC 6901."""
 
     try:
         doc = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
-        return ()
-    out: list[BodyParam] = []
-    _walk_json("", doc, content_type, out)
-    return tuple(out)
+        return
+    _walk_json("", doc, content_type, out, inputs)
 
 
 def _rfc6901_escape(token: str) -> str:
@@ -839,8 +897,14 @@ def _rfc6901_escape(token: str) -> str:
     return token.replace("~", "~0").replace("/", "~1")
 
 
-def _walk_json(pointer: str, node: object, content_type: str, out: list[BodyParam]) -> None:
-    """Recurse a JSON value, emitting a `BodyParam` per leaf.
+def _walk_json(
+    pointer: str,
+    node: object,
+    content_type: str,
+    out: list[BodyParam],
+    inputs: list[CandidateOccurrence],
+) -> None:
+    """Recurse a JSON value, emitting a `BodyParam` (+ input candidate) per leaf.
 
     `pointer` is the RFC 6901 JSON Pointer to `node`. Object keys and array indices
     extend the pointer; scalars (and empty containers) are leaves. The leaf's
@@ -853,12 +917,12 @@ def _walk_json(pointer: str, node: object, content_type: str, out: list[BodyPara
             return
         for key, value in node.items():
             child = f"{pointer}/{_rfc6901_escape(str(key))}"
-            _walk_json(child, value, content_type, out)
+            _walk_json(child, value, content_type, out, inputs)
         return
     if isinstance(node, list):
         for index, value in enumerate(node):
             child = f"{pointer}/{index}"
-            _walk_json(child, value, content_type, out)
+            _walk_json(child, value, content_type, out, inputs)
         return
 
     # Leaf. Derive the parameter name from the final pointer token.
@@ -868,7 +932,7 @@ def _walk_json(pointer: str, node: object, content_type: str, out: list[BodyPara
         return
     name = name.replace("~1", "/").replace("~0", "~")
     value_str = _scalar_to_str(node)
-    out.append(_body_param(name, value_str, pointer, content_type))
+    out.append(_body_param(name, value_str, pointer, content_type, inputs))
 
 
 def _scalar_to_str(value: object) -> str:
@@ -883,7 +947,12 @@ def _scalar_to_str(value: object) -> str:
     return json.dumps(value)
 
 
-def _parse_multipart_body(raw: bytes, content_type: str) -> tuple[BodyParam, ...]:
+def _parse_multipart_body(
+    raw: bytes,
+    content_type: str,
+    out: list[BodyParam],
+    inputs: list[CandidateOccurrence],
+) -> None:
     """Best-effort RFC 7578 multipart parse: text fields only, binary parts skipped.
 
     Uses the stdlib email parser to split parts (multipart/form-data is MIME).
@@ -897,11 +966,10 @@ def _parse_multipart_body(raw: bytes, content_type: str) -> tuple[BodyParam, ...
     try:
         msg = BytesParser(policy=default_email_policy).parsebytes(message_bytes)
     except Exception:  # noqa: BLE001 - never crash the parser on odd multipart
-        return ()
+        return
     if not msg.is_multipart():
-        return ()
+        return
 
-    out: list[BodyParam] = []
     for part in msg.iter_parts():
         disposition = part.get_content_disposition()
         if disposition != "form-data":
@@ -925,8 +993,9 @@ def _parse_multipart_body(raw: bytes, content_type: str) -> tuple[BodyParam, ...
             continue
         if not isinstance(value, str):
             continue
-        out.append(_body_param(name, value.rstrip("\r\n"), None, "multipart/form-data"))
-    return tuple(out)
+        out.append(
+            _body_param(name, value.rstrip("\r\n"), None, "multipart/form-data", inputs)
+        )
 
 
 class _EntryError(Exception):

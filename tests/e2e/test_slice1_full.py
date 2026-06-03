@@ -197,14 +197,29 @@ def test_slice1_comprehensive_pipeline(neo4j_client, redis_client, blob_client) 
         eid=_EID,
     )
     assert error and error[0]["ee"] and "internal-billing.corp.example" in error[0]["ee"]
-    # Every ObservedValue is YIELDED_VALUE from a RequestObservation.
+    # ADR-0023: response-output values reach ObservedValue via YIELDED_VALUE;
+    # request-input values via SENT_VALUE (#16). 2 outputs (internal-billing
+    # hostname + access_token JWT) + 2 allowlisted inputs (the POST body email +
+    # refresh_token secret) = 4 ObservedValues, every one with a provenance edge.
     yielded = neo4j_client.execute_read(
         "MATCH (:RequestObservation {engagement_id: $eid})-[:YIELDED_VALUE]->"
         "(v:ObservedValue {engagement_id: $eid}) RETURN count(DISTINCT v) AS c",
         eid=_EID,
     )
-    assert yielded[0]["c"] == _count(neo4j_client, "ObservedValue", _EID)
-    assert yielded[0]["c"] == 2  # internal-billing hostname + access_token JWT
+    assert yielded[0]["c"] == 2  # internal-billing hostname + access_token JWT (outputs)
+    sent = neo4j_client.execute_read(
+        "MATCH (:RequestObservation {engagement_id: $eid})-[:SENT_VALUE]->"
+        "(v:ObservedValue {engagement_id: $eid}) RETURN count(DISTINCT v) AS c",
+        eid=_EID,
+    )
+    assert sent[0]["c"] == 2  # POST body email + refresh_token (allowlisted inputs)
+    reached = neo4j_client.execute_read(
+        "MATCH (v:ObservedValue {engagement_id: $eid}) "
+        "WHERE (:RequestObservation)-[:YIELDED_VALUE|SENT_VALUE]->(v) "
+        "RETURN count(DISTINCT v) AS c",
+        eid=_EID,
+    )
+    assert reached[0]["c"] == _count(neo4j_client, "ObservedValue", _EID)  # every OV has provenance
 
     # --- ADR-0015: no raw token bytes anywhere in the graph. ---
     blob = _all_node_props_blob(neo4j_client)

@@ -88,8 +88,38 @@ def _entry(url: str, *, minute: int, second: int, status: int, ctype: str, body:
     }
 
 
+# A UUID that leaks in a *list* response (output, endpoint A = /widgets) and is
+# later sent as a request query parameter (input, endpoint B = /widget-detail) ->
+# the leak-to-input pivot (#16): ONE ObservedValue, a YIELDED_VALUE from the
+# producer and a SENT_VALUE {parameter_name} from the consumer.
+LEAKED_UUID = "11111111-2222-3333-4444-555555555555"
+
+
+def _input_entry(
+    url: str, *, minute: int, second: int, query: list[dict[str, str]]
+) -> dict:
+    """A 200 GET entry whose request carries query parameters (the input side)."""
+
+    return {
+        "startedDateTime": f"2026-05-03T09:{minute:02d}:{second:02d}.000Z",
+        "request": {
+            "method": "GET",
+            "url": url,
+            "queryString": query,
+            "headersSize": -1,
+            "bodySize": 0,
+        },
+        "response": {
+            "status": 200,
+            "bodySize": 2,
+            "headers": [{"name": "Content-Type", "value": "application/json"}],
+            "content": {"mimeType": "application/json", "text": "{}"},
+        },
+    }
+
+
 def _fixture_har() -> bytes:
-    """A HAR exercising every promotion case ADR-0023 names for #14.
+    """A HAR exercising every promotion case ADR-0023 names for #14/#15/#16.
 
     - /report (500 HTML): an internal hostname + a 5xx error excerpt.
     - /session (200 JSON): a JWT (secret), and a Server fingerprint header.
@@ -99,6 +129,9 @@ def _fixture_har() -> bytes:
       (multiplicity >=2 -> promotes, #15).
     - /solo (200 JSON): a non-allowlisted `account_id` seen in ONE response
       (multiplicity 1 -> stays inline, no promotion).
+    - /widgets (200 JSON): a list whose item ids include LEAKED_UUID (output).
+    - /widget-detail?widget_id=LEAKED_UUID (200): the same UUID sent as a request
+      query parameter (input) -> leak-to-input pivot across distinct endpoints (#16).
     """
 
     # A recurring tenant/account identifier (non-allowlisted `identifier` kind) that
@@ -108,6 +141,10 @@ def _fixture_har() -> bytes:
     solo_account = "acct-solo-91bd"
     list_items = json.dumps(
         {"items": [{"id": f"{i:08d}-0000-0000-0000-000000000000"} for i in range(100)]}
+    )
+    # A short list whose item ids include the UUID we later send as an input.
+    widgets = json.dumps(
+        {"items": [{"id": LEAKED_UUID}, {"id": "99999999-8888-7777-6666-555555555555"}]}
     )
     entries = [
         _entry(
@@ -150,6 +187,16 @@ def _fixture_har() -> bytes:
             minute=0, second=7, status=200, ctype="application/json",
             body=json.dumps({"account_id": solo_account}),
         ),
+        _entry(
+            "https://api.example.com/widgets",
+            minute=0, second=8, status=200, ctype="application/json",
+            body=widgets,
+        ),
+        _input_entry(
+            f"https://api.example.com/widget-detail?widget_id={LEAKED_UUID}",
+            minute=0, second=9,
+            query=[{"name": "widget_id", "value": LEAKED_UUID}],
+        ),
     ]
     return json.dumps({"log": {"version": "1.2", "entries": entries}}).encode()
 
@@ -168,16 +215,18 @@ def test_observed_value_promotion_end_to_end(
         filename="observed_values.har",
     )
 
-    # Zero ResponseArtifacts (retired). 8 RequestObservations.
+    # Zero ResponseArtifacts (retired). 10 RequestObservations.
     assert _count(neo4j_client, "ResponseArtifact", eid) == 0
-    assert _count(neo4j_client, "RequestObservation", eid) == 8
+    assert _count(neo4j_client, "RequestObservation", eid) == 10
 
-    # Four ObservedValues promote: internal-billing.corp.example,
-    # shared.internal.example (deduped across /a and /b), the JWT secret, and the
-    # recurring account_id (multiplicity >=2 across /x and /y, #15). The 100 list
-    # UUIDs do NOT promote (the 277k collapse), and the solo account_id seen in
-    # one response does NOT promote (multiplicity 1).
-    assert _count(neo4j_client, "ObservedValue", eid) == 4
+    # Five ObservedValues promote: internal-billing.corp.example,
+    # shared.internal.example (deduped across /a and /b), the JWT secret, the
+    # recurring account_id (multiplicity >=2 across /x and /y, #15), and the
+    # LEAKED_UUID (leak-to-input across /widgets output + /widget-detail input,
+    # #16). The 100 list UUIDs do NOT promote (the 277k collapse), the solo
+    # account_id seen in one response does NOT promote (multiplicity 1), and the
+    # second /widgets UUID seen only once as an output does NOT promote.
+    assert _count(neo4j_client, "ObservedValue", eid) == 5
     kinds = neo4j_client.execute_read(
         "MATCH (v:ObservedValue {engagement_id: $eid}) RETURN v.kind AS k, count(*) AS c "
         "ORDER BY k",
@@ -185,9 +234,29 @@ def test_observed_value_promotion_end_to_end(
     )
     assert {r["k"]: r["c"] for r in kinds} == {
         "internal_hostname": 2,
-        "identifier": 1,
+        "identifier": 2,
         "secret": 1,
     }
+
+    # Leak-to-input pivot (#16): LEAKED_UUID promotes to ONE ObservedValue with a
+    # YIELDED_VALUE edge from the producing /widgets response and a SENT_VALUE edge
+    # carrying parameter_name=widget_id from the consuming /widget-detail request —
+    # across DISTINCT endpoints.
+    pivot = neo4j_client.execute_read(
+        "MATCH (v:ObservedValue {engagement_id: $eid, value: $uuid}) "
+        "OPTIONAL MATCH (prod:RequestObservation)-[:YIELDED_VALUE]->(v) "
+        "OPTIONAL MATCH (cons:RequestObservation)-[s:SENT_VALUE]->(v) "
+        "RETURN count(DISTINCT v) AS vc, "
+        "       collect(DISTINCT prod.concrete_path) AS produced, "
+        "       collect(DISTINCT cons.concrete_path) AS consumed, "
+        "       collect(DISTINCT s.parameter_name) AS params",
+        eid=eid,
+        uuid=LEAKED_UUID,
+    )
+    assert pivot[0]["vc"] == 1
+    assert pivot[0]["produced"] == ["/widgets"]
+    assert pivot[0]["consumed"] == ["/widget-detail"]
+    assert pivot[0]["params"] == ["widget_id"]
 
     # Multiplicity (#15): the recurring account_id promotes to ONE ObservedValue
     # with a YIELDED_VALUE edge from each of /x and /y.
@@ -284,11 +353,20 @@ def test_observed_value_reingest_is_idempotent(
             filename="observed_values.har",
         )
     # Re-ingest adds no new ObservedValues or edges, and does not double-count the
-    # multiplicity signal (the recurring account_id is still ONE node, 2 edges).
-    assert _count(neo4j_client, "ObservedValue", eid) == 4
-    edges = neo4j_client.execute_read(
+    # multiplicity signal (the recurring account_id is still ONE node, 2 edges) nor
+    # the leak-to-input pivot (LEAKED_UUID is still ONE node, 1 YIELDED + 1 SENT).
+    assert _count(neo4j_client, "ObservedValue", eid) == 5
+    yielded = neo4j_client.execute_read(
         "MATCH (:RequestObservation {engagement_id: $eid})-[y:YIELDED_VALUE]->"
         "(:ObservedValue {engagement_id: $eid}) RETURN count(y) AS c",
         eid=eid,
     )
-    assert edges[0]["c"] == 6  # billing(1) + shared(2) + jwt(1) + recurring(2)
+    # billing(1) + shared(2) + jwt(1) + recurring(2) + leaked-uuid(2: json-walk id
+    # field + uuid regex, two distinct locations on the /widgets response).
+    assert yielded[0]["c"] == 8
+    sent = neo4j_client.execute_read(
+        "MATCH (:RequestObservation {engagement_id: $eid})-[s:SENT_VALUE]->"
+        "(:ObservedValue {engagement_id: $eid}) RETURN count(s) AS c",
+        eid=eid,
+    )
+    assert sent[0]["c"] == 1  # the single widget_id input occurrence (#16)

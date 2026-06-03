@@ -48,9 +48,9 @@ CandidateSection = str  # one of {"body", "header"}
 class CandidateOccurrence:
     """One extracted value occurrence, recorded inline on a `RequestObservation`.
 
-    `role` is `"output"` for everything this module produces (values surfaced in a
-    *response*); the `"input"` role (values *sent* as request parameters) is
-    indexed elsewhere and is out of #14's scope.
+    `role` is `"output"` for values surfaced in a *response* (the `extract_*`
+    functions here); `"input"` for values *sent* as request parameters
+    (`extract_input_candidates`, #16) — the leak-to-input pivot.
 
     For non-secret kinds `value` is the raw matched substring and `value_hash` is
     the hash of its normalised form. For secret kinds (ADR-0015) `value` is `None`
@@ -59,7 +59,8 @@ class CandidateOccurrence:
 
     `section` is `"body"` or `"header"`. Body occurrences carry byte offsets into
     the decoded body and, for JSON-walk hits, an RFC 6901 `json_pointer`; header
-    occurrences carry the source `header_name`.
+    occurrences carry the source `header_name`. `parameter_name` is set for
+    `"input"`-role occurrences (the request parameter that carried the value).
     """
 
     value_hash: Sha256Hex
@@ -74,6 +75,7 @@ class CandidateOccurrence:
     json_pointer: str | None = None
     byte_start: int | None = None
     byte_end: int | None = None
+    parameter_name: str | None = None
 
     @property
     def is_secret(self) -> bool:
@@ -203,8 +205,11 @@ def _candidate(
     """Build a `CandidateOccurrence`, applying ADR-0015 at the construction edge.
 
     Secret kinds drop the raw value, carrying only `value_hash` (over the raw
-    matched bytes) + length + 8-char preview. Non-secret kinds carry the raw value
-    and a `value_hash` over its normalised form (`canonical/values.py`).
+    matched bytes) + length + an 8-char preview. The preview is emitted ONLY when
+    the value is longer than the preview window (`len > 8`); a short secret (e.g.
+    a 7-char password sent as an `input` param) would otherwise be revealed in
+    full by its own preview, violating ADR-0015. Non-secret kinds carry the raw
+    value and a `value_hash` over its normalised form (`canonical/values.py`).
     """
 
     vh = hash_for(kind, raw)
@@ -216,7 +221,7 @@ def _candidate(
             section=section,
             value=None,
             value_length=len(raw.encode("utf-8")),
-            value_preview=raw[:8],
+            value_preview=raw[:8] if len(raw) > 8 else None,
             header_name=header_name,
             json_pointer=json_pointer,
             byte_start=byte_start,
@@ -384,6 +389,105 @@ def extract_candidates(
             _walk_json_ids(doc, "", out)
 
     return out
+
+
+# --------------------------------------------------------------------------- #
+# #16: request-input value candidates (the leak-to-input pivot, ADR-0023).
+# --------------------------------------------------------------------------- #
+
+# Secret-conventional parameter *names* (lowercased): a non-trivial value under
+# one of these is treated as a `secret` input regardless of its shape (ADR-0015),
+# so its raw value is hashed and never carried — mirroring the body-param
+# suppression in `extraction/har.py`.
+_SECRET_INPUT_NAMES: frozenset[str] = frozenset(
+    (
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "api_key",
+        "apikey",
+        "client_secret",
+        "private_key",
+    )
+)
+
+# Anchored variants for classifying a *whole* parameter value (not a substring of
+# a body). A query/body leaf value is the entire candidate, so we full-match.
+_FULL_INTERNAL_HOSTNAME_RE = re.compile(rf"^(?:{_INTERNAL_HOSTNAME_RE.pattern})$", re.IGNORECASE)
+_FULL_PRIVATE_IPV4_RE = re.compile(rf"^(?:{_PRIVATE_IPV4_RE.pattern})$")
+_FULL_URL_RE = re.compile(rf"^(?:{_URL_RE.pattern})$", re.IGNORECASE)
+_FULL_EMAIL_RE = re.compile(rf"^(?:{_EMAIL_RE.pattern})$")
+_FULL_UUID_RE = re.compile(rf"^(?:{_UUID_RE.pattern})$", re.IGNORECASE)
+
+
+def classify_input_kind(name: str, value: str) -> CandidateKind:
+    """Classify a request-parameter value's `CandidateKind` (deterministic, #16).
+
+    Secret-conventional names and JWT-shaped values classify as `secret` (their raw
+    value is then hashed, never carried; ADR-0015). Otherwise the value is matched
+    against the same shape rules the response extractors use, anchored to the whole
+    value. Anything unclassified falls back to `identifier` — the high-cardinality
+    catch-all that promotes only on cross-context signal (leak-to-input / multiplicity).
+    """
+
+    if name.lower() in _SECRET_INPUT_NAMES and value:
+        return "secret"
+    if _JWT_RE.fullmatch(value) or _AWS_ACCESS_KEY_RE.fullmatch(value) or (
+        _STRIPE_KEY_RE.fullmatch(value)
+    ):
+        return "secret"
+    if _FULL_INTERNAL_HOSTNAME_RE.match(value):
+        return "internal_hostname"
+    if _FULL_EMAIL_RE.match(value):
+        return "email"
+    if _FULL_PRIVATE_IPV4_RE.match(value):
+        return "ip_address"
+    if _FULL_URL_RE.match(value):
+        return "url"
+    if _FULL_UUID_RE.match(value):
+        return "identifier"
+    return "identifier"
+
+
+def extract_input_candidate(
+    name: str, value: str, *, extractor: str
+) -> CandidateOccurrence:
+    """Build one `input`-role `CandidateOccurrence` for a request-parameter value.
+
+    The value is canonicalised through the same `hash_for` as response outputs, so a
+    value that *leaked* in a response and is later *sent* as an input collapses to
+    one `value_hash` (the leak-to-input pivot, ADR-0023 / ADR-0009). Secret-shaped
+    inputs carry hash + length only, with an 8-char preview ONLY when the value is
+    longer than the preview window — a short secret (e.g. a 7-char `password`)
+    would otherwise be revealed in full by its own preview (ADR-0015); the raw
+    value is always dropped.
+    """
+
+    kind = classify_input_kind(name, value)
+    vh = hash_for(kind, value)
+    if is_secret_kind(kind):
+        return CandidateOccurrence(
+            value_hash=vh,
+            kind=kind,
+            extractor=extractor,
+            role="input",
+            value=None,
+            value_length=len(value.encode("utf-8")),
+            value_preview=value[:8] if len(value) > 8 else None,
+            parameter_name=name,
+        )
+    return CandidateOccurrence(
+        value_hash=vh,
+        kind=kind,
+        extractor=extractor,
+        role="input",
+        value=value,
+        parameter_name=name,
+    )
 
 
 def _error_excerpt(text: str) -> str:

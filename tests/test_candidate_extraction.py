@@ -20,7 +20,11 @@ from doo.canonical.value_objects import BlobRef
 from doo.canonical.values import hash_for
 from doo.events.envelope import IngestionEnvelope
 from doo.events.l2 import RequestObservation
-from doo.extraction.artifacts import extract_candidates, extract_diagnostics
+from doo.extraction.artifacts import (
+    extract_candidates,
+    extract_diagnostics,
+    extract_input_candidate,
+)
 from doo.extraction.har import parse_har
 from doo.ids import BlobKey, EngagementId, IdempotencyKey, Sha256Hex
 from tests.fixtures import RESPONSE_ARTIFACTS_HAR
@@ -269,3 +273,22 @@ class _FakeUploader:
             size_bytes=len(raw),
             encoding=encoding,
         )
+
+
+def test_short_secret_input_param_has_no_revealing_preview() -> None:
+    """ADR-0015 regression (#16): a 7-char `password`'s first-8 preview would BE
+    the whole secret, so a short secret input carries no preview at all."""
+    c = extract_input_candidate("password", "hunter2", extractor="request-param:body_v1")
+    assert c.is_secret
+    assert c.value is None
+    assert c.value_preview is None
+    assert c.value_length == 7
+    assert "hunter2" not in (c.value_preview or "")
+
+
+def test_long_secret_input_param_keeps_partial_preview_never_full() -> None:
+    long_secret = "supersecretlongtoken1234567890"
+    c = extract_input_candidate("token", long_secret, extractor="request-param:body_v1")
+    assert c.value is None
+    assert c.value_preview == long_secret[:8]
+    assert long_secret not in (c.value_preview or "")  # never the full value

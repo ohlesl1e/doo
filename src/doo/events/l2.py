@@ -107,14 +107,20 @@ class ValueCandidate(BaseModel):
     aggregates these by `value_hash` (engagement-scoped) and mints an
     `ObservedValue` for kinds in the shape-allowlist.
 
-    `role` is `output` for values surfaced in a response; `input` (values *sent*
-    as request parameters) is reserved for the leak-to-input branch (out of #14's
-    scope). `section` is `body` or `header`.
+    `role` is `output` for values surfaced in a response; `input` for values
+    *sent* as request parameters (path/query/body) — the leak-to-input branch
+    (#16, ADR-0023). `section` is `body` or `header`.
+
+    `parameter_name` is set for `input`-role candidates: the name of the request
+    parameter (query key, body-leaf name) that carried the value. It feeds the
+    `SENT_VALUE {parameter_name}` edge from the consuming request to the promoted
+    `ObservedValue`. Output candidates leave it `None` (they carry a structural
+    location — `header_name` / `json_pointer` / byte offsets — instead).
 
     Secret discipline (ADR-0015): for `secret` / `token` kinds, `value` is null and
     only `value_hash` + `value_length` + `value_preview` (first 8 chars) are
-    carried; the raw value lives only in the response-body blob. Non-secret kinds
-    carry the raw `value` and a `value_hash` over its normalised form.
+    carried; the raw value lives only in the response/request-body blob. Non-secret
+    kinds carry the raw `value` and a `value_hash` over its normalised form.
     """
 
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
@@ -131,6 +137,9 @@ class ValueCandidate(BaseModel):
     json_pointer: str | None = None
     byte_start: int | None = Field(default=None, ge=0)
     byte_end: int | None = Field(default=None, ge=0)
+    # Set for input-role candidates: the request parameter that carried the value
+    # (the `SENT_VALUE.parameter_name`). None for output candidates.
+    parameter_name: str | None = None
 
     @model_validator(mode="after")
     def _shape(self) -> Self:
@@ -150,6 +159,8 @@ class ValueCandidate(BaseModel):
         if self.section == "header":
             if not self.header_name:
                 raise ValueError("header candidates must carry a header_name")
+        if self.role == "input" and not self.parameter_name:
+            raise ValueError("input candidates must carry a parameter_name")
         return self
 
 

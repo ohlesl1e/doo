@@ -13,6 +13,7 @@ import pytest
 from doo.canonical.promotion import (
     MULTIPLICITY_THRESHOLD,
     SHAPE_ALLOWLIST,
+    is_leak_to_input,
     kind_is_allowlisted,
     should_promote,
 )
@@ -92,6 +93,76 @@ def test_multiplicity_truth_table() -> None:
     assert should_promote(["identifier", "identifier"], distinct_observations=2)
     # same value twice in one observation -> no (distinct-observation count is 1)
     assert not should_promote(["identifier", "identifier"], distinct_observations=1)
+
+
+# --- Leak-to-input branch (#16) ------------------------------------------------
+
+
+def test_is_leak_to_input_requires_both_roles() -> None:
+    assert is_leak_to_input(["output", "input"])
+    assert is_leak_to_input(["input", "output"])
+    assert not is_leak_to_input(["output"])
+    assert not is_leak_to_input(["input"])
+    assert not is_leak_to_input(["output", "output"])
+    assert not is_leak_to_input(["input", "input"])
+    assert not is_leak_to_input([])
+
+
+def test_leak_to_input_promotes_non_allowlisted_value() -> None:
+    # A high-cardinality identifier (would NOT promote on shape, and only ONE
+    # distinct observation each side) promotes once it is seen as both an output
+    # and an input — the leak-to-input pivot (#16).
+    assert not kind_is_allowlisted("identifier")
+    assert should_promote(
+        ["identifier", "identifier"],
+        distinct_observations=2,
+        roles=["output", "input"],
+    )
+
+
+def test_output_only_does_not_promote_without_other_signal() -> None:
+    # Seen only as an output, single observation, non-allowlisted -> no promotion.
+    assert not should_promote(
+        ["identifier"], distinct_observations=1, roles=["output"]
+    )
+
+
+def test_input_only_does_not_promote_by_leak_to_input_alone() -> None:
+    # Seen only as an input, single observation -> leak-to-input does NOT fire; no
+    # other signal either -> no promotion (the issue's explicit case).
+    assert not should_promote(
+        ["identifier"], distinct_observations=1, roles=["input"]
+    )
+
+
+def test_input_only_still_promotes_on_multiplicity() -> None:
+    # An input-only value seen across 2 distinct observations still promotes on
+    # multiplicity (#15) even without an output occurrence.
+    assert should_promote(
+        ["identifier", "identifier"],
+        distinct_observations=2,
+        roles=["input", "input"],
+    )
+
+
+def test_leak_to_input_truth_table() -> None:
+    # output + input -> promote
+    assert should_promote(["identifier", "identifier"], roles=["output", "input"])
+    # output-only -> not (no other signal)
+    assert not should_promote(["identifier"], roles=["output"])
+    # input-only -> not (no other signal)
+    assert not should_promote(["identifier"], roles=["input"])
+    # leak-to-input overrides the 277k collapse regardless of distinct_observations.
+    assert should_promote(
+        ["identifier", "identifier"], distinct_observations=1, roles=["output", "input"]
+    )
+
+
+def test_roles_default_empty_keeps_kinds_only_behaviour() -> None:
+    # A caller that does not pass roles gets the pre-#16 behaviour: leak-to-input
+    # simply cannot fire, so the shape-allowlist / multiplicity decision stands.
+    assert not should_promote(["identifier"])
+    assert should_promote(["internal_hostname"])
 
 
 def test_allowlist_is_exactly_the_four_shape_kinds() -> None:
