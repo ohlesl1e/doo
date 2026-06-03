@@ -95,8 +95,17 @@ def _fixture_har() -> bytes:
     - /session (200 JSON): a JWT (secret), and a Server fingerprint header.
     - /a and /b (200 JSON): the SAME internal hostname in two responses (dedup).
     - /list (200 JSON): 100 distinct UUID ids (the 277k collapse: no promotion).
+    - /x and /y (200 JSON): the SAME non-allowlisted `account_id` in two responses
+      (multiplicity >=2 -> promotes, #15).
+    - /solo (200 JSON): a non-allowlisted `account_id` seen in ONE response
+      (multiplicity 1 -> stays inline, no promotion).
     """
 
+    # A recurring tenant/account identifier (non-allowlisted `identifier` kind) that
+    # appears in two distinct responses -> promotes on multiplicity, not shape.
+    recurring_account = "acct-recurring-7f3a"
+    # A non-allowlisted identifier seen in exactly one response -> no promotion.
+    solo_account = "acct-solo-91bd"
     list_items = json.dumps(
         {"items": [{"id": f"{i:08d}-0000-0000-0000-000000000000"} for i in range(100)]}
     )
@@ -126,6 +135,21 @@ def _fixture_har() -> bytes:
             minute=0, second=4, status=200, ctype="application/json",
             body=list_items,
         ),
+        _entry(
+            "https://api.example.com/x",
+            minute=0, second=5, status=200, ctype="application/json",
+            body=json.dumps({"account_id": recurring_account}),
+        ),
+        _entry(
+            "https://api.example.com/y",
+            minute=0, second=6, status=200, ctype="application/json",
+            body=json.dumps({"account_id": recurring_account}),
+        ),
+        _entry(
+            "https://api.example.com/solo",
+            minute=0, second=7, status=200, ctype="application/json",
+            body=json.dumps({"account_id": solo_account}),
+        ),
     ]
     return json.dumps({"log": {"version": "1.2", "entries": entries}}).encode()
 
@@ -144,20 +168,45 @@ def test_observed_value_promotion_end_to_end(
         filename="observed_values.har",
     )
 
-    # Zero ResponseArtifacts (retired). 5 RequestObservations.
+    # Zero ResponseArtifacts (retired). 8 RequestObservations.
     assert _count(neo4j_client, "ResponseArtifact", eid) == 0
-    assert _count(neo4j_client, "RequestObservation", eid) == 5
+    assert _count(neo4j_client, "RequestObservation", eid) == 8
 
-    # Exactly three ObservedValues promote: internal-billing.corp.example,
-    # shared.internal.example (deduped across /a and /b), and the JWT secret.
-    # The 100 list UUIDs do NOT promote (the 277k collapse).
-    assert _count(neo4j_client, "ObservedValue", eid) == 3
+    # Four ObservedValues promote: internal-billing.corp.example,
+    # shared.internal.example (deduped across /a and /b), the JWT secret, and the
+    # recurring account_id (multiplicity >=2 across /x and /y, #15). The 100 list
+    # UUIDs do NOT promote (the 277k collapse), and the solo account_id seen in
+    # one response does NOT promote (multiplicity 1).
+    assert _count(neo4j_client, "ObservedValue", eid) == 4
     kinds = neo4j_client.execute_read(
         "MATCH (v:ObservedValue {engagement_id: $eid}) RETURN v.kind AS k, count(*) AS c "
         "ORDER BY k",
         eid=eid,
     )
-    assert {r["k"]: r["c"] for r in kinds} == {"internal_hostname": 2, "secret": 1}
+    assert {r["k"]: r["c"] for r in kinds} == {
+        "internal_hostname": 2,
+        "identifier": 1,
+        "secret": 1,
+    }
+
+    # Multiplicity (#15): the recurring account_id promotes to ONE ObservedValue
+    # with a YIELDED_VALUE edge from each of /x and /y.
+    recurring = neo4j_client.execute_read(
+        "MATCH (r:RequestObservation {engagement_id: $eid})-[y:YIELDED_VALUE]->"
+        "(v:ObservedValue {engagement_id: $eid, value: 'acct-recurring-7f3a'}) "
+        "RETURN count(DISTINCT v) AS vc, count(y) AS edges",
+        eid=eid,
+    )
+    assert recurring[0]["vc"] == 1
+    assert recurring[0]["edges"] == 2
+
+    # The solo account_id seen in a single observation does NOT promote.
+    solo = neo4j_client.execute_read(
+        "MATCH (v:ObservedValue {engagement_id: $eid, value: 'acct-solo-91bd'}) "
+        "RETURN count(v) AS c",
+        eid=eid,
+    )
+    assert solo[0]["c"] == 0
 
     # No ObservedValue for any list UUID id.
     list_ids = neo4j_client.execute_read(
@@ -234,11 +283,12 @@ def test_observed_value_reingest_is_idempotent(
             har_bytes=_fixture_har(),
             filename="observed_values.har",
         )
-    # Re-ingest adds no new ObservedValues or edges.
-    assert _count(neo4j_client, "ObservedValue", eid) == 3
+    # Re-ingest adds no new ObservedValues or edges, and does not double-count the
+    # multiplicity signal (the recurring account_id is still ONE node, 2 edges).
+    assert _count(neo4j_client, "ObservedValue", eid) == 4
     edges = neo4j_client.execute_read(
         "MATCH (:RequestObservation {engagement_id: $eid})-[y:YIELDED_VALUE]->"
         "(:ObservedValue {engagement_id: $eid}) RETURN count(y) AS c",
         eid=eid,
     )
-    assert edges[0]["c"] == 4  # billing(1) + shared(2) + jwt(1)
+    assert edges[0]["c"] == 6  # billing(1) + shared(2) + jwt(1) + recurring(2)

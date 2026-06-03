@@ -9,15 +9,20 @@ For one engagement it:
 
 1. Reads every `RequestObservation`'s inline value candidates (ADR-0023) from the
    graph and groups the occurrences by `value_hash` (engagement-scoped).
-2. For each value whose occurrence kinds clear the shape-allowlist
-   (`canonical.promotion.should_promote` — `{secret, token, internal_hostname,
-   email}` in #14), MERGEs one `ObservedValue` (identity `(engagement_id,
-   value_hash)`; ADR-0009) and wires a `YIELDED_VALUE {location, extractor}` edge
-   from every observation that surfaced it.
+2. For each value that clears a promotion signal
+   (`canonical.promotion.should_promote`), MERGEs one `ObservedValue` (identity
+   `(engagement_id, value_hash)`; ADR-0009) and wires a `YIELDED_VALUE {location,
+   extractor}` edge from every observation that surfaced it. Two signals fire
+   here: the shape-allowlist (`{secret, token, internal_hostname, email}`, #14)
+   and **multiplicity ≥2** (#15) — a value seen in ≥2 *distinct* observations,
+   regardless of kind.
 3. Stamps the seven cross-cutting fields (ADR-0005) on the node and edge.
 
-High-cardinality identifiers / URLs do **not** promote here — they stay inline
-candidate occurrences (the 277k collapse). Secret discipline (ADR-0015): a secret
+A non-allowlisted value seen in a single observation does **not** promote — it
+stays an inline candidate occurrence (the 277k collapse: 100 distinct list ids
+are 100 single-occurrence hashes). Distinct-observation counting (and so the
+multiplicity decision) is over *distinct* `observation_id`s, so the same value
+twice within one response counts once. Secret discipline (ADR-0015): a secret
 `ObservedValue` carries `value_hash` + length + preview only; the raw value is not
 in the candidate and never reaches the graph.
 
@@ -101,7 +106,11 @@ def promote_values(
     edge_count = 0
     for value_hash, occurrences in sorted(by_hash.items()):
         kinds = [o.kind for o in occurrences]
-        if not should_promote(kinds):
+        # Distinct observations carrying this value — the multiplicity count and
+        # the set the YIELDED_VALUE edges fan out to. Counting *distinct*
+        # observation ids means the same value twice in one response is 1, not 2.
+        yielded_from = sorted({o.observation_id for o in occurrences})
+        if not should_promote(kinds, distinct_observations=len(yielded_from)):
             continue
         # A value's kind is stable across its occurrences (the hash includes the
         # normalisation, and secret/non-secret never collide); take the first.
@@ -116,7 +125,6 @@ def promote_values(
             observed_at=observed_at,
             ingested_at=ingested_at,
         )
-        yielded_from = sorted({o.observation_id for o in occurrences})
         edge_count += len(yielded_from)
         promoted.append(
             PromotedValue(
