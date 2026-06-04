@@ -314,6 +314,44 @@ def test_reissued_tokens_keyed_on_uid_when_no_sub_collapse_to_one_principal(
     assert acs[0]["c"] == 3
 
 
+def test_reissued_jwt_cookies_collapse_to_one_discovered_principal(
+    neo4j_client,
+) -> None:
+    """ADR-0027 (cookie path): an undeclared user authenticated by a JWT *cookie*
+    (no bearer header) whose token is reissued each request collapses to ONE
+    discovered Principal keyed on the decoded `sub` — one AuthContext per token."""
+
+    eid = "eng-recon-jwtcookie"
+    _seed_declared_principal(neo4j_client, eid)
+    for i in range(3):
+        token = jwt.encode(
+            {"sub": "uuid-cookie-zzz", "jti": f"c-{i}", "exp": 4102444800 + i},
+            SIGNING_KEY,
+            algorithm="HS256",
+        )
+        cue = extract_auth_context_cue(
+            {"headers": [], "cookies": [{"name": "session", "value": token}]}
+        )
+        # The cookie JWT supplied the identity claims (no bearer header present).
+        assert cue.identity_claims.get("sub") == "uuid-cookie-zzz"
+        resolved = _resolve(neo4j_client, eid, cue)
+        assert resolved.principal_tier == "discovered"
+        assert resolved.unmerged is True
+
+    pcount = neo4j_client.execute_read(
+        "MATCH (p:Principal {engagement_id: $eid, tier: 'discovered'}) "
+        "WHERE p.identity_key = 'discovered:jwt:sub:uuid-cookie-zzz' RETURN count(p) AS c",
+        eid=eid,
+    )
+    assert pcount[0]["c"] == 1
+    acs = neo4j_client.execute_read(
+        "MATCH (ac:AuthContext {engagement_id: $eid})-[:OF_PRINCIPAL]->"
+        "(p:Principal {identity_key: 'discovered:jwt:sub:uuid-cookie-zzz'}) RETURN count(ac) AS c",
+        eid=eid,
+    )
+    assert acs[0]["c"] == 3
+
+
 def test_anonymous_singleton_preserved(neo4j_client) -> None:
     eid = "eng-recon-anon"
     _seed_declared_principal(neo4j_client, eid)

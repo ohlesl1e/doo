@@ -471,7 +471,13 @@ def extract_auth_context_cue(
       `identity_claims`.
     - `Authorization: Basic <b64>` -> hash of the *username only*; the password is
       never carried forward.
-    - cookies -> per-cookie-name value hashes (sorted by name).
+    - cookies -> per-cookie-name value hashes, but only for *session-credential*
+      cookies (ADR-0026): app/UI-state cookies are excluded so they cannot
+      fragment identity. `session_cookie_names`, when set, is the authoritative
+      allowlist; otherwise a value-shape heuristic decides.
+    - a JWT *session cookie* is decoded into `identity_claims` when no bearer JWT
+      did so (ADR-0027), so cookie-authenticated users get the same claim-keyed
+      Principal collapse as bearer users (bearer takes precedence).
     - `X-API-Key`-style headers -> per-header-name value hashes.
 
     When no auth-bearing material is present, returns the anonymous singleton cue
@@ -506,6 +512,19 @@ def extract_auth_context_cue(
         for _name, value in sorted(_cookie_pairs(request), key=lambda p: p[0])
         if cookie_feeds_identity(_name, value, allowlist=allowlist)
     )
+
+    # ADR-0027: when no bearer JWT supplied identity claims, decode a JWT *session*
+    # cookie instead — bearer takes precedence. The first session cookie (by name)
+    # that decodes to non-empty claims wins; opaque cookies yield {} and are
+    # skipped. This is what collapses reissued JWT-cookie sessions to one Principal.
+    if not identity_claims:
+        for _name, value in sorted(_cookie_pairs(request), key=lambda p: p[0]):
+            if not cookie_feeds_identity(_name, value, allowlist=allowlist):
+                continue
+            cookie_claims = _decode_jwt_claims(value)
+            if cookie_claims:
+                identity_claims = cookie_claims
+                break
 
     api_key_headers: dict[str, Sha256Hex] = {}
     for name_lower, value in headers.items():

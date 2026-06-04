@@ -21,6 +21,13 @@ BEARER_JWT = jwt.encode(
 )
 
 
+COOKIE_JWT = jwt.encode(
+    {"sub": "uuid-cookie", "email": "c@example.com", "exp": 4102444800},
+    "irrelevant-signing-key-at-least-32-bytes-long!",
+    algorithm="HS256",
+)
+
+
 def _request(headers=None, cookies=None):
     return {
         "method": "GET",
@@ -28,6 +35,34 @@ def _request(headers=None, cookies=None):
         "headers": [{"name": n, "value": v} for n, v in (headers or [])],
         "cookies": [{"name": n, "value": v} for n, v in (cookies or [])],
     }
+
+
+def test_jwt_session_cookie_populates_identity_claims() -> None:
+    # No bearer header; the session cookie is a JWT → its claims become identity_claims (ADR-0027).
+    cue = extract_auth_context_cue(_request(cookies=[("session", COOKIE_JWT)]))
+    assert cue.is_anonymous is False
+    assert cue.identity_claims["sub"] == "uuid-cookie"
+    assert cue.identity_claims["email"] == "c@example.com"
+    # Raw token bytes never on the cue.
+    assert COOKIE_JWT not in repr(cue.model_dump())
+
+
+def test_bearer_jwt_takes_precedence_over_cookie_jwt() -> None:
+    cue = extract_auth_context_cue(
+        _request(
+            headers=[("Authorization", f"Bearer {BEARER_JWT}")],
+            cookies=[("session", COOKIE_JWT)],
+        )
+    )
+    # Bearer wins: claims come from the bearer JWT, not the cookie.
+    assert cue.identity_claims["sub"] == "uuid-aaa"
+
+
+def test_opaque_session_cookie_yields_no_identity_claims() -> None:
+    # A non-JWT session cookie is hashed but yields no claims, and never crashes.
+    cue = extract_auth_context_cue(_request(cookies=[("session", "opaque-session-value-1234")]))
+    assert cue.is_anonymous is False
+    assert cue.identity_claims == {}
 
 
 def test_bearer_jwt_hash_and_unverified_claims() -> None:
