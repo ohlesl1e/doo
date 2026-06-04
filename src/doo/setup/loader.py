@@ -100,6 +100,7 @@ class CurrentEngagementState:
     scope_content_hash: ScopeContentHash
     kill_switch_ttl_seconds: int
     kill_switch_refresh_seconds: int
+    session_cookie_names: tuple[str, ...] = ()
     declared_principals: dict[str, dict[str, Any]] = dataclasses.field(default_factory=dict)
 
 
@@ -363,6 +364,7 @@ def _build_diff(
     current: CurrentEngagementState,
     desired_scope_view: dict[str, Any],
     desired_kill_switch: dict[str, Any],
+    desired_session_cookie_names: list[str],
     current_scope_view: dict[str, Any] | None,
     desired_principal_views: dict[str, dict[str, Any]] | None = None,
 ) -> str:
@@ -380,11 +382,13 @@ def _build_diff(
             "lease_ttl_seconds": current.kill_switch_ttl_seconds,
             "refresh_interval_seconds": current.kill_switch_refresh_seconds,
         },
+        "session_cookie_names": list(current.session_cookie_names),
         "principals": current.declared_principals,
     }
     desired_view = {
         "scope": desired_scope_view,
         "kill_switch": desired_kill_switch,
+        "session_cookie_names": desired_session_cookie_names,
         "principals": desired_principal_views if desired_principal_views is not None else {},
     }
 
@@ -601,6 +605,7 @@ def load_engagement(
                     if config.engagement.time_window
                     else None,
                     "kill_switch": desired_kill_switch,
+                    "session_cookie_names": list(config.auth.session_cookie_names),
                     # Cross-cutting fields per ADR-0005.
                     "source": "manual",
                     "source_id": None,
@@ -657,6 +662,9 @@ def load_engagement(
     )
     name_changed = current.engagement_name != config.engagement.name
     description_changed = current.engagement_description != config.engagement.description
+    session_cookies_changed = tuple(current.session_cookie_names) != tuple(
+        config.auth.session_cookie_names
+    )
 
     # Principal diff (ADR-0019): adds, removes, and mods are material. The
     # comparison is over the secret-free `_principal_view` dicts.
@@ -676,7 +684,9 @@ def load_engagement(
         principals_added or principals_removed or principals_modified
     )
 
-    material = scope_changed or killswitch_changed or principals_changed
+    material = (
+        scope_changed or killswitch_changed or principals_changed or session_cookies_changed
+    )
     cosmetic = name_changed or description_changed
 
     if not material and not cosmetic:
@@ -698,6 +708,7 @@ def load_engagement(
             current=current,
             desired_scope_view=desired_scope_view,
             desired_kill_switch=desired_kill_switch,
+            desired_session_cookie_names=list(config.auth.session_cookie_names),
             current_scope_view=None,
             desired_principal_views=desired_principal_views,
         )
@@ -750,7 +761,7 @@ def load_engagement(
             )
         )
 
-    if killswitch_changed or name_changed or description_changed:
+    if killswitch_changed or name_changed or description_changed or session_cookies_changed:
         mutations.append(
             PlannedMutation(
                 kind="engagement_update",
@@ -759,6 +770,7 @@ def load_engagement(
                     "name": config.engagement.name,
                     "description": config.engagement.description,
                     "kill_switch": desired_kill_switch,
+                    "session_cookie_names": list(config.auth.session_cookie_names),
                     "last_seen": now,
                 },
             )

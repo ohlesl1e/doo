@@ -1,12 +1,14 @@
-"""Cookie identity classifier — pure heuristic (ADR-0026, slice T-AI1).
+"""Cookie identity classifier (ADR-0026).
 
 Determines whether a cookie contributes to `AuthContext` identity (i.e. is a
-session credential) based on its *value shape* alone.  No I/O, no graph, no
-config — this is the heuristic path only; the engagement-config allowlist
-(issue #28) is a separate, later layer.
+session credential). Pure — no I/O, no graph.
 
-Rule: **include-biased**.  A cookie feeds identity *unless* its value is
-*confidently app/UI state*.
+Two modes:
+- **Authoritative allowlist** (engagement `session_cookie_names`, ADR-0026 #28):
+  when a non-empty allowlist is supplied, ONLY cookies whose name is listed feed
+  identity; the shape heuristic is bypassed entirely (names matched exactly).
+- **Shape heuristic** (no allowlist): **include-biased** — a cookie feeds
+  identity *unless* its value is *confidently app/UI state*.
 
 Exclusion conditions (``cookie_feeds_identity`` returns ``False``):
 - value is empty or whitespace-only
@@ -49,15 +51,21 @@ _BOOL_RE: re.Pattern[str] = re.compile(
 _MIN_SESSION_LEN = 8
 
 
-def cookie_feeds_identity(name: str, value: str) -> bool:  # noqa: ARG001
+def cookie_feeds_identity(
+    name: str, value: str, *, allowlist: frozenset[str] | None = None
+) -> bool:
     """Return ``True`` if this cookie should contribute to ``AuthContext`` identity.
 
     Parameters
     ----------
     name:
-        Cookie name (carried for future allowlist use; not used by this heuristic).
+        Cookie name.
     value:
         Cookie value as a plain string (URL-decoded or as-is from the HAR).
+    allowlist:
+        Authoritative engagement `session_cookie_names` (ADR-0026 #28). When
+        non-empty, identity is computed over ONLY these cookie names and the shape
+        heuristic below is bypassed entirely. ``None``/empty → use the heuristic.
 
     Returns
     -------
@@ -65,6 +73,10 @@ def cookie_feeds_identity(name: str, value: str) -> bool:  # noqa: ARG001
         ``True``  — cookie is (or may be) a session credential; include in hash.
         ``False`` — cookie is confidently app/UI state; exclude from hash.
     """
+    # Authoritative allowlist: only listed names feed identity, heuristic bypassed.
+    if allowlist:
+        return name in allowlist
+
     # Fast path: JWT-shaped value is unconditionally a credential.
     if _JWT_RE.search(value):
         return True

@@ -242,6 +242,25 @@ class DeclaredPrincipal(BaseModel):
         return self
 
 
+class AuthConfig(BaseModel):
+    """Auth-identity hints for interpreting captured traffic (ADR-0026).
+
+    `session_cookie_names` is the authoritative, engagement-global allowlist of
+    cookie names that carry the session credential. When non-empty, ONLY these
+    cookies feed the `AuthContext` identity (the shape heuristic is bypassed);
+    empty means fall back to the heuristic. A flat list is correct across a
+    multi-host engagement because cookies are host-scoped at request time, so the
+    union partitions naturally. Cookie names are matched exactly (case-sensitive,
+    per RFC 6265).
+    """
+
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    session_cookie_names: tuple[str, ...] = ()
+
+    _coerce_names = field_validator("session_cookie_names", mode="before")(_list_to_tuple)
+
+
 class EngagementConfig(BaseModel):
     """The whole YAML file, validated."""
 
@@ -250,6 +269,7 @@ class EngagementConfig(BaseModel):
     engagement: EngagementMeta
     scope: ScopeRules
     kill_switch: KillSwitchConfig = Field(default_factory=KillSwitchConfig)
+    auth: AuthConfig = Field(default_factory=AuthConfig)
     principals: tuple[DeclaredPrincipal, ...] = ()
 
     _coerce_principals = field_validator("principals", mode="before")(_list_to_tuple)

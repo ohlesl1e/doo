@@ -244,6 +244,60 @@ def test_ui_state_filtering_does_not_affect_bearer_detection() -> None:
     assert cue.cookie_session_hashes == ()
 
 
+# ---------------------------------------------------------------------------
+# Authoritative allowlist (ADR-0026 #28)
+# ---------------------------------------------------------------------------
+
+
+def test_allowlist_authoritative_includes_only_listed_names() -> None:
+    allow = frozenset({"token"})
+    # Listed name → included regardless of value shape.
+    assert cookie_feeds_identity("token", "0", allowlist=allow) is True
+    # Unlisted name → excluded even when the value is opaque/credential-shaped.
+    assert cookie_feeds_identity("sess", _SESSION_VALUE, allowlist=allow) is False
+
+
+def test_empty_allowlist_falls_back_to_heuristic() -> None:
+    # Empty/None allowlist → heuristic (no regression vs #26).
+    assert cookie_feeds_identity("anything", _SESSION_VALUE, allowlist=frozenset()) is True
+    assert cookie_feeds_identity("ap_page", "0", allowlist=frozenset()) is False
+
+
+def test_cue_allowlist_overrides_heuristic() -> None:
+    """With an allowlist, ONLY listed cookies feed identity — an opaque cookie not
+    on the list is excluded, and a listed cookie is kept even if short."""
+    req = _request(
+        [
+            ("token", "42"),                 # listed, would be excluded by heuristic (int)
+            ("other_opaque", _SESSION_VALUE),  # opaque but NOT listed → excluded
+            ("ap_page", "3"),
+        ]
+    )
+    cue = extract_auth_context_cue(req, session_cookie_names=("token",))
+    assert cue.is_anonymous is False
+    assert cue.cookie_session_hashes == (compute_auth_hash("cookie", "42"),)
+
+
+def test_cue_no_allowlist_matches_heuristic() -> None:
+    """No allowlist passed → identical to the #26 heuristic path."""
+    req = _request([("token", _SESSION_VALUE), ("ap_page", "1")])
+    assert (
+        extract_auth_context_cue(req).cookie_session_hashes
+        == extract_auth_context_cue(req, session_cookie_names=()).cookie_session_hashes
+        == (compute_auth_hash("cookie", _SESSION_VALUE),)
+    )
+
+
+def test_cue_allowlist_none_present_yields_anonymous() -> None:
+    """A request with none of the allowlisted cookies (and no other cred) → anonymous."""
+    cue = extract_auth_context_cue(
+        _request([("ap_page", "2"), ("other", _SESSION_VALUE)]),
+        session_cookie_names=("token",),
+    )
+    assert cue.is_anonymous is True
+    assert cue.cookie_session_hashes == ()
+
+
 def test_two_session_cookies_both_hashed() -> None:
     """Two session-credential cookies → two hashes (sorted by name)."""
     val_a = "aaaaaaaaaaaaaaaa"  # len=16, not int, not bool

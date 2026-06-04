@@ -203,7 +203,14 @@ def parse_har(
 
     entries = log["entries"]
     for index, entry in enumerate(entries):
-        yield from _parse_entry(entry, index, envelope, ingested_at, body_uploader)
+        yield from _parse_entry(
+            entry,
+            index,
+            envelope,
+            ingested_at,
+            body_uploader,
+            session_cookie_names=envelope.session_cookie_names,
+        )
 
 
 def _parse_entry(
@@ -212,6 +219,8 @@ def _parse_entry(
     envelope: IngestionEnvelope,
     ingested_at: datetime,
     body_uploader: BodyUploader | None,
+    *,
+    session_cookie_names: tuple[str, ...] = (),
 ) -> Iterator[L2Event]:
     """Parse one HAR entry into a `RequestObservation` with inline value candidates.
 
@@ -247,7 +256,9 @@ def _parse_entry(
 
         host_ref, concrete_path, query_string = _split_url(url)
         query_params = _query_parameters(request, query_string)
-        auth_context_cue = extract_auth_context_cue(request)
+        auth_context_cue = extract_auth_context_cue(
+            request, session_cookie_names=session_cookie_names
+        )
 
         response = entry.get("response")
         response_status, response_size = _response_shape(response)
@@ -448,7 +459,9 @@ def _decode_jwt_claims(token: str) -> dict[str, str | int | float | bool | None]
     return claims
 
 
-def extract_auth_context_cue(request: dict[str, object]) -> AuthContextCue:
+def extract_auth_context_cue(
+    request: dict[str, object], *, session_cookie_names: tuple[str, ...] = ()
+) -> AuthContextCue:
     """Extract an `AuthContextCue` from a HAR request, hashing at the L2 boundary.
 
     Per ADR-0015 raw tokens never leave L2: every credential is reduced to a
@@ -485,10 +498,13 @@ def extract_auth_context_cue(request: dict[str, object]) -> AuthContextCue:
                 # Hash the username only — the password never leaves L2.
                 basic_auth_user_hash = compute_auth_hash("basic_auth", username)
 
+    # Authoritative engagement allowlist (ADR-0026 #28) when configured; else the
+    # shape heuristic decides which cookies are session credentials.
+    allowlist = frozenset(session_cookie_names) if session_cookie_names else None
     cookie_hashes = tuple(
         compute_auth_hash("cookie", value)
         for _name, value in sorted(_cookie_pairs(request), key=lambda p: p[0])
-        if cookie_feeds_identity(_name, value)
+        if cookie_feeds_identity(_name, value, allowlist=allowlist)
     )
 
     api_key_headers: dict[str, Sha256Hex] = {}

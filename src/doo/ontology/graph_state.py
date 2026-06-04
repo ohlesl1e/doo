@@ -50,7 +50,8 @@ class Neo4jGraphState:
             MATCH (e:Engagement {id: $engagement_id})-[:UNDER_SCOPE]->(s:Scope)
             RETURN e.id AS id, e.name AS name, e.description AS description,
                    s.content_hash AS scope_content_hash,
-                   e.kill_switch AS kill_switch
+                   e.kill_switch AS kill_switch,
+                   e.session_cookie_names AS session_cookie_names
             LIMIT 1
             """,
             engagement_id=engagement_id,
@@ -70,8 +71,25 @@ class Neo4jGraphState:
             scope_content_hash=ScopeContentHash(row["scope_content_hash"]),
             kill_switch_ttl_seconds=int(kill_switch.get("lease_ttl_seconds", 60)),
             kill_switch_refresh_seconds=int(kill_switch.get("refresh_interval_seconds", 30)),
+            session_cookie_names=tuple(row.get("session_cookie_names") or ()),
             declared_principals=self._fetch_declared_principals(engagement_id),
         )
+
+    def get_session_cookie_names(self, engagement_id: EngagementId) -> tuple[str, ...]:
+        """The engagement's `session_cookie_names` allowlist (ADR-0026 #28).
+
+        Lightweight read for L1 intake (stamped onto the envelope). Empty tuple
+        when unset or the engagement is absent.
+        """
+
+        rows = self._client.execute_read(
+            "MATCH (e:Engagement {id: $engagement_id}) "
+            "RETURN e.session_cookie_names AS names LIMIT 1",
+            engagement_id=engagement_id,
+        )
+        if not rows:
+            return ()
+        return tuple(rows[0].get("names") or ())
 
     def _fetch_declared_principals(
         self, engagement_id: EngagementId
@@ -222,7 +240,9 @@ def _engagement_update(client: Neo4jClient, m: PlannedMutation) -> None:
         """
         MATCH (e:Engagement {id: $id})
         SET e.name = $props.name, e.description = $props.description,
-            e.kill_switch = $props.kill_switch, e.last_seen = $props.last_seen
+            e.kill_switch = $props.kill_switch,
+            e.session_cookie_names = $props.session_cookie_names,
+            e.last_seen = $props.last_seen
         """,
         id=props["id"],
         props=props,

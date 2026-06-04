@@ -23,6 +23,9 @@ class _FakeEngagements:
     def engagement_exists(self, engagement_id: EngagementId) -> bool:
         return engagement_id in self._known
 
+    def get_session_cookie_names(self, engagement_id: EngagementId) -> tuple[str, ...]:
+        return ()
+
 
 class _FakeBlobs:
     def __init__(self) -> None:

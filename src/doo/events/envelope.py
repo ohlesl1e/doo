@@ -79,6 +79,9 @@ class IngestionEnvelope(BaseModel):
     received_at: datetime
     producer_id: str = Field(min_length=1)
     bytes_size: int = Field(ge=0)
+    # Engagement auth-identity config carried L1->L2 so the parser can scope the
+    # cookie AuthContext identity (ADR-0026 #28). Empty = use the shape heuristic.
+    session_cookie_names: tuple[str, ...] = ()
 
     @model_validator(mode="after")
     def _trace_format(self) -> Self:
