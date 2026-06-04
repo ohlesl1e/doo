@@ -40,6 +40,7 @@ from doo.infra.neo4j_driver import Neo4jClient
 from doo.infra.streams import L3_EVENTS_STREAM, StreamClient
 from doo.observability.ids import new_span_id, new_trace_id
 from doo.observability.logging import bind_correlation, get_logger
+from doo.ontology.identity_reconcile import reconcile_observed_identities
 from doo.ontology.promotion import PromotionResult, promote_values
 from doo.ontology.resolve import (
     commit_parse_failure,
@@ -114,6 +115,10 @@ class FlushResult:
     retracted: int = 0
     observed_values: int = 0
     yielded_value_edges: int = 0
+    # ADR-0029: synthetic discovered Principals upgraded from observed-response
+    # identity, and synthetic Principals left orphaned (retracted) by that upgrade.
+    observed_identity_upgrades: int = 0
+    principals_retracted: int = 0
 
 
 class CommitOrchestrator:
@@ -311,6 +316,21 @@ class CommitOrchestrator:
             observed_values += len(promotion.promoted)
             yielded_value_edges += promotion.edges
 
+        # --- ADR-0029: upgrade synthetic discovered Principals from observed
+        # response identity (headers/self-endpoint bodies), collapsing reissued
+        # opaque credentials for one actor. ---
+        identity_upgrades = principals_retracted = 0
+        for engagement_id in sorted(engagements):
+            now = datetime.now(UTC)
+            reconcile = reconcile_observed_identities(
+                self._neo4j,
+                engagement_id=engagement_id,
+                observed_at=now,
+                ingested_at=now,
+            )
+            identity_upgrades += reconcile.upgrades
+            principals_retracted += reconcile.retracted
+
         if cohorts or observed_values:
             log.info(
                 "flush.applied",
@@ -320,6 +340,8 @@ class CommitOrchestrator:
                 retracted=retracted,
                 observed_values=observed_values,
                 yielded_value_edges=yielded_value_edges,
+                observed_identity_upgrades=identity_upgrades,
+                principals_retracted=principals_retracted,
             )
         return FlushResult(
             cohorts=cohorts,
@@ -328,6 +350,8 @@ class CommitOrchestrator:
             retracted=retracted,
             observed_values=observed_values,
             yielded_value_edges=yielded_value_edges,
+            observed_identity_upgrades=identity_upgrades,
+            principals_retracted=principals_retracted,
         )
 
     def _promotion_events(

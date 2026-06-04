@@ -611,6 +611,8 @@ def commit_request_observation(
                       r.value_candidates = $value_candidates,
                       r.server_fingerprint = $server_fingerprint,
                       r.error_excerpt = $error_excerpt,
+                      r.observed_identity_signal = $observed_identity_signal,
+                      r.observed_identity_value = $observed_identity_value,
                       r.envelope_event_id = $envelope_event_id,
                       r += $props
         ON MATCH SET r.last_seen = $props.last_seen
@@ -633,6 +635,12 @@ def commit_request_observation(
         value_candidates=value_candidates,
         server_fingerprint=obs.server_fingerprint,
         error_excerpt=obs.error_excerpt,
+        observed_identity_signal=(
+            obs.observed_identity.signal if obs.observed_identity is not None else None
+        ),
+        observed_identity_value=(
+            obs.observed_identity.value if obs.observed_identity is not None else None
+        ),
         envelope_event_id=str(obs.envelope_event_id),
         host_id=host_node_id,
         auth_context_id=auth_context_node_id,
