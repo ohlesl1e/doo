@@ -37,6 +37,8 @@ import re
 from collections.abc import Iterator
 from dataclasses import dataclass
 
+import jwt
+
 from doo.canonical.values import CandidateKind, hash_for, is_secret_kind
 from doo.ids import Sha256Hex
 
@@ -156,6 +158,24 @@ _BEARER_RE = re.compile(r"\bBearer\s+([A-Za-z0-9._\-+/=]{12,})")
 # alone do not trip it — those are caught by UUID / identifier rules instead).
 _HIGH_ENTROPY_RE = re.compile(r"\b[A-Za-z0-9_\-]{32,}\b")
 
+# JWT identity claims surfaced as values (ADR-0025, broadened ADR-0027). The
+# token itself is the secret (the signature); these decoded claims are not — a
+# user id that leaks in a response token and is later sent as a request input is
+# the textbook leak-to-input pivot. The full identity-claim set (matching the
+# discovered-Principal key priority) → `identifier`, except `email` → `email`
+# (allowlisted).
+_JWT_CLAIM_KINDS: dict[str, CandidateKind] = {
+    "sub": "identifier",
+    "uid": "identifier",
+    "user_id": "identifier",
+    "uuid": "identifier",
+    "_id": "identifier",
+    "username": "identifier",
+    "uname": "identifier",
+    "preferred_username": "identifier",
+    "email": "email",
+}
+
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 
 # JSON field names that carry identifiers (the json-walk:id-fields_v1 rule).
@@ -266,17 +286,71 @@ def _iter_regex(
         )
 
 
+def _decode_jwt_claims(token: str) -> dict[str, object]:
+    """Decode a JWT *without verification* (claim peek only, never a trust call).
+
+    `verify_signature=False`, `verify_exp=False` (ADR-0015 / ADR-0025): we read
+    claims for entity resolution, we never act on the token's authority. Any
+    non-JWT / malformed string yields `{}` rather than raising, so extraction
+    never crashes on a string that merely looked JWT-shaped to the regex.
+    """
+
+    try:
+        decoded = jwt.decode(token, options={"verify_signature": False, "verify_exp": False})
+    except jwt.PyJWTError:
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def _jwt_claim_candidates(
+    token: str, *, byte_start: int, byte_end: int
+) -> Iterator[CandidateOccurrence]:
+    """Emit a JWT's identity claims as (non-secret) value candidates (ADR-0025).
+
+    Only the claims in `_JWT_CLAIM_KINDS` are surfaced, and only when scalar and
+    non-empty. These carry the raw value (not hash-only) — the leak-to-input pivot
+    matches on the value across roles, so the value must survive. A malformed or
+    claim-less token yields nothing.
+    """
+
+    claims = _decode_jwt_claims(token)
+    for claim, kind in _JWT_CLAIM_KINDS.items():
+        raw = claims.get(claim)
+        # Scalar identity claims only; bool is an int subclass but never an id.
+        if not isinstance(raw, str | int) or isinstance(raw, bool):
+            continue
+        value = str(raw).strip()
+        if not value:
+            continue
+        yield _candidate(
+            kind,
+            value,
+            extractor="jwt-claims:identity_v1",
+            byte_start=byte_start,
+            byte_end=byte_end,
+        )
+
+
 def _extract_secrets_from_body(text: str) -> Iterator[CandidateOccurrence]:
     """Secret-shape extractors over the body. Higher-precision shapes run first.
 
-    The generic high-entropy net runs last and skips spans already claimed so a
-    JWT is not also reported as a high-entropy blob.
+    The structured detectors (JWT, AWS, Stripe, Bearer continuation) emit
+    `secret` — high-precision, always-promoted (ADR-0023 shape-allowlist). The
+    generic high-entropy net runs last, skips spans already claimed (so a JWT is
+    not also reported as a high-entropy blob), and emits `opaque_token`
+    (ADR-0024): hash-only for storage but NOT always-promoted — it becomes a node
+    only on multiplicity ≥2 or leak-to-input. This stops a capture full of
+    ETags / content hashes / signed-URL tokens flooding the graph as `secret`s.
     """
 
     claimed: list[tuple[int, int]] = []
 
     def _emit(
-        m: re.Match[str], extractor: str, group: int = 0
+        m: re.Match[str],
+        extractor: str,
+        *,
+        kind: CandidateKind = "secret",
+        group: int = 0,
     ) -> Iterator[CandidateOccurrence]:
         value = m.group(group)
         cs = m.start(group)
@@ -284,11 +358,18 @@ def _extract_secrets_from_body(text: str) -> Iterator[CandidateOccurrence]:
         be = bs + len(value.encode("utf-8"))
         claimed.append((cs, cs + len(value)))
         yield _candidate(
-            "secret", value, extractor=extractor, byte_start=bs, byte_end=be
+            kind, value, extractor=extractor, byte_start=bs, byte_end=be
         )
 
     for m in _JWT_RE.finditer(text):
         yield from _emit(m, "regex:jwt_v1")
+        # ADR-0025: the token's identity claims are values too (sub/email/...),
+        # emitted alongside the hash-only secret. Shares the token's byte span;
+        # the distinct value_hash keeps each claim's semantic key separate.
+        cs = m.start()
+        bs = len(text[:cs].encode("utf-8"))
+        be = bs + len(m.group(0).encode("utf-8"))
+        yield from _jwt_claim_candidates(m.group(0), byte_start=bs, byte_end=be)
     for m in _AWS_ACCESS_KEY_RE.finditer(text):
         yield from _emit(m, "regex:aws_access_key_v1")
     for m in _STRIPE_KEY_RE.finditer(text):
@@ -302,7 +383,7 @@ def _extract_secrets_from_body(text: str) -> Iterator[CandidateOccurrence]:
             continue  # already reported as a more-specific secret shape
         if not _high_entropy(m.group(0)):
             continue
-        yield from _emit(m, "regex:high_entropy_token_v1")
+        yield from _emit(m, "regex:high_entropy_token_v1", kind="opaque_token")
 
 
 def _walk_json_ids(
@@ -427,11 +508,15 @@ _FULL_UUID_RE = re.compile(rf"^(?:{_UUID_RE.pattern})$", re.IGNORECASE)
 def classify_input_kind(name: str, value: str) -> CandidateKind:
     """Classify a request-parameter value's `CandidateKind` (deterministic, #16).
 
-    Secret-conventional names and JWT-shaped values classify as `secret` (their raw
-    value is then hashed, never carried; ADR-0015). Otherwise the value is matched
-    against the same shape rules the response extractors use, anchored to the whole
-    value. Anything unclassified falls back to `identifier` — the high-cardinality
-    catch-all that promotes only on cross-context signal (leak-to-input / multiplicity).
+    Secret-conventional names and the structured shapes (JWT / AWS / Stripe)
+    classify as `secret` (their raw value is then hashed, never carried;
+    ADR-0015). Otherwise the value is matched against the same shape rules the
+    response extractors use, anchored to the whole value. A generic high-entropy
+    blob (no recognised structure) classifies as `opaque_token` (ADR-0024):
+    hash-only for storage but gated for promotion — a high-entropy request param
+    becomes a node only on multiplicity ≥2 or leak-to-input, not on shape.
+    Anything else falls back to `identifier` — the high-cardinality catch-all
+    that promotes only on cross-context signal (leak-to-input / multiplicity).
     """
 
     if name.lower() in _SECRET_INPUT_NAMES and value:
@@ -450,6 +535,8 @@ def classify_input_kind(name: str, value: str) -> CandidateKind:
         return "url"
     if _FULL_UUID_RE.match(value):
         return "identifier"
+    if _HIGH_ENTROPY_RE.fullmatch(value) and _high_entropy(value):
+        return "opaque_token"
     return "identifier"
 
 

@@ -97,8 +97,9 @@ class AuthContextCue(BaseModel):
     api_key_headers: dict[str, Sha256Hex] = Field(default_factory=dict)
     basic_auth_user_hash: Sha256Hex | None = None
     # JWT decoded *without verification* (planner-side claim peek, not a trust
-    # decision). Empty dict when not present or not parseable.
-    bearer_claims: dict[str, str | int | float | bool | None] = Field(default_factory=dict)
+    # decision), from the primary credential — the bearer `Authorization` JWT, or
+    # (ADR-0027) a JWT session cookie. Empty dict when absent / not parseable.
+    identity_claims: dict[str, str | int | float | bool | None] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _anon_vs_credentials(self) -> Self:
@@ -107,7 +108,7 @@ class AuthContextCue(BaseModel):
             or self.cookie_session_hashes
             or self.api_key_headers
             or self.basic_auth_user_hash is not None
-            or self.bearer_claims
+            or self.identity_claims
         )
         if self.is_anonymous and carries_creds:
             raise ValueError("anonymous AuthContextCue must not carry any credential hashes")

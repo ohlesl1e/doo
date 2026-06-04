@@ -17,6 +17,7 @@ import hashlib
 import json
 from collections.abc import Iterator
 
+import jwt as pyjwt
 import pytest
 
 from doo.infra.blobs import BlobClient
@@ -28,6 +29,12 @@ _JWT = (
     "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
     "eyJzdWIiOiJ1c2VyIn0.AbCdEf0123456789AbCdEf0123456789AbCd"
 )
+
+# A generic high-entropy blob (ETag / signed-URL token shape) with no recognised
+# structure -> `opaque_token` (ADR-0024): hash-only for storage but NOT
+# always-promoted. Seen in TWO distinct responses -> promotes on multiplicity ≥2
+# (the only opaque_token that becomes a node here).
+RECURRING_OPAQUE = "Rec0pAqUe7f3aB9cD2eF5gH8iJ1kL4mN6"
 
 
 @pytest.fixture
@@ -132,6 +139,11 @@ def _fixture_har() -> bytes:
     - /widgets (200 JSON): a list whose item ids include LEAKED_UUID (output).
     - /widget-detail?widget_id=LEAKED_UUID (200): the same UUID sent as a request
       query parameter (input) -> leak-to-input pivot across distinct endpoints (#16).
+    - /blobs (200 JSON): 50 distinct high-entropy blobs (ETags / signed-URL
+      tokens) -> all `opaque_token`, each single-occurrence -> 0 ObservedValues
+      (ADR-0024: high entropy no longer floods the graph as `secret`s).
+    - /tok-a and /tok-b (200 JSON): the SAME high-entropy blob in two responses ->
+      `opaque_token` promoting on multiplicity ≥2 (#15), NOT on shape.
     """
 
     # A recurring tenant/account identifier (non-allowlisted `identifier` kind) that
@@ -145,6 +157,11 @@ def _fixture_har() -> bytes:
     # A short list whose item ids include the UUID we later send as an input.
     widgets = json.dumps(
         {"items": [{"id": LEAKED_UUID}, {"id": "99999999-8888-7777-6666-555555555555"}]}
+    )
+    # 50 DISTINCT high-entropy blobs (mixed-class, len >= 32) in one response: each
+    # is an opaque_token seen once -> none promotes (the ADR-0024 anti-flood case).
+    distinct_blobs = json.dumps(
+        {"etags": [f"Bl0b{i:02d}Zz9Yw8Vu7Ts6Rq5Po4Nm3Lk2Ji1Hg" for i in range(50)]}
     )
     entries = [
         _entry(
@@ -197,6 +214,21 @@ def _fixture_har() -> bytes:
             minute=0, second=9,
             query=[{"name": "widget_id", "value": LEAKED_UUID}],
         ),
+        _entry(
+            "https://api.example.com/blobs",
+            minute=0, second=10, status=200, ctype="application/json",
+            body=distinct_blobs,
+        ),
+        _entry(
+            "https://api.example.com/tok-a",
+            minute=0, second=11, status=200, ctype="application/json",
+            body=json.dumps({"sig": RECURRING_OPAQUE}),
+        ),
+        _entry(
+            "https://api.example.com/tok-b",
+            minute=0, second=12, status=200, ctype="application/json",
+            body=json.dumps({"sig": RECURRING_OPAQUE}),
+        ),
     ]
     return json.dumps({"log": {"version": "1.2", "entries": entries}}).encode()
 
@@ -215,18 +247,21 @@ def test_observed_value_promotion_end_to_end(
         filename="observed_values.har",
     )
 
-    # Zero ResponseArtifacts (retired). 10 RequestObservations.
+    # Zero ResponseArtifacts (retired). 13 RequestObservations.
     assert _count(neo4j_client, "ResponseArtifact", eid) == 0
-    assert _count(neo4j_client, "RequestObservation", eid) == 10
+    assert _count(neo4j_client, "RequestObservation", eid) == 13
 
-    # Five ObservedValues promote: internal-billing.corp.example,
+    # Six ObservedValues promote: internal-billing.corp.example,
     # shared.internal.example (deduped across /a and /b), the JWT secret, the
-    # recurring account_id (multiplicity >=2 across /x and /y, #15), and the
+    # recurring account_id (multiplicity >=2 across /x and /y, #15), the
     # LEAKED_UUID (leak-to-input across /widgets output + /widget-detail input,
-    # #16). The 100 list UUIDs do NOT promote (the 277k collapse), the solo
-    # account_id seen in one response does NOT promote (multiplicity 1), and the
-    # second /widgets UUID seen only once as an output does NOT promote.
-    assert _count(neo4j_client, "ObservedValue", eid) == 5
+    # #16), and the RECURRING_OPAQUE token (opaque_token promoting on multiplicity
+    # >=2 across /tok-a and /tok-b, NOT on shape; ADR-0024). The 100 list UUIDs do
+    # NOT promote (the 277k collapse), the solo account_id seen in one response
+    # does NOT promote (multiplicity 1), the second /widgets UUID seen only once as
+    # an output does NOT promote, and the 50 distinct /blobs opaque_tokens do NOT
+    # promote (high entropy no longer floods the graph as secrets).
+    assert _count(neo4j_client, "ObservedValue", eid) == 6
     kinds = neo4j_client.execute_read(
         "MATCH (v:ObservedValue {engagement_id: $eid}) RETURN v.kind AS k, count(*) AS c "
         "ORDER BY k",
@@ -236,7 +271,35 @@ def test_observed_value_promotion_end_to_end(
         "internal_hostname": 2,
         "identifier": 2,
         "secret": 1,
+        "opaque_token": 1,
     }
+
+    # ADR-0024: the 50 distinct high-entropy /blobs opaque_tokens produce ZERO
+    # ObservedValues (single-occurrence, not on the shape-allowlist). A capture
+    # full of ETags / signed-URL tokens no longer floods the graph.
+    blob_nodes = neo4j_client.execute_read(
+        "MATCH (v:ObservedValue {engagement_id: $eid, kind: 'opaque_token'}) "
+        "RETURN count(v) AS c, collect(v.value_hash) AS hashes",
+        eid=eid,
+    )
+    assert blob_nodes[0]["c"] == 1  # only the recurring one, never the 50 distinct
+
+    # The recurring opaque_token promotes hash-only (ADR-0015): value null, hash +
+    # preview set, and exactly TWO YIELDED_VALUE edges (one per /tok-* response).
+    opaque = neo4j_client.execute_read(
+        "MATCH (r:RequestObservation {engagement_id: $eid})-[y:YIELDED_VALUE]->"
+        "(v:ObservedValue {engagement_id: $eid, kind: 'opaque_token'}) "
+        "RETURN count(DISTINCT v) AS vc, count(y) AS edges, "
+        "       collect(DISTINCT v.value)[0] AS val, "
+        "       collect(DISTINCT v.value_hash)[0] AS vh, "
+        "       collect(DISTINCT v.value_preview)[0] AS prev",
+        eid=eid,
+    )
+    assert opaque[0]["vc"] == 1
+    assert opaque[0]["edges"] == 2  # multiplicity >=2 across /tok-a and /tok-b
+    assert opaque[0]["val"] is None  # hash-only (ADR-0015)
+    assert opaque[0]["vh"] == hashlib.sha256(RECURRING_OPAQUE.encode()).hexdigest()
+    assert opaque[0]["prev"] == RECURRING_OPAQUE[:8]
 
     # Leak-to-input pivot (#16): LEAKED_UUID promotes to ONE ObservedValue with a
     # YIELDED_VALUE edge from the producing /widgets response and a SENT_VALUE edge
@@ -336,6 +399,69 @@ def test_observed_value_promotion_end_to_end(
     )
     blob = json.dumps([n["props"] for n in nodes], default=str)
     assert _JWT not in blob
+    # The raw opaque token likewise lands in no node property (hash-only, ADR-0015).
+    assert RECURRING_OPAQUE not in blob
+
+
+def test_jwt_sub_leaks_to_input_promotes_one_observed_value(
+    neo4j_client, redis_client, blob_client
+) -> None:
+    """ADR-0025 + ADR-0023: a JWT `sub` that surfaces in a response (decoded as an
+    `identifier` value) and is later sent as a request input promotes to ONE
+    `ObservedValue` carrying both a `YIELDED_VALUE` (producer) and a `SENT_VALUE`
+    (consumer) edge — the sub-leaks-to-input pivot. The token stays hash-only."""
+
+    eid = "eng-ov-jwtsub"
+    _seed_engagement(neo4j_client, eid)
+
+    sub = "acct-leak-7"  # not UUID-/high-entropy-shaped -> plain identifier both sides
+    token = pyjwt.encode(
+        {"sub": sub, "email": "leak@corp.example.com", "exp": 4102444800},
+        "e2e-signing-key-at-least-32-bytes-long!!",
+        algorithm="HS256",
+    )
+    entries = [
+        _entry(
+            "https://api.example.com/login",
+            minute=1, second=0, status=200, ctype="application/json",
+            body=json.dumps({"access_token": token}),
+        ),
+        _input_entry(
+            f"https://api.example.com/profile?actor={sub}",
+            minute=1, second=1,
+            query=[{"name": "actor", "value": sub}],
+        ),
+    ]
+    har = json.dumps({"log": {"version": "1.2", "entries": entries}}).encode()
+    _run_pipeline(
+        neo4j=neo4j_client, redis_client=redis_client, blob_client=blob_client,
+        engagement_id=eid, har_bytes=har, filename="jwt_sub_leak.har",
+    )
+
+    pivot = neo4j_client.execute_read(
+        "MATCH (v:ObservedValue {engagement_id: $eid, value: $sub}) "
+        "OPTIONAL MATCH (prod:RequestObservation)-[:YIELDED_VALUE]->(v) "
+        "OPTIONAL MATCH (cons:RequestObservation)-[s:SENT_VALUE]->(v) "
+        "RETURN v.kind AS kind, count(DISTINCT v) AS vc, "
+        "       collect(DISTINCT prod.concrete_path) AS produced, "
+        "       collect(DISTINCT cons.concrete_path) AS consumed, "
+        "       collect(DISTINCT s.parameter_name) AS params",
+        eid=eid,
+        sub=sub,
+    )
+    assert pivot[0]["vc"] == 1
+    assert pivot[0]["kind"] == "identifier"
+    assert pivot[0]["produced"] == ["/login"]  # decoded from the response JWT claim
+    assert pivot[0]["consumed"] == ["/profile"]
+    assert pivot[0]["params"] == ["actor"]
+
+    # The token (and its signature) never lands raw in any node property (ADR-0015).
+    nodes = neo4j_client.execute_read(
+        "MATCH (n {engagement_id: $eid}) RETURN properties(n) AS props", eid=eid
+    )
+    blob = json.dumps([n["props"] for n in nodes], default=str)
+    assert token not in blob
+    assert token.split(".")[2] not in blob
 
 
 def test_observed_value_reingest_is_idempotent(
@@ -353,17 +479,19 @@ def test_observed_value_reingest_is_idempotent(
             filename="observed_values.har",
         )
     # Re-ingest adds no new ObservedValues or edges, and does not double-count the
-    # multiplicity signal (the recurring account_id is still ONE node, 2 edges) nor
-    # the leak-to-input pivot (LEAKED_UUID is still ONE node, 1 YIELDED + 1 SENT).
-    assert _count(neo4j_client, "ObservedValue", eid) == 5
+    # multiplicity signal (the recurring account_id / opaque token are each still
+    # ONE node, 2 edges) nor the leak-to-input pivot (LEAKED_UUID is still ONE node,
+    # 1 YIELDED + 1 SENT).
+    assert _count(neo4j_client, "ObservedValue", eid) == 6
     yielded = neo4j_client.execute_read(
         "MATCH (:RequestObservation {engagement_id: $eid})-[y:YIELDED_VALUE]->"
         "(:ObservedValue {engagement_id: $eid}) RETURN count(y) AS c",
         eid=eid,
     )
     # billing(1) + shared(2) + jwt(1) + recurring(2) + leaked-uuid(2: json-walk id
-    # field + uuid regex, two distinct locations on the /widgets response).
-    assert yielded[0]["c"] == 8
+    # field + uuid regex, two distinct locations on the /widgets response) +
+    # recurring opaque_token(2: one YIELDED from each of /tok-a, /tok-b).
+    assert yielded[0]["c"] == 10
     sent = neo4j_client.execute_read(
         "MATCH (:RequestObservation {engagement_id: $eid})-[s:SENT_VALUE]->"
         "(:ObservedValue {engagement_id: $eid}) RETURN count(s) AS c",

@@ -62,6 +62,14 @@ class EngagementChecker(Protocol):
 
     def engagement_exists(self, engagement_id: EngagementId) -> bool: ...
 
+    def get_session_cookie_names(self, engagement_id: EngagementId) -> tuple[str, ...]:
+        """The engagement's configured session-cookie allowlist (ADR-0026 #28).
+
+        Empty tuple when none configured (the parser then uses the shape
+        heuristic). Read at L1 so it travels on the envelope to L2.
+        """
+        ...
+
 
 class BlobStore(Protocol):
     """Duck-type for the blob client surface intake needs."""
@@ -123,6 +131,7 @@ def ingest_har(
         blob_sha256 = sha256_hex(data)
         blob_ref = deps.blobs.put_har(engagement_id, blob_sha256, data)
         idempotency_key = compute_idempotency_key(HAR_SOURCE, blob_sha256, engagement_id)
+        session_cookie_names = deps.engagements.get_session_cookie_names(engagement_id)
 
         envelope = IngestionEnvelope(
             event_id=uuid4(),
@@ -138,6 +147,7 @@ def ingest_har(
             received_at=datetime.now(UTC),
             producer_id=PRODUCER_ID,
             bytes_size=len(data),
+            session_cookie_names=session_cookie_names,
         )
         message_id = deps.streams.publish(
             INGEST_STREAM, envelope.model_dump(mode="json")

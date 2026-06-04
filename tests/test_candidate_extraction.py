@@ -16,6 +16,8 @@ import hashlib
 from datetime import UTC, datetime
 from uuid import uuid4
 
+import jwt as pyjwt
+
 from doo.canonical.value_objects import BlobRef
 from doo.canonical.values import hash_for
 from doo.events.envelope import IngestionEnvelope
@@ -130,12 +132,147 @@ def test_jwt_is_secret_kind_hash_preview_no_raw_value() -> None:
     assert SESSION_JWT not in repr(jwt)
 
 
+_CLAIM_SK = "claims-signing-key-at-least-32-bytes-long!!"
+
+
+def test_jwt_claims_emit_sub_identifier_and_email_alongside_secret() -> None:
+    """ADR-0025: a JWT yields the hash-only `secret` AND value candidates for its
+    identity claims — `sub` -> identifier, `email` -> email — carrying raw values."""
+
+    token = pyjwt.encode(
+        {"sub": "user-42", "email": "alice@corp.example.com", "exp": 4102444800},
+        _CLAIM_SK,
+        algorithm="HS256",
+    )
+    cands = extract_candidates(
+        f'{{"access_token": "{token}"}}'.encode(), content_type="application/json"
+    )
+
+    # The token is still a hash-only secret.
+    secret = next(c for c in cands if c.extractor == "regex:jwt_v1")
+    assert secret.kind == "secret"
+    assert secret.value is None
+
+    claims = [c for c in cands if c.extractor == "jwt-claims:identity_v1"]
+    sub = next(c for c in claims if c.kind == "identifier")
+    email = next(c for c in claims if c.kind == "email")
+    # Claims are non-secret: raw value carried (the leak-to-input pivot needs it).
+    assert sub.value == "user-42"
+    assert sub.value_hash == hash_for("identifier", "user-42")
+    assert email.value == "alice@corp.example.com"
+    assert email.role == "output"
+    # No raw token bytes ride along on a claim candidate.
+    assert token not in repr(sub)
+    assert token not in repr(email)
+
+
+def test_jwt_without_sub_emits_no_sub_candidate() -> None:
+    token = pyjwt.encode(
+        {"email": "bob@corp.example.com", "exp": 4102444800}, _CLAIM_SK, algorithm="HS256"
+    )
+    cands = extract_candidates(
+        f'{{"id_token": "{token}"}}'.encode(), content_type="application/json"
+    )
+    claims = [c for c in cands if c.extractor == "jwt-claims:identity_v1"]
+    assert {c.kind for c in claims} == {"email"}
+    assert all(c.kind != "identifier" for c in claims)
+
+
+def test_jwt_broadened_identity_claims_emit_identifier_values() -> None:
+    """ADR-0027: the broadened claim set (uid / _id / username / …) emits
+    `identifier` candidates alongside the hash-only secret."""
+
+    token = pyjwt.encode(
+        {"uid": "u-7", "_id": "507f1f77bcf86cd799439011", "username": "carol", "exp": 4102444800},
+        _CLAIM_SK,
+        algorithm="HS256",
+    )
+    cands = extract_candidates(
+        f'{{"access_token": "{token}"}}'.encode(), content_type="application/json"
+    )
+    claim_values = {c.value for c in cands if c.extractor == "jwt-claims:identity_v1"}
+    assert {"u-7", "507f1f77bcf86cd799439011", "carol"} <= claim_values
+    assert all(
+        c.kind == "identifier"
+        for c in cands
+        if c.extractor == "jwt-claims:identity_v1"
+    )
+
+
+def test_malformed_jwt_does_not_crash_extraction() -> None:
+    # Matches the JWT regex (eyJ + three base64url segments) but the header/payload
+    # are not valid base64url JSON, so the decode must fail closed, not raise.
+    malformed = "eyJBBBBBBBB.eyJCCCCCCCC.DDDDDDDDDD"
+    cands = extract_candidates(
+        f'{{"token": "{malformed}"}}'.encode(), content_type="application/json"
+    )
+    # The secret candidate is still produced; no claim candidates, no exception.
+    assert any(c.extractor == "regex:jwt_v1" for c in cands)
+    assert not [c for c in cands if c.extractor == "jwt-claims:identity_v1"]
+
+
 def test_aws_key_is_secret_kind() -> None:
     cands = extract_candidates(b"aws_key=AKIAIOSFODNN7EXAMPLE", content_type="text/plain")
     secret = next(c for c in cands if c.extractor == "regex:aws_access_key_v1")
     assert secret.kind == "secret"
     assert secret.value is None
     assert secret.value_hash == hashlib.sha256(AWS_KEY.encode()).hexdigest()
+
+
+def test_generic_high_entropy_blob_is_opaque_token_not_secret() -> None:
+    # A long base64url/hex blob with no recognised structure (an ETag / signed-URL
+    # token) is `opaque_token` (ADR-0024): hash-only for storage but not promoted on
+    # shape. It must NOT be classified `secret`.
+    blob = "Ab3Cd9Ef2Gh5Ij8Kl1Mn4Op7Qr0St6Uv"  # 33 chars, mixed classes
+    cands = extract_candidates(
+        f'{{"etag": "{blob}"}}'.encode(), content_type="application/json"
+    )
+    tok = next(c for c in cands if c.extractor == "regex:high_entropy_token_v1")
+    assert tok.kind == "opaque_token"
+    # Still hash-only for storage (ADR-0015): no raw value, hash + preview carried.
+    assert tok.is_secret  # secret-for-storage predicate
+    assert tok.value is None
+    assert tok.value_hash == hashlib.sha256(blob.encode()).hexdigest()
+    assert tok.value_preview == blob[:8]
+    assert blob not in repr(tok)
+    # No structured detector mislabels it as `secret`.
+    assert not any(c.kind == "secret" for c in cands)
+
+
+def test_structured_secrets_stay_secret_not_opaque_token() -> None:
+    # JWT, AWS, Stripe keep emitting `secret` (the always-promoted shape-allowlist).
+    jwt = extract_candidates(
+        f'{{"t": "{SESSION_JWT}"}}'.encode(), content_type="application/json"
+    )
+    assert next(c for c in jwt if c.extractor == "regex:jwt_v1").kind == "secret"
+    aws = extract_candidates(b"AKIAIOSFODNN7EXAMPLE", content_type="text/plain")
+    assert next(c for c in aws if c.extractor == "regex:aws_access_key_v1").kind == "secret"
+    stripe = extract_candidates(
+        b"sk_live_abc123ABC456def789X", content_type="text/plain"
+    )
+    s = next(c for c in stripe if c.extractor == "regex:stripe_key_v1")
+    assert s.kind == "secret"
+
+
+def test_high_entropy_request_param_input_is_opaque_token() -> None:
+    # classify_input_kind maps a high-entropy request param to `opaque_token`
+    # (ADR-0024): hash-only, gated for promotion (not on shape).
+    blob = "Zx9Yw8Vu7Ts6Rq5Po4Nm3Lk2Ji1Hg0Fe"
+    c = extract_input_candidate("sig", blob, extractor="request-param:query_v1")
+    assert c.kind == "opaque_token"
+    assert c.role == "input"
+    assert c.is_secret  # secret-for-storage
+    assert c.value is None
+    assert c.value_hash == hash_for("opaque_token", blob)
+    assert c.value_preview == blob[:8]
+    assert blob not in repr(c)
+
+
+def test_plain_identifier_input_stays_identifier_not_opaque_token() -> None:
+    # A non-high-entropy param value (a slug / plain id) is still `identifier`, not
+    # opaque_token — the high-entropy gate requires mixed character classes.
+    c = extract_input_candidate("page", "next-page", extractor="request-param:query_v1")
+    assert c.kind == "identifier"
 
 
 def test_extract_candidates_does_not_return_diagnostics() -> None:

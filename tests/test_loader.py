@@ -56,6 +56,7 @@ class FakeGraphState:
             scope_content_hash=base.scope_content_hash,
             kill_switch_ttl_seconds=base.kill_switch_ttl_seconds,
             kill_switch_refresh_seconds=base.kill_switch_refresh_seconds,
+            session_cookie_names=base.session_cookie_names,
             declared_principals=dict(self.principals.get(engagement_id, {})),
         )
 
@@ -116,6 +117,7 @@ class FakeGraphState:
                     kill_switch_refresh_seconds=m.properties["kill_switch"][
                         "refresh_interval_seconds"
                     ],
+                    session_cookie_names=tuple(m.properties.get("session_cookie_names") or ()),
                 )
             elif m.kind == "engagement_rebind_scope":
                 eid = m.properties["engagement_id"]
@@ -127,6 +129,7 @@ class FakeGraphState:
                     scope_content_hash=m.properties["new_scope_content_hash"],
                     kill_switch_ttl_seconds=prev.kill_switch_ttl_seconds,
                     kill_switch_refresh_seconds=prev.kill_switch_refresh_seconds,
+                    session_cookie_names=prev.session_cookie_names,
                 )
             elif m.kind == "engagement_update":
                 eid = m.properties["id"]
@@ -140,6 +143,11 @@ class FakeGraphState:
                     kill_switch_ttl_seconds=ks.get("lease_ttl_seconds", prev.kill_switch_ttl_seconds),
                     kill_switch_refresh_seconds=ks.get(
                         "refresh_interval_seconds", prev.kill_switch_refresh_seconds
+                    ),
+                    session_cookie_names=tuple(
+                        m.properties.get("session_cookie_names")
+                        if m.properties.get("session_cookie_names") is not None
+                        else prev.session_cookie_names
                     ),
                 )
 
@@ -187,6 +195,41 @@ def test_loader_is_noop_on_identical_reload() -> None:
     assert result.noop
     assert not result.created
     assert result.mutations == ()
+
+
+def test_config_accepts_session_cookie_names_and_defaults_empty() -> None:
+    # Default: no auth block → empty allowlist.
+    assert _build_config().auth.session_cookie_names == ()
+    # Explicit list parses (and a YAML list coerces to a tuple).
+    d = _base_config_dict()
+    d["auth"] = {"session_cookie_names": ["token", "sid"]}
+    assert _build_config(d).auth.session_cookie_names == ("token", "sid")
+
+
+def test_loader_session_cookie_names_round_trips_and_reload_is_noop() -> None:
+    state = FakeGraphState()
+    d = _base_config_dict()
+    d["auth"] = {"session_cookie_names": ["token"]}
+    config = _build_config(d)
+    load_engagement(config, state)
+    # The value was stored on the engagement_create mutation…
+    create = next(m for m in state.applied if m.kind == "engagement_create")
+    assert create.properties["session_cookie_names"] == ["token"]
+    # …and an identical reload is a noop (the field round-trips through the diff).
+    result = load_engagement(config, state)
+    assert result.noop
+    assert result.mutations == ()
+
+
+def test_loader_session_cookie_names_change_is_material() -> None:
+    state = FakeGraphState()
+    load_engagement(_build_config(), state)  # starts with empty allowlist
+    d2 = _base_config_dict()
+    d2["auth"] = {"session_cookie_names": ["token"]}
+    result = load_engagement(_build_config(d2), state, apply=True)
+    assert not result.noop
+    update = next(m for m in result.mutations if m.kind == "engagement_update")
+    assert update.properties["session_cookie_names"] == ["token"]
 
 
 def test_loader_applies_cosmetic_change_silently() -> None:

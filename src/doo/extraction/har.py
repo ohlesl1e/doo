@@ -33,10 +33,11 @@ from datetime import UTC, datetime
 from email.parser import BytesParser
 from email.policy import default as default_email_policy
 from typing import Protocol
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 import jwt
 
+from doo.canonical.cookies import cookie_feeds_identity
 from doo.canonical.identity import (
     canonicalize_host,
     canonicalize_path,
@@ -202,7 +203,14 @@ def parse_har(
 
     entries = log["entries"]
     for index, entry in enumerate(entries):
-        yield from _parse_entry(entry, index, envelope, ingested_at, body_uploader)
+        yield from _parse_entry(
+            entry,
+            index,
+            envelope,
+            ingested_at,
+            body_uploader,
+            session_cookie_names=envelope.session_cookie_names,
+        )
 
 
 def _parse_entry(
@@ -211,6 +219,8 @@ def _parse_entry(
     envelope: IngestionEnvelope,
     ingested_at: datetime,
     body_uploader: BodyUploader | None,
+    *,
+    session_cookie_names: tuple[str, ...] = (),
 ) -> Iterator[L2Event]:
     """Parse one HAR entry into a `RequestObservation` with inline value candidates.
 
@@ -246,7 +256,9 @@ def _parse_entry(
 
         host_ref, concrete_path, query_string = _split_url(url)
         query_params = _query_parameters(request, query_string)
-        auth_context_cue = extract_auth_context_cue(request)
+        auth_context_cue = extract_auth_context_cue(
+            request, session_cookie_names=session_cookie_names
+        )
 
         response = entry.get("response")
         response_status, response_size = _response_shape(response)
@@ -406,8 +418,32 @@ def _header_map(request: dict[str, object]) -> dict[str, str]:
     return out
 
 
+def _normalize_cookie_value(value: str) -> str:
+    """Normalise a cookie value: percent-decode, then strip the RFC 6265 `DQUOTE`
+    wrapper.
+
+    RFC 6265's `cookie-octet` excludes `DQUOTE`/comma/semicolon, so an app that
+    needs to send such content (e.g. a *quoted* JWT) percent-encodes it — a real
+    capture carried its session JWT as `%22eyJ…%22`. Both the encoding and the
+    surrounding quotes are transport syntax, not credential material: leaving them
+    on breaks JWT claim decoding (ADR-0027) and splits an otherwise-identical
+    credential into distinct `auth_hash`es. Decode, then remove one matching
+    leading+trailing `"` pair.
+    """
+
+    decoded = unquote(value)
+    if len(decoded) >= 2 and decoded[0] == '"' and decoded[-1] == '"':
+        return decoded[1:-1]
+    return decoded
+
+
 def _cookie_pairs(request: dict[str, object]) -> list[tuple[str, str]]:
-    """`(name, value)` cookie pairs from a HAR request's `cookies` array."""
+    """`(name, value)` cookie pairs from a HAR request's `cookies` array.
+
+    Cookie values are normalised (percent-decoded + RFC 6265 `DQUOTE` wrapper
+    stripped) so a quoted/encoded credential hashes and decodes the same as its
+    bare form.
+    """
 
     out: list[tuple[str, str]] = []
     raw = request.get("cookies")
@@ -418,7 +454,7 @@ def _cookie_pairs(request: dict[str, object]) -> list[tuple[str, str]]:
             name = item.get("name")
             value = item.get("value")
             if isinstance(name, str) and name and isinstance(value, str):
-                out.append((name, value))
+                out.append((name, _normalize_cookie_value(value)))
     return out
 
 
@@ -427,7 +463,7 @@ def _decode_jwt_claims(token: str) -> dict[str, str | int | float | bool | None]
 
     Per ADR-0015 / the issue: `verify_signature=False`, `verify_exp=False`. Any
     non-JWT bearer token (opaque, not three base64url segments) yields `{}`.
-    Only scalar claims are kept (the cue's `bearer_claims` type is scalar-valued);
+    Only scalar claims are kept (the cue's `identity_claims` type is scalar-valued);
     structured claims are dropped for the cue.
     """
 
@@ -447,17 +483,25 @@ def _decode_jwt_claims(token: str) -> dict[str, str | int | float | bool | None]
     return claims
 
 
-def extract_auth_context_cue(request: dict[str, object]) -> AuthContextCue:
+def extract_auth_context_cue(
+    request: dict[str, object], *, session_cookie_names: tuple[str, ...] = ()
+) -> AuthContextCue:
     """Extract an `AuthContextCue` from a HAR request, hashing at the L2 boundary.
 
     Per ADR-0015 raw tokens never leave L2: every credential is reduced to a
     sha256 here and the raw bytes are dropped. Detects:
 
     - `Authorization: Bearer <jwt>` -> `bearer_token_hash` + decoded (unverified)
-      `bearer_claims`.
+      `identity_claims`.
     - `Authorization: Basic <b64>` -> hash of the *username only*; the password is
       never carried forward.
-    - cookies -> per-cookie-name value hashes (sorted by name).
+    - cookies -> per-cookie-name value hashes, but only for *session-credential*
+      cookies (ADR-0026): app/UI-state cookies are excluded so they cannot
+      fragment identity. `session_cookie_names`, when set, is the authoritative
+      allowlist; otherwise a value-shape heuristic decides.
+    - a JWT *session cookie* is decoded into `identity_claims` when no bearer JWT
+      did so (ADR-0027), so cookie-authenticated users get the same claim-keyed
+      Principal collapse as bearer users (bearer takes precedence).
     - `X-API-Key`-style headers -> per-header-name value hashes.
 
     When no auth-bearing material is present, returns the anonymous singleton cue
@@ -468,7 +512,7 @@ def extract_auth_context_cue(request: dict[str, object]) -> AuthContextCue:
 
     bearer_token_hash: Sha256Hex | None = None
     basic_auth_user_hash: Sha256Hex | None = None
-    bearer_claims: dict[str, str | int | float | bool | None] = {}
+    identity_claims: dict[str, str | int | float | bool | None] = {}
 
     authorization = headers.get("authorization", "").strip()
     if authorization:
@@ -477,17 +521,34 @@ def extract_auth_context_cue(request: dict[str, object]) -> AuthContextCue:
         credential = credential.strip()
         if scheme_lower == "bearer" and credential:
             bearer_token_hash = compute_auth_hash("bearer", credential)
-            bearer_claims = _decode_jwt_claims(credential)
+            identity_claims = _decode_jwt_claims(credential)
         elif scheme_lower == "basic" and credential:
             username = _basic_auth_username(credential)
             if username is not None:
                 # Hash the username only — the password never leaves L2.
                 basic_auth_user_hash = compute_auth_hash("basic_auth", username)
 
+    # Authoritative engagement allowlist (ADR-0026 #28) when configured; else the
+    # shape heuristic decides which cookies are session credentials.
+    allowlist = frozenset(session_cookie_names) if session_cookie_names else None
     cookie_hashes = tuple(
         compute_auth_hash("cookie", value)
         for _name, value in sorted(_cookie_pairs(request), key=lambda p: p[0])
+        if cookie_feeds_identity(_name, value, allowlist=allowlist)
     )
+
+    # ADR-0027: when no bearer JWT supplied identity claims, decode a JWT *session*
+    # cookie instead — bearer takes precedence. The first session cookie (by name)
+    # that decodes to non-empty claims wins; opaque cookies yield {} and are
+    # skipped. This is what collapses reissued JWT-cookie sessions to one Principal.
+    if not identity_claims:
+        for _name, value in sorted(_cookie_pairs(request), key=lambda p: p[0]):
+            if not cookie_feeds_identity(_name, value, allowlist=allowlist):
+                continue
+            cookie_claims = _decode_jwt_claims(value)
+            if cookie_claims:
+                identity_claims = cookie_claims
+                break
 
     api_key_headers: dict[str, Sha256Hex] = {}
     for name_lower, value in headers.items():
@@ -508,7 +569,7 @@ def extract_auth_context_cue(request: dict[str, object]) -> AuthContextCue:
         cookie_session_hashes=cookie_hashes,
         api_key_headers=api_key_headers,
         basic_auth_user_hash=basic_auth_user_hash,
-        bearer_claims=bearer_claims,
+        identity_claims=identity_claims,
     )
 
 

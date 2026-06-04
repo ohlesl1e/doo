@@ -28,6 +28,9 @@ class _Engagements:
     def engagement_exists(self, engagement_id: EngagementId) -> bool:
         return engagement_id == ENG
 
+    def get_session_cookie_names(self, engagement_id: EngagementId) -> tuple[str, ...]:
+        return ()
+
 
 class _Blobs:
     def __init__(self) -> None:
