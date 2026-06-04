@@ -125,3 +125,20 @@ class AuthContextCue(BaseModel):
             if h is not None and not _SHA256_HEX_RE.match(h):
                 raise ValueError("auth hash must be 64 lowercase hex chars")
         return self
+
+
+class ObservedIdentity(BaseModel):
+    """An actor identity revealed by a *response* (ADR-0029).
+
+    Extracted at L2 from a response the actor's request elicited — an identity
+    response header, or (later) a self-endpoint body claim — and correlated at
+    flush back to the request's `AuthContext` to upgrade a synthetic discovered
+    `Principal`. `signal` is the namespace token for the discovered identity key
+    `discovered:observed:{signal}:{value}` (e.g. the header name `x-user-id`);
+    `value` must be globally unique per user (the merge-safety requirement).
+    """
+
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    signal: str = Field(min_length=1)
+    value: str = Field(min_length=1)

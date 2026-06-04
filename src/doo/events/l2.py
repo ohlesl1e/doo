@@ -23,7 +23,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from doo.canonical.value_objects import AuthContextCue, BlobRef, HostRef
+from doo.canonical.value_objects import AuthContextCue, BlobRef, HostRef, ObservedIdentity
 from doo.canonical.values import CandidateKind, is_secret_kind
 from doo.ids import (
     EngagementId,
@@ -238,6 +238,10 @@ class RequestObservation(L2EventBase):
     value_candidates: tuple[ValueCandidate, ...] = ()
     server_fingerprint: str | None = None
     error_excerpt: str | None = None
+    # ADR-0029: actor identity revealed by this response (an identity header, or a
+    # self-endpoint body claim), correlated at flush to the AuthContext to upgrade
+    # a synthetic discovered Principal. `None` when the response asserts no identity.
+    observed_identity: ObservedIdentity | None = None
 
     @model_validator(mode="after")
     def _validate(self) -> Self:
