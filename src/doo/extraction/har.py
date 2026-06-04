@@ -428,7 +428,7 @@ def _decode_jwt_claims(token: str) -> dict[str, str | int | float | bool | None]
 
     Per ADR-0015 / the issue: `verify_signature=False`, `verify_exp=False`. Any
     non-JWT bearer token (opaque, not three base64url segments) yields `{}`.
-    Only scalar claims are kept (the cue's `bearer_claims` type is scalar-valued);
+    Only scalar claims are kept (the cue's `identity_claims` type is scalar-valued);
     structured claims are dropped for the cue.
     """
 
@@ -455,7 +455,7 @@ def extract_auth_context_cue(request: dict[str, object]) -> AuthContextCue:
     sha256 here and the raw bytes are dropped. Detects:
 
     - `Authorization: Bearer <jwt>` -> `bearer_token_hash` + decoded (unverified)
-      `bearer_claims`.
+      `identity_claims`.
     - `Authorization: Basic <b64>` -> hash of the *username only*; the password is
       never carried forward.
     - cookies -> per-cookie-name value hashes (sorted by name).
@@ -469,7 +469,7 @@ def extract_auth_context_cue(request: dict[str, object]) -> AuthContextCue:
 
     bearer_token_hash: Sha256Hex | None = None
     basic_auth_user_hash: Sha256Hex | None = None
-    bearer_claims: dict[str, str | int | float | bool | None] = {}
+    identity_claims: dict[str, str | int | float | bool | None] = {}
 
     authorization = headers.get("authorization", "").strip()
     if authorization:
@@ -478,7 +478,7 @@ def extract_auth_context_cue(request: dict[str, object]) -> AuthContextCue:
         credential = credential.strip()
         if scheme_lower == "bearer" and credential:
             bearer_token_hash = compute_auth_hash("bearer", credential)
-            bearer_claims = _decode_jwt_claims(credential)
+            identity_claims = _decode_jwt_claims(credential)
         elif scheme_lower == "basic" and credential:
             username = _basic_auth_username(credential)
             if username is not None:
@@ -510,7 +510,7 @@ def extract_auth_context_cue(request: dict[str, object]) -> AuthContextCue:
         cookie_session_hashes=cookie_hashes,
         api_key_headers=api_key_headers,
         basic_auth_user_hash=basic_auth_user_hash,
-        bearer_claims=bearer_claims,
+        identity_claims=identity_claims,
     )
 
 

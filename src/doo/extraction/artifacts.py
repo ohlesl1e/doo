@@ -158,15 +158,22 @@ _BEARER_RE = re.compile(r"\bBearer\s+([A-Za-z0-9._\-+/=]{12,})")
 # alone do not trip it — those are caught by UUID / identifier rules instead).
 _HIGH_ENTROPY_RE = re.compile(r"\b[A-Za-z0-9_\-]{32,}\b")
 
-# JWT identity claims surfaced as values (ADR-0025). The token itself is the
-# secret (the signature); these decoded claims are not — a `sub` that leaks in a
-# response token and is later sent as a request input is the textbook
-# leak-to-input pivot. `sub` -> `identifier` (signal-gated promotion), `email` ->
-# `email` (allowlisted). `preferred_username` is the common OIDC user handle.
+# JWT identity claims surfaced as values (ADR-0025, broadened ADR-0027). The
+# token itself is the secret (the signature); these decoded claims are not — a
+# user id that leaks in a response token and is later sent as a request input is
+# the textbook leak-to-input pivot. The full identity-claim set (matching the
+# discovered-Principal key priority) → `identifier`, except `email` → `email`
+# (allowlisted).
 _JWT_CLAIM_KINDS: dict[str, CandidateKind] = {
     "sub": "identifier",
-    "email": "email",
+    "uid": "identifier",
+    "user_id": "identifier",
+    "uuid": "identifier",
+    "_id": "identifier",
+    "username": "identifier",
+    "uname": "identifier",
     "preferred_username": "identifier",
+    "email": "email",
 }
 
 _HTML_TAG_RE = re.compile(r"<[^>]+>")

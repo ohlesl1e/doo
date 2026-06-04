@@ -34,8 +34,8 @@ def test_bearer_jwt_hash_and_unverified_claims() -> None:
     cue = extract_auth_context_cue(_request(headers=[("Authorization", f"Bearer {BEARER_JWT}")]))
     assert cue.is_anonymous is False
     assert cue.bearer_token_hash == compute_auth_hash("bearer", BEARER_JWT)
-    assert cue.bearer_claims["sub"] == "uuid-aaa"
-    assert cue.bearer_claims["email"] == "a@example.com"
+    assert cue.identity_claims["sub"] == "uuid-aaa"
+    assert cue.identity_claims["email"] == "a@example.com"
     # Raw token bytes never on the cue.
     assert BEARER_JWT not in repr(cue.model_dump())
 
@@ -43,7 +43,7 @@ def test_bearer_jwt_hash_and_unverified_claims() -> None:
 def test_opaque_bearer_token_has_empty_claims() -> None:
     cue = extract_auth_context_cue(_request(headers=[("Authorization", "Bearer opaque-abc123")]))
     assert cue.bearer_token_hash == compute_auth_hash("bearer", "opaque-abc123")
-    assert cue.bearer_claims == {}
+    assert cue.identity_claims == {}
 
 
 def test_basic_auth_hashes_username_only_never_password() -> None:

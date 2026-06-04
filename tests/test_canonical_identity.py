@@ -101,27 +101,82 @@ def test_derive_har_source_id_shape() -> None:
     assert derive_har_source_id(3, "2026-05-01T10:00:00.000Z") == "3|2026-05-01T10:00:00.000Z"
 
 
-# --- discovered Principal identity key (ADR-0025) ---------------------------
+# --- discovered Principal identity key (ADR-0027 claim-priority) -------------
 
 _AUTH_HASH = Sha256Hex("a" * 64)
 
 
-def test_discovered_principal_key_falls_back_to_auth_hash_without_sub() -> None:
-    # No stable signal (opaque / non-JWT bearer) → per-credential key, unchanged.
+def test_discovered_principal_key_falls_back_to_auth_hash_without_claims() -> None:
+    # No claims (opaque / non-JWT credential) → per-credential key, unchanged.
     assert discovered_principal_identity_key(_AUTH_HASH) == f"discovered:{_AUTH_HASH}"
-    assert discovered_principal_identity_key(_AUTH_HASH, jwt_sub=None) == f"discovered:{_AUTH_HASH}"
-
-
-def test_discovered_principal_key_prefers_jwt_sub() -> None:
     assert (
-        discovered_principal_identity_key(_AUTH_HASH, jwt_sub="uuid-aaa")
-        == "discovered:jwt_sub:uuid-aaa"
+        discovered_principal_identity_key(_AUTH_HASH, identity_claims={})
+        == f"discovered:{_AUTH_HASH}"
+    )
+    # Claims present but none in the priority list → still synthetic.
+    assert (
+        discovered_principal_identity_key(_AUTH_HASH, identity_claims={"iat": 1, "scope": "x"})
+        == f"discovered:{_AUTH_HASH}"
+    )
+
+
+def test_discovered_principal_key_namespaces_first_priority_claim() -> None:
+    assert (
+        discovered_principal_identity_key(_AUTH_HASH, identity_claims={"sub": "uuid-aaa"})
+        == "discovered:jwt:sub:uuid-aaa"
+    )
+
+
+def test_discovered_principal_key_falls_through_priority_to_uid() -> None:
+    # `sub` absent → next present claim (`uid`) keys it, namespaced by claim.
+    assert (
+        discovered_principal_identity_key(
+            _AUTH_HASH, identity_claims={"uid": "u-7", "email": "a@x.com"}
+        )
+        == "discovered:jwt:uid:u-7"
+    )
+
+
+def test_discovered_principal_key_prefers_sub_over_lower_claims() -> None:
+    # All present → highest-priority (`sub`) wins deterministically.
+    assert (
+        discovered_principal_identity_key(
+            _AUTH_HASH, identity_claims={"email": "a@x.com", "uid": "u-7", "sub": "s-1"}
+        )
+        == "discovered:jwt:sub:s-1"
+    )
+
+
+def test_discovered_principal_key_lowercases_email_only() -> None:
+    assert (
+        discovered_principal_identity_key(_AUTH_HASH, identity_claims={"email": "Alice@X.COM"})
+        == "discovered:jwt:email:alice@x.com"
+    )
+    # A non-email claim keeps its case.
+    assert (
+        discovered_principal_identity_key(_AUTH_HASH, identity_claims={"username": "Alice"})
+        == "discovered:jwt:username:Alice"
     )
 
 
 def test_discovered_principal_key_converges_across_reissued_tokens() -> None:
-    # Same user (sub), two reissued tokens → two distinct auth_hashes, but one key,
-    # so the discovered Principal collapses to one (ADR-0025).
-    key1 = discovered_principal_identity_key(Sha256Hex("b" * 64), jwt_sub="uuid-aaa")
-    key2 = discovered_principal_identity_key(Sha256Hex("c" * 64), jwt_sub="uuid-aaa")
-    assert key1 == key2 == "discovered:jwt_sub:uuid-aaa"
+    # Same user (same top claim), two reissued tokens → two auth_hashes, one key.
+    key1 = discovered_principal_identity_key(Sha256Hex("b" * 64), identity_claims={"sub": "uuid-aaa"})
+    key2 = discovered_principal_identity_key(Sha256Hex("c" * 64), identity_claims={"sub": "uuid-aaa"})
+    assert key1 == key2 == "discovered:jwt:sub:uuid-aaa"
+
+
+def test_discovered_principal_key_fragments_honestly_on_differing_claims() -> None:
+    # Same user but tokens expose different claims → different (honest) keys, never
+    # a wrong merge.
+    k_sub = discovered_principal_identity_key(_AUTH_HASH, identity_claims={"sub": "x"})
+    k_uid = discovered_principal_identity_key(_AUTH_HASH, identity_claims={"uid": "x"})
+    assert k_sub != k_uid
+
+
+def test_discovered_principal_key_ignores_bool_claim() -> None:
+    # bool is an int subclass but is never an identifier.
+    assert (
+        discovered_principal_identity_key(_AUTH_HASH, identity_claims={"sub": True, "uid": "u-9"})
+        == "discovered:jwt:uid:u-9"
+    )

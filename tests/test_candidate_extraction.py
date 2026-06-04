@@ -178,6 +178,27 @@ def test_jwt_without_sub_emits_no_sub_candidate() -> None:
     assert all(c.kind != "identifier" for c in claims)
 
 
+def test_jwt_broadened_identity_claims_emit_identifier_values() -> None:
+    """ADR-0027: the broadened claim set (uid / _id / username / …) emits
+    `identifier` candidates alongside the hash-only secret."""
+
+    token = pyjwt.encode(
+        {"uid": "u-7", "_id": "507f1f77bcf86cd799439011", "username": "carol", "exp": 4102444800},
+        _CLAIM_SK,
+        algorithm="HS256",
+    )
+    cands = extract_candidates(
+        f'{{"access_token": "{token}"}}'.encode(), content_type="application/json"
+    )
+    claim_values = {c.value for c in cands if c.extractor == "jwt-claims:identity_v1"}
+    assert {"u-7", "507f1f77bcf86cd799439011", "carol"} <= claim_values
+    assert all(
+        c.kind == "identifier"
+        for c in cands
+        if c.extractor == "jwt-claims:identity_v1"
+    )
+
+
 def test_malformed_jwt_does_not_crash_extraction() -> None:
     # Matches the JWT regex (eyJ + three base64url segments) but the header/payload
     # are not valid base64url JSON, so the decode must fail closed, not raise.

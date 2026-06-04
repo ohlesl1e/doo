@@ -215,12 +215,10 @@ def resolve_auth_context(
         )
 
     # No match → discovered Principal (step 5), low confidence, unmerged. Keyed on
-    # the JWT `sub` when present so a user's reissued tokens collapse to one
-    # Principal (ADR-0025); else on the per-credential auth_hash.
-    cue_sub = cue.bearer_claims.get("sub")
-    p_key = discovered_principal_identity_key(
-        auth_hash, jwt_sub=cue_sub if isinstance(cue_sub, str) and cue_sub else None
-    )
+    # the namespaced claim-priority list (sub → … → email) decoded from the cue's
+    # credential, so a user's reissued tokens collapse to one Principal (ADR-0027);
+    # else on the per-credential auth_hash.
+    p_key = discovered_principal_identity_key(auth_hash, identity_claims=cue.identity_claims)
     p_id = principal_id(engagement_id, p_key)
     _write_discovered_principal_and_auth_context(
         client,
@@ -380,8 +378,8 @@ def _match_declared_principal(
             ks = json.loads(ks)
         parsed.append((row, ks))
 
-    # Priority 1: JWT `sub` claim from the cue's decoded bearer_claims.
-    cue_sub = cue.bearer_claims.get("sub")
+    # Priority 1: JWT `sub` claim from the cue's decoded identity_claims.
+    cue_sub = cue.identity_claims.get("sub")
     if cue_sub is not None:
         for row, ks in parsed:
             if ks.get("jwt_sub") is not None and str(ks["jwt_sub"]) == str(cue_sub):
@@ -406,7 +404,7 @@ def _match_declared_principal(
 
     # Priority 3: email tied to the AuthContext. Slice-1 only surfaces an email if
     # the decoded JWT carries an `email` claim (response-body emails arrive in T6).
-    cue_email = cue.bearer_claims.get("email")
+    cue_email = cue.identity_claims.get("email")
     if cue_email is not None:
         for row, ks in parsed:
             if ks.get("email") is not None and str(ks["email"]) == str(cue_email):
@@ -428,14 +426,16 @@ def _discovered_ac_props(
 
     import json
 
-    exp = cue.bearer_claims.get("exp")
+    exp = cue.identity_claims.get("exp")
     validity_window = None
     if isinstance(exp, int | float):
         validity_window = json.dumps(
             {"exp": datetime.fromtimestamp(float(exp), tz=UTC).isoformat()}, sort_keys=True
         )
     return {
-        "bearer_claims": json.dumps(dict(cue.bearer_claims), sort_keys=True),
+        # Graph property name kept as `bearer_claims` (persisted schema unchanged);
+        # the source is now the source-agnostic cue field (ADR-0027).
+        "bearer_claims": json.dumps(dict(cue.identity_claims), sort_keys=True),
         "validity_window": validity_window,
         "confidence": confidence,
     }

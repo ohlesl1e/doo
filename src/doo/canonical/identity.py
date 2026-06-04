@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+from collections.abc import Mapping
 from urllib.parse import quote, unquote
 
 from doo.canonical.value_objects import AuthContextCue, HostRef, Scheme
@@ -292,18 +293,49 @@ def declared_principal_identity_key(label: str) -> str:
     return f"declared:{label}"
 
 
-def discovered_principal_identity_key(
-    auth_hash: Sha256Hex, *, jwt_sub: str | None = None
-) -> str:
-    """`identity_key` for a discovered (undeclared) Principal (ADR-0010 step 5; ADR-0025).
+# Identity claims that can key a discovered Principal, most-canonical first
+# (ADR-0027). The first present, scalar, non-empty claim wins. Every claim is
+# globally unique per user, so keying on any of them is merge-safe; and any claim
+# is >= the synthetic `auth_hash` fallback for fragmentation (the fallback is
+# itself per-token), so the list is generous by design.
+_IDENTITY_CLAIM_PRIORITY: tuple[str, ...] = (
+    "sub",
+    "uid",
+    "user_id",
+    "uuid",
+    "_id",
+    "username",
+    "uname",
+    "preferred_username",
+    "email",
+)
 
-    Keyed on the **stable JWT `sub`** when one was decoded from the cue, so a
-    user's reissued tokens (new `iat`/`exp`/signature -> new `auth_hash`) collapse
-    to a single discovered Principal. Falls back to the per-credential `auth_hash`
-    only when there is no stable signal (an opaque / non-JWT bearer). Deterministic
-    either way, so re-ingesting the same traffic converges to the same Principal.
+
+def discovered_principal_identity_key(
+    auth_hash: Sha256Hex, *, identity_claims: Mapping[str, object] | None = None
+) -> str:
+    """`identity_key` for a discovered (undeclared) Principal (ADR-0010 step 5; ADR-0027).
+
+    Keyed on a **namespaced claim-priority list**: `discovered:jwt:{claim}:{value}`
+    over the first present of `_IDENTITY_CLAIM_PRIORITY` (`sub` -> ... -> `email`,
+    `email` lowercased). A user's reissued tokens — which expose the same stable
+    claim — therefore collapse to one discovered Principal, while the per-token
+    `auth_hash` differs. Namespacing by claim name keeps the key honest: tokens
+    exposing *different* claims fragment rather than wrongly merge. Falls back to
+    the per-credential `auth_hash` only when no listed claim is present (an opaque
+    / non-JWT credential). Deterministic, so re-ingest converges.
     """
 
-    if jwt_sub:
-        return f"discovered:jwt_sub:{jwt_sub}"
+    if identity_claims:
+        for claim in _IDENTITY_CLAIM_PRIORITY:
+            raw = identity_claims.get(claim)
+            # Scalar identity claims only; bool is an int subclass but never an id.
+            if not isinstance(raw, str | int) or isinstance(raw, bool):
+                continue
+            value = str(raw).strip()
+            if not value:
+                continue
+            if claim == "email":
+                value = value.lower()
+            return f"discovered:jwt:{claim}:{value}"
     return f"discovered:{auth_hash}"
