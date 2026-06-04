@@ -2,6 +2,10 @@
 .claude/worktrees/
 get-docker.sh
 
+# Local, ad-hoc HAR captures + their engagement configs (real-target data;
+# never committed). The directory is a scratch space for graph inspection.
+tests/test_har/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
