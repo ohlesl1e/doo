@@ -37,6 +37,7 @@ from urllib.parse import parse_qsl, urlsplit
 
 import jwt
 
+from doo.canonical.cookies import cookie_feeds_identity
 from doo.canonical.identity import (
     canonicalize_host,
     canonicalize_path,
@@ -487,6 +488,7 @@ def extract_auth_context_cue(request: dict[str, object]) -> AuthContextCue:
     cookie_hashes = tuple(
         compute_auth_hash("cookie", value)
         for _name, value in sorted(_cookie_pairs(request), key=lambda p: p[0])
+        if cookie_feeds_identity(_name, value)
     )
 
     api_key_headers: dict[str, Sha256Hex] = {}
