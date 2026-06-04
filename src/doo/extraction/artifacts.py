@@ -206,6 +206,37 @@ def _high_entropy(s: str) -> bool:
     return has_digit and has_upper and has_lower
 
 
+# Charset anchor for opaque token whole-value matching (base64url / hex chars only).
+_OPAQUE_TOKEN_CHARSET_RE = re.compile(r"^[A-Za-z0-9_\-]+$")
+
+# Inclusive length bounds for opaque-token classification (ADR-0028).
+_OPAQUE_TOKEN_MIN_LEN = 32
+_OPAQUE_TOKEN_MAX_LEN = 512
+
+
+def is_opaque_token_shaped(value: str) -> bool:
+    """True iff `value` is a plausible opaque token (ADR-0028).
+
+    A value is opaque-token-shaped iff ALL of:
+    - Entire value is base64url/hex charset (``[A-Za-z0-9_-]``), no other chars.
+    - Length is in [32, 512] (inclusive).
+    - Mixes upper + lower + digit (rejects all-hex checksums and lowercase slugs).
+    - Does NOT start with ``data:`` (rejects inline data URIs).
+
+    This predicate is shared between the output side (JSON-leaf walk) and the
+    input side (``classify_input_kind``) so both sides apply identical bounds.
+    """
+
+    if value.startswith("data:"):
+        return False
+    length = len(value)
+    if length < _OPAQUE_TOKEN_MIN_LEN or length > _OPAQUE_TOKEN_MAX_LEN:
+        return False
+    if not _OPAQUE_TOKEN_CHARSET_RE.match(value):
+        return False
+    return _high_entropy(value)
+
+
 # --------------------------------------------------------------------------- #
 # Candidate construction (with secret discipline at the construction edge).
 # --------------------------------------------------------------------------- #
@@ -335,15 +366,13 @@ def _extract_secrets_from_body(text: str) -> Iterator[CandidateOccurrence]:
     """Secret-shape extractors over the body. Higher-precision shapes run first.
 
     The structured detectors (JWT, AWS, Stripe, Bearer continuation) emit
-    `secret` — high-precision, always-promoted (ADR-0023 shape-allowlist). The
-    generic high-entropy net runs last, skips spans already claimed (so a JWT is
-    not also reported as a high-entropy blob), and emits `opaque_token`
-    (ADR-0024): hash-only for storage but NOT always-promoted — it becomes a node
-    only on multiplicity ≥2 or leak-to-input. This stops a capture full of
-    ETags / content hashes / signed-URL tokens flooding the graph as `secret`s.
-    """
+    `secret` — high-precision, always-promoted (ADR-0023 shape-allowlist). They
+    run over the whole body text regardless of content-type.
 
-    claimed: list[tuple[int, int]] = []
+    The generic high-entropy body-text sweep was removed in ADR-0028. Generic
+    `opaque_token` extraction now happens only via whole-value classification of
+    JSON leaf strings in `_walk_json_ids`.
+    """
 
     def _emit(
         m: re.Match[str],
@@ -356,7 +385,6 @@ def _extract_secrets_from_body(text: str) -> Iterator[CandidateOccurrence]:
         cs = m.start(group)
         bs = len(text[:cs].encode("utf-8"))
         be = bs + len(value.encode("utf-8"))
-        claimed.append((cs, cs + len(value)))
         yield _candidate(
             kind, value, extractor=extractor, byte_start=bs, byte_end=be
         )
@@ -377,35 +405,50 @@ def _extract_secrets_from_body(text: str) -> Iterator[CandidateOccurrence]:
     for m in _BEARER_RE.finditer(text):
         yield from _emit(m, "regex:bearer_continuation_v1", group=1)
 
-    for m in _HIGH_ENTROPY_RE.finditer(text):
-        cs, ce = m.start(), m.end()
-        if any(cs < c_end and c_start < ce for c_start, c_end in claimed):
-            continue  # already reported as a more-specific secret shape
-        if not _high_entropy(m.group(0)):
-            continue
-        yield from _emit(m, "regex:high_entropy_token_v1", kind="opaque_token")
+    # NOTE: the generic high-entropy body-text sweep (finditer over _HIGH_ENTROPY_RE)
+    # was removed in ADR-0028. opaque_token is now emitted only from whole JSON leaf
+    # values via _walk_json_ids. Structured detectors above still run over the whole
+    # body text.
 
 
 def _walk_json_ids(
     node: object, pointer: str, out: list[CandidateOccurrence]
 ) -> None:
-    """Recurse JSON, emitting an `identifier` candidate for `id` / `*_id` leaves.
+    """Recurse JSON, emitting candidates for ``id``/``*_id`` leaves and opaque tokens.
+
+    For every scalar leaf in the JSON tree:
+
+    - If the **key** matches ``_ID_FIELD_RE`` (``id`` / ``*_id``), emit an
+      ``identifier`` candidate (unchanged from before ADR-0028).
+    - Otherwise, if the leaf is a **string** and the *whole value* passes
+      ``is_opaque_token_shaped``, emit an ``opaque_token`` candidate (ADR-0028).
+      A leaf that qualifies as an id-field is never double-emitted.
 
     The value's byte offset into the body is not recoverable from the parsed
-    structure (json.loads discards positions), so JSON-walk identifiers carry the
-    RFC 6901 `json_pointer` for location instead of byte offsets.
+    structure (json.loads discards positions), so all JSON-walk candidates carry
+    the RFC 6901 ``json_pointer`` for location instead of byte offsets.
     """
 
     if isinstance(node, dict):
         for key, value in node.items():
             child = f"{pointer}/{_rfc6901_escape(str(key))}"
             if isinstance(value, str | int) and not isinstance(value, bool):
+                str_value = str(value)
                 if _ID_FIELD_RE.search(str(key)):
                     out.append(
                         _candidate(
                             "identifier",
-                            str(value),
+                            str_value,
                             extractor="json-walk:id-fields_v1",
+                            json_pointer=child,
+                        )
+                    )
+                elif isinstance(value, str) and is_opaque_token_shaped(value):
+                    out.append(
+                        _candidate(
+                            "opaque_token",
+                            value,
+                            extractor="json-walk:opaque_token_v1",
                             json_pointer=child,
                         )
                     )
@@ -535,7 +578,7 @@ def classify_input_kind(name: str, value: str) -> CandidateKind:
         return "url"
     if _FULL_UUID_RE.match(value):
         return "identifier"
-    if _HIGH_ENTROPY_RE.fullmatch(value) and _high_entropy(value):
+    if is_opaque_token_shaped(value):
         return "opaque_token"
     return "identifier"
 
