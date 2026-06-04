@@ -26,6 +26,7 @@ from doo.extraction.artifacts import (
     extract_candidates,
     extract_diagnostics,
     extract_input_candidate,
+    is_opaque_token_shaped,
 )
 from doo.extraction.har import parse_har
 from doo.ids import BlobKey, EngagementId, IdempotencyKey, Sha256Hex
@@ -221,13 +222,17 @@ def test_aws_key_is_secret_kind() -> None:
 
 def test_generic_high_entropy_blob_is_opaque_token_not_secret() -> None:
     # A long base64url/hex blob with no recognised structure (an ETag / signed-URL
-    # token) is `opaque_token` (ADR-0024): hash-only for storage but not promoted on
-    # shape. It must NOT be classified `secret`.
+    # token) is `opaque_token` (ADR-0024/ADR-0028): hash-only for storage but not
+    # promoted on shape. It must NOT be classified `secret`.
+    # ADR-0028: opaque_token now comes from whole JSON leaf values (json-walk),
+    # not from the body-text substring sweep. The blob must be in [32, 512] and
+    # mixed upper+lower+digit to qualify.
     blob = "Ab3Cd9Ef2Gh5Ij8Kl1Mn4Op7Qr0St6Uv"  # 33 chars, mixed classes
+    assert is_opaque_token_shaped(blob)  # sanity-check the predicate
     cands = extract_candidates(
         f'{{"etag": "{blob}"}}'.encode(), content_type="application/json"
     )
-    tok = next(c for c in cands if c.extractor == "regex:high_entropy_token_v1")
+    tok = next(c for c in cands if c.extractor == "json-walk:opaque_token_v1")
     assert tok.kind == "opaque_token"
     # Still hash-only for storage (ADR-0015): no raw value, hash + preview carried.
     assert tok.is_secret  # secret-for-storage predicate
@@ -237,6 +242,144 @@ def test_generic_high_entropy_blob_is_opaque_token_not_secret() -> None:
     assert blob not in repr(tok)
     # No structured detector mislabels it as `secret`.
     assert not any(c.kind == "secret" for c in cands)
+    # json_pointer is set (ADR-0028: whole-leaf, not byte-offset).
+    assert tok.json_pointer == "/etag"
+
+
+# --------------------------------------------------------------------------- #
+# ADR-0028: is_opaque_token_shaped unit tests.
+# --------------------------------------------------------------------------- #
+
+
+def test_is_opaque_token_shaped_accepts_33_char_mixed_base64() -> None:
+    # A 33-char mixed-class base64url string -> True.
+    assert is_opaque_token_shaped("Ab3Cd9Ef2Gh5Ij8Kl1Mn4Op7Qr0St6Uv")
+
+
+def test_is_opaque_token_shaped_rejects_length_31() -> None:
+    # 31 chars — below the [32, 512] floor.
+    assert not is_opaque_token_shaped("Ab3Cd9Ef2Gh5Ij8Kl1Mn4Op7Qr0St6U")
+
+
+def test_is_opaque_token_shaped_rejects_length_600() -> None:
+    # 600-char value — above the 512 ceiling.
+    value = "Ab3C" * 150  # 600 chars, mixed classes
+    assert len(value) == 600
+    assert not is_opaque_token_shaped(value)
+
+
+def test_is_opaque_token_shaped_rejects_data_uri() -> None:
+    # data: URI leaves are never opaque tokens.
+    data_uri = "data:image/png;base64," + "Ab3C" * 20  # starts with data:
+    assert not is_opaque_token_shaped(data_uri)
+
+
+def test_is_opaque_token_shaped_rejects_all_hex_md5() -> None:
+    # A 32-hex all-lowercase MD5 hash: no uppercase → not mixed-class.
+    md5 = "d41d8cd98f00b204e9800998ecf8427e"
+    assert len(md5) == 32
+    assert not is_opaque_token_shaped(md5)
+
+
+def test_is_opaque_token_shaped_rejects_lowercase_slug() -> None:
+    # A 32-char all-lowercase slug: no uppercase or digit mixing → rejected.
+    slug = "a" * 32
+    assert not is_opaque_token_shaped(slug)
+
+
+# --------------------------------------------------------------------------- #
+# ADR-0028: output-side whole-leaf extraction.
+# --------------------------------------------------------------------------- #
+
+
+def test_opaque_token_from_json_leaf_bounded_and_pointer_set() -> None:
+    # A JSON body with a bounded mixed-class leaf emits ONE opaque_token from the
+    # JSON walk (not the body sweep), with json_pointer set.
+    blob = "Ab3Cd9Ef2Gh5Ij8Kl1Mn4Op7Qr0St6Uv"  # 33 chars
+    cands = extract_candidates(
+        f'{{"etag": "{blob}"}}'.encode(), content_type="application/json"
+    )
+    toks = [c for c in cands if c.kind == "opaque_token"]
+    assert len(toks) == 1
+    assert toks[0].extractor == "json-walk:opaque_token_v1"
+    assert toks[0].json_pointer == "/etag"
+    assert toks[0].value is None  # hash-only (ADR-0015)
+    assert toks[0].value_hash == hashlib.sha256(blob.encode()).hexdigest()
+
+
+def test_oversized_json_leaf_yields_no_opaque_token() -> None:
+    # A 600-char base64 leaf (e.g. inline PNG data) exceeds the 512-char ceiling and
+    # must NOT produce an opaque_token (the root cause of the 14k noise nodes).
+    big_value = "Ab3C" * 150  # 600 chars, mixed classes
+    assert len(big_value) == 600
+    cands = extract_candidates(
+        f'{{"img": "{big_value}"}}'.encode(), content_type="application/json"
+    )
+    assert not any(c.kind == "opaque_token" for c in cands)
+
+
+def test_non_json_body_with_high_entropy_run_yields_no_opaque_token() -> None:
+    # An HTML (non-JSON) body with a high-entropy run produces NO opaque_token.
+    # opaque_token now comes only from JSON leaf values (ADR-0028).
+    blob = "Ab3Cd9Ef2Gh5Ij8Kl1Mn4Op7Qr0St6Uv"  # 33 chars, would have been swept
+    html_body = f"<html><body>token={blob}</body></html>".encode()
+    cands = extract_candidates(html_body, content_type="text/html")
+    assert not any(c.kind == "opaque_token" for c in cands)
+
+
+def test_id_field_json_leaf_emits_identifier_not_opaque_token() -> None:
+    # A leaf whose key matches *_id stays `identifier` (never double-emitted as
+    # opaque_token, even if the value is opaque-token-shaped).
+    blob = "Ab3Cd9Ef2Gh5Ij8Kl1Mn4Op7Qr0St6Uv"  # 33 chars, would pass is_opaque_token_shaped
+    cands = extract_candidates(
+        f'{{"session_id": "{blob}"}}'.encode(), content_type="application/json"
+    )
+    id_cands = [c for c in cands if c.extractor == "json-walk:id-fields_v1"]
+    opaque_cands = [c for c in cands if c.kind == "opaque_token"]
+    assert len(id_cands) == 1  # emitted as identifier
+    assert len(opaque_cands) == 0  # NOT also emitted as opaque_token
+
+
+def test_jwt_in_any_body_still_yields_secret() -> None:
+    # Structured detectors run over the whole body regardless of content-type.
+    cands = extract_candidates(
+        f"token={SESSION_JWT}".encode(), content_type="text/plain"
+    )
+    assert any(c.extractor == "regex:jwt_v1" and c.kind == "secret" for c in cands)
+
+
+def test_aws_key_in_json_body_still_yields_secret() -> None:
+    cands = extract_candidates(
+        f'{{"key": "{AWS_KEY}"}}'.encode(), content_type="application/json"
+    )
+    assert any(c.extractor == "regex:aws_access_key_v1" and c.kind == "secret" for c in cands)
+
+
+def test_stripe_key_in_text_body_still_yields_secret() -> None:
+    cands = extract_candidates(
+        b"sk_live_abc123ABC456def789X", content_type="text/plain"
+    )
+    assert any(c.extractor == "regex:stripe_key_v1" and c.kind == "secret" for c in cands)
+
+
+# --------------------------------------------------------------------------- #
+# ADR-0028: input side uses is_opaque_token_shaped (length bound + data: guard).
+# --------------------------------------------------------------------------- #
+
+
+def test_classify_input_rejects_oversized_value_as_identifier_not_opaque() -> None:
+    # A 600-char high-entropy value exceeds the 512-char ceiling; classify_input_kind
+    # must fall through to `identifier`, not `opaque_token`.
+    big = "Ab3C" * 150  # 600 chars
+    c = extract_input_candidate("sig", big, extractor="request-param:query_v1")
+    assert c.kind == "identifier"
+
+
+def test_classify_input_rejects_data_uri_value_as_identifier_not_opaque() -> None:
+    # A data: URI input parameter must not classify as opaque_token.
+    data_uri = "data:image/png;base64," + "Ab3C" * 20
+    c = extract_input_candidate("img", data_uri, extractor="request-param:query_v1")
+    assert c.kind != "opaque_token"
 
 
 def test_structured_secrets_stay_secret_not_opaque_token() -> None:
