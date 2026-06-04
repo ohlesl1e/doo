@@ -33,7 +33,7 @@ from datetime import UTC, datetime
 from email.parser import BytesParser
 from email.policy import default as default_email_policy
 from typing import Protocol
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 import jwt
 
@@ -418,8 +418,32 @@ def _header_map(request: dict[str, object]) -> dict[str, str]:
     return out
 
 
+def _normalize_cookie_value(value: str) -> str:
+    """Normalise a cookie value: percent-decode, then strip the RFC 6265 `DQUOTE`
+    wrapper.
+
+    RFC 6265's `cookie-octet` excludes `DQUOTE`/comma/semicolon, so an app that
+    needs to send such content (e.g. a *quoted* JWT) percent-encodes it — a real
+    capture carried its session JWT as `%22eyJ…%22`. Both the encoding and the
+    surrounding quotes are transport syntax, not credential material: leaving them
+    on breaks JWT claim decoding (ADR-0027) and splits an otherwise-identical
+    credential into distinct `auth_hash`es. Decode, then remove one matching
+    leading+trailing `"` pair.
+    """
+
+    decoded = unquote(value)
+    if len(decoded) >= 2 and decoded[0] == '"' and decoded[-1] == '"':
+        return decoded[1:-1]
+    return decoded
+
+
 def _cookie_pairs(request: dict[str, object]) -> list[tuple[str, str]]:
-    """`(name, value)` cookie pairs from a HAR request's `cookies` array."""
+    """`(name, value)` cookie pairs from a HAR request's `cookies` array.
+
+    Cookie values are normalised (percent-decoded + RFC 6265 `DQUOTE` wrapper
+    stripped) so a quoted/encoded credential hashes and decodes the same as its
+    bare form.
+    """
 
     out: list[tuple[str, str]] = []
     raw = request.get("cookies")
@@ -430,7 +454,7 @@ def _cookie_pairs(request: dict[str, object]) -> list[tuple[str, str]]:
             name = item.get("name")
             value = item.get("value")
             if isinstance(name, str) and name and isinstance(value, str):
-                out.append((name, value))
+                out.append((name, _normalize_cookie_value(value)))
     return out
 
 

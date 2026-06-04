@@ -352,6 +352,42 @@ def test_reissued_jwt_cookies_collapse_to_one_discovered_principal(
     assert acs[0]["c"] == 3
 
 
+def test_quoted_jwt_cookies_keyed_on_mongo_id_collapse(neo4j_client) -> None:
+    """Real-capture case (ADR-0027): a DQUOTE-wrapped JWT cookie carrying a Mongo
+    `_id` (no `sub`) — reissued tokens for one `_id` collapse to ONE discovered
+    Principal keyed on `discovered:jwt:_id:{_id}`, one AuthContext per token."""
+
+    eid = "eng-recon-mongoid"
+    _seed_declared_principal(neo4j_client, eid)
+    for i in range(3):
+        token = jwt.encode(
+            {"_id": "6614a9412c25a5000df5d4d6", "iat": 1700000000 + i},
+            SIGNING_KEY,
+            algorithm="HS256",
+        )
+        cue = extract_auth_context_cue(
+            {"headers": [], "cookies": [{"name": "token", "value": f'"{token}"'}]}
+        )
+        assert cue.identity_claims.get("_id") == "6614a9412c25a5000df5d4d6"
+        resolved = _resolve(neo4j_client, eid, cue)
+        assert resolved.unmerged is True
+
+    pcount = neo4j_client.execute_read(
+        "MATCH (p:Principal {engagement_id: $eid, tier: 'discovered'}) "
+        "WHERE p.identity_key = 'discovered:jwt:_id:6614a9412c25a5000df5d4d6' "
+        "RETURN count(p) AS c",
+        eid=eid,
+    )
+    assert pcount[0]["c"] == 1
+    acs = neo4j_client.execute_read(
+        "MATCH (ac:AuthContext {engagement_id: $eid})-[:OF_PRINCIPAL]->"
+        "(p:Principal {identity_key: 'discovered:jwt:_id:6614a9412c25a5000df5d4d6'}) "
+        "RETURN count(ac) AS c",
+        eid=eid,
+    )
+    assert acs[0]["c"] == 3
+
+
 def test_anonymous_singleton_preserved(neo4j_client) -> None:
     eid = "eng-recon-anon"
     _seed_declared_principal(neo4j_client, eid)

@@ -65,6 +65,29 @@ def test_opaque_session_cookie_yields_no_identity_claims() -> None:
     assert cue.identity_claims == {}
 
 
+def test_quoted_jwt_session_cookie_is_decoded() -> None:
+    # RFC 6265 DQUOTE-wrapped credential cookie (e.g. `"eyJ…"`) — the wrapper must
+    # be stripped so the JWT decodes (the real-capture `_id` case).
+    cue = extract_auth_context_cue(_request(cookies=[("token", f'"{COOKIE_JWT}"')]))
+    assert cue.identity_claims["sub"] == "uuid-cookie"
+
+
+def test_percent_encoded_quoted_jwt_cookie_is_decoded() -> None:
+    # The real-capture form: a percent-encoded, quote-wrapped JWT (`%22eyJ…%22`).
+    # cookie-octet forbids a literal DQUOTE, so apps encode it; we must decode then
+    # unwrap before the JWT parses.
+    cue = extract_auth_context_cue(_request(cookies=[("token", f"%22{COOKIE_JWT}%22")]))
+    assert cue.identity_claims["sub"] == "uuid-cookie"
+
+
+def test_quoted_and_unquoted_cookie_hash_identically() -> None:
+    # The DQUOTE wrapper is transport syntax, not credential material, so a quoted
+    # and unquoted same value collapse to one AuthContext identity.
+    quoted = extract_auth_context_cue(_request(cookies=[("session", '"abc123XYZ9012345"')]))
+    bare = extract_auth_context_cue(_request(cookies=[("session", "abc123XYZ9012345")]))
+    assert quoted.cookie_session_hashes == bare.cookie_session_hashes
+
+
 def test_bearer_jwt_hash_and_unverified_claims() -> None:
     cue = extract_auth_context_cue(_request(headers=[("Authorization", f"Bearer {BEARER_JWT}")]))
     assert cue.is_anonymous is False
