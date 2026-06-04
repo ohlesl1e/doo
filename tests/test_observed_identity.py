@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from doo.extraction.identity_signals import extract_observed_identity_from_headers
+from doo.extraction.identity_signals import (
+    extract_observed_identity_from_headers,
+    extract_observed_identity_from_self_endpoint_body,
+    is_self_endpoint,
+)
 from doo.ontology.identity_reconcile import choose_observed_identity
 
 # --- header extraction (M1) -------------------------------------------------
@@ -57,3 +61,66 @@ def test_choose_ignores_conflict_on_lower_signal_when_top_is_clean() -> None:
     assert choose_observed_identity(
         [("x-user-id", "alice"), ("x-account-id", "a1"), ("x-account-id", "a2")]
     ) == ("x-user-id", "alice")
+
+
+def test_choose_header_outranks_body() -> None:
+    # A header signal outranks the self-endpoint "body" signal (T-OI1 > T-OI2).
+    assert choose_observed_identity(
+        [("body", "from-body"), ("x-user-id", "from-header")]
+    ) == ("x-user-id", "from-header")
+
+
+# --- self-endpoint path matcher (M2) ----------------------------------------
+
+
+def test_self_endpoint_matches_common_patterns() -> None:
+    for path in ("/me", "/api/wireless/users/me", "/profile", "/whoami", "/account",
+                 "/me/password", "/user/current", "/current-user"):
+        assert is_self_endpoint(path), path
+
+
+def test_self_endpoint_rejects_ordinary_paths() -> None:
+    for path in ("/method", "/readme", "/home", "/api/items", "/accounts/123/orders",
+                 "/messages"):
+        assert not is_self_endpoint(path), path
+
+
+# --- self-endpoint body identity (M1-body) ----------------------------------
+
+
+def test_body_identity_top_level_id() -> None:
+    oi = extract_observed_identity_from_self_endpoint_body(
+        '{"_id": "6614a9412c25a5000df5d4d6", "role": "admin"}', "application/json"
+    )
+    assert oi is not None
+    assert (oi.signal, oi.value) == ("body", "6614a9412c25a5000df5d4d6")
+
+
+def test_body_identity_email_takes_priority() -> None:
+    oi = extract_observed_identity_from_self_endpoint_body(
+        '{"_id": "abc", "email": "alice@x.com"}', "application/json"
+    )
+    assert oi is not None
+    assert oi.value == "alice@x.com"
+
+
+def test_body_identity_from_wrapper_object() -> None:
+    oi = extract_observed_identity_from_self_endpoint_body(
+        '{"data": {"sub": "user-9", "name": "x"}}', "application/json"
+    )
+    assert oi is not None
+    assert oi.value == "user-9"
+
+
+def test_body_identity_non_json_is_none() -> None:
+    assert extract_observed_identity_from_self_endpoint_body("OK", "text/plain") is None
+
+
+def test_body_identity_malformed_json_is_none() -> None:
+    assert extract_observed_identity_from_self_endpoint_body("{not json", "application/json") is None
+
+
+def test_body_identity_no_claim_is_none() -> None:
+    assert extract_observed_identity_from_self_endpoint_body(
+        '{"role": "admin", "mfaEnabled": false}', "application/json"
+    ) is None

@@ -30,8 +30,15 @@ from doo.infra.neo4j_driver import Neo4jClient
 from doo.ontology.resolve import cross_cutting
 
 # Confidence of an observed-identity-keyed discovered Principal: above the
-# synthetic fallback (0.3, ADR-0010 step 5), below a declared match.
-_OBSERVED_CONFIDENCE = 0.6
+# synthetic fallback (0.3, ADR-0010 step 5), below a declared match. A
+# server-asserted header (T-OI1) outranks a self-endpoint body claim (T-OI2).
+_HEADER_CONFIDENCE = 0.6
+_BODY_CONFIDENCE = 0.5
+
+
+def _observed_confidence(signal: str) -> float:
+    return _HEADER_CONFIDENCE if signal in IDENTITY_RESPONSE_HEADERS else _BODY_CONFIDENCE
+
 
 # Signal-priority for choosing among the identities an AuthContext accumulated.
 # Header names rank by IDENTITY_RESPONSE_HEADERS; anything else (future body
@@ -119,7 +126,7 @@ def reconcile_observed_identities(
             source_id=None,
             observed_at=observed_at,
             ingested_at=ingested_at,
-            confidence=_OBSERVED_CONFIDENCE,
+            confidence=_observed_confidence(signal),
         )
         # Re-point this AuthContext from its synthetic Principal onto the
         # observed-identity Principal (ADR-0010 edge re-pointing). Guard the
