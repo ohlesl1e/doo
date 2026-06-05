@@ -318,7 +318,9 @@ def discovered_principal_identity_key(
 
     Keyed on a **namespaced claim-priority list**: `discovered:jwt:{claim}:{value}`
     over the first present of `_IDENTITY_CLAIM_PRIORITY` (`sub` -> ... -> `email`,
-    `email` lowercased). A user's reissued tokens — which expose the same stable
+    `email` lowercased). `sub` is **issuer-scoped** when an `iss` claim is present
+    (`discovered:jwt:sub:{iss}:{sub}`) — OIDC `sub` is unique only within its issuer.
+    A user's reissued tokens — which expose the same stable
     claim — therefore collapse to one discovered Principal, while the per-token
     `auth_hash` differs. Namespacing by claim name keeps the key honest: tokens
     exposing *different* claims fragment rather than wrongly merge. Falls back to
@@ -337,5 +339,13 @@ def discovered_principal_identity_key(
                 continue
             if claim == "email":
                 value = value.lower()
+            if claim == "sub":
+                # OIDC: `sub` is unique only within its issuer (`iss`) — it can even
+                # be pairwise per client. Scope it by `iss` so two IdPs that mint the
+                # same `sub` for different people never merge. No `iss` → bare `sub`
+                # (a single-issuer token), backward-compatible.
+                iss = identity_claims.get("iss")
+                if isinstance(iss, str) and iss.strip():
+                    return f"discovered:jwt:sub:{iss.strip()}:{value}"
             return f"discovered:jwt:{claim}:{value}"
     return f"discovered:{auth_hash}"

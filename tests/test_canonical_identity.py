@@ -127,6 +127,31 @@ def test_discovered_principal_key_namespaces_first_priority_claim() -> None:
     )
 
 
+def test_discovered_principal_key_issuer_scopes_sub() -> None:
+    # OIDC sub is unique only within its issuer.
+    assert (
+        discovered_principal_identity_key(
+            _AUTH_HASH, identity_claims={"sub": "12345", "iss": "https://idp.example"}
+        )
+        == "discovered:jwt:sub:https://idp.example:12345"
+    )
+
+
+def test_discovered_principal_key_same_sub_different_iss_do_not_merge() -> None:
+    # Two IdPs minting the same sub for different people → distinct keys.
+    a = discovered_principal_identity_key(_AUTH_HASH, identity_claims={"sub": "1", "iss": "idp-a"})
+    b = discovered_principal_identity_key(_AUTH_HASH, identity_claims={"sub": "1", "iss": "idp-b"})
+    assert a != b
+
+
+def test_discovered_principal_key_bare_sub_without_iss_unchanged() -> None:
+    # No iss → bare sub key (backward-compatible with single-issuer tokens).
+    assert (
+        discovered_principal_identity_key(_AUTH_HASH, identity_claims={"sub": "uuid-aaa"})
+        == "discovered:jwt:sub:uuid-aaa"
+    )
+
+
 def test_discovered_principal_key_falls_through_priority_to_uid() -> None:
     # `sub` absent → next present claim (`uid`) keys it, namespaced by claim.
     assert (
