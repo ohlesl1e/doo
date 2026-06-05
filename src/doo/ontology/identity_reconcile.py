@@ -30,8 +30,15 @@ from doo.infra.neo4j_driver import Neo4jClient
 from doo.ontology.resolve import cross_cutting
 
 # Confidence of an observed-identity-keyed discovered Principal: above the
-# synthetic fallback (0.3, ADR-0010 step 5), below a declared match.
-_OBSERVED_CONFIDENCE = 0.6
+# synthetic fallback (0.3, ADR-0010 step 5), below a declared match. A
+# server-asserted header (T-OI1) outranks a self-endpoint body claim (T-OI2).
+_HEADER_CONFIDENCE = 0.6
+_BODY_CONFIDENCE = 0.5
+
+
+def _observed_confidence(signal: str) -> float:
+    return _HEADER_CONFIDENCE if signal in IDENTITY_RESPONSE_HEADERS else _BODY_CONFIDENCE
+
 
 # Signal-priority for choosing among the identities an AuthContext accumulated.
 # Header names rank by IDENTITY_RESPONSE_HEADERS; anything else (future body
@@ -45,6 +52,7 @@ class ReconcileResult:
 
     upgrades: int = 0
     retracted: int = 0
+    aliases: int = 0
 
 
 def choose_observed_identity(
@@ -82,6 +90,16 @@ _SYNTHETIC_PRINCIPAL_WHERE = (
 )
 
 
+def _is_synthetic_key(identity_key: str) -> bool:
+    """True if `identity_key` is the synthetic `discovered:{auth_hash}` form."""
+
+    return (
+        identity_key.startswith("discovered:")
+        and not identity_key.startswith("discovered:jwt:")
+        and not identity_key.startswith("discovered:observed:")
+    )
+
+
 def reconcile_observed_identities(
     client: Neo4jClient,
     *,
@@ -89,16 +107,16 @@ def reconcile_observed_identities(
     observed_at: datetime,
     ingested_at: datetime,
 ) -> ReconcileResult:
-    """Upgrade synthetic discovered Principals from observed-response identity."""
+    """Upgrade synthetic discovered Principals + alias observed identities (ADR-0029)."""
 
-    # Gather, per synthetic-keyed AuthContext, the observed identities its
-    # observations asserted.
+    # Gather, per (non-anonymous) AuthContext, the observed identities its
+    # observations asserted, plus the Principal it currently resolves to.
     rows = client.execute_read(
-        f"""
-        MATCH (r:RequestObservation {{engagement_id: $eid}})
+        """
+        MATCH (r:RequestObservation {engagement_id: $eid})
               -[:OBSERVED_UNDER]->(ac:AuthContext)-[:OF_PRINCIPAL]->(p:Principal)
-        WHERE r.observed_identity_value IS NOT NULL AND {_SYNTHETIC_PRINCIPAL_WHERE}
-        RETURN ac.auth_hash AS auth_hash,
+        WHERE r.observed_identity_value IS NOT NULL AND p.is_anonymous = false
+        RETURN ac.auth_hash AS auth_hash, p.identity_key AS principal_key,
                collect(DISTINCT [r.observed_identity_signal, r.observed_identity_value])
                  AS identities
         """,
@@ -106,12 +124,35 @@ def reconcile_observed_identities(
     )
 
     upgrades = 0
+    aliases = 0
     for row in rows:
         identities = [(str(s), str(v)) for s, v in row["identities"]]
         chosen = choose_observed_identity(identities)
         if chosen is None:
             continue
         signal, value = chosen
+
+        # Non-synthetic Principal (JWT-keyed / declared / already observed-keyed):
+        # the observed identity can't safely re-key it (merge-safety), so attach it
+        # as a known *alias* — enrichment, never a merge (ADR-0029 amendment).
+        if not _is_synthetic_key(str(row["principal_key"])):
+            client.execute_write(
+                """
+                MATCH (ac:AuthContext {engagement_id: $eid, auth_hash: $auth_hash})
+                      -[:OF_PRINCIPAL]->(p:Principal)
+                WHERE p.is_anonymous = false
+                WITH p, $alias AS alias
+                SET p.observed_aliases = CASE
+                    WHEN alias IN coalesce(p.observed_aliases, []) THEN p.observed_aliases
+                    ELSE coalesce(p.observed_aliases, []) + alias END
+                """,
+                eid=engagement_id,
+                auth_hash=row["auth_hash"],
+                alias=f"{signal}={value}",
+            )
+            aliases += 1
+            continue
+
         target_key = f"discovered:observed:{signal}:{value}"
         target_pid = principal_id(engagement_id, target_key)
         p_props = cross_cutting(
@@ -119,7 +160,7 @@ def reconcile_observed_identities(
             source_id=None,
             observed_at=observed_at,
             ingested_at=ingested_at,
-            confidence=_OBSERVED_CONFIDENCE,
+            confidence=_observed_confidence(signal),
         )
         # Re-point this AuthContext from its synthetic Principal onto the
         # observed-identity Principal (ADR-0010 edge re-pointing). Guard the
@@ -161,4 +202,4 @@ def reconcile_observed_identities(
         eid=engagement_id,
     )
     retracted = int(retracted_rows[0]["retracted"]) if retracted_rows else 0
-    return ReconcileResult(upgrades=upgrades, retracted=retracted)
+    return ReconcileResult(upgrades=upgrades, retracted=retracted, aliases=aliases)

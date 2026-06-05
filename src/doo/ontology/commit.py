@@ -119,6 +119,9 @@ class FlushResult:
     # identity, and synthetic Principals left orphaned (retracted) by that upgrade.
     observed_identity_upgrades: int = 0
     principals_retracted: int = 0
+    # ADR-0029 amendment: observed identities attached as aliases to non-synthetic
+    # Principals (enrichment — e.g. a JWT-keyed Principal's `/me` email).
+    observed_identity_aliases: int = 0
 
 
 class CommitOrchestrator:
@@ -319,7 +322,7 @@ class CommitOrchestrator:
         # --- ADR-0029: upgrade synthetic discovered Principals from observed
         # response identity (headers/self-endpoint bodies), collapsing reissued
         # opaque credentials for one actor. ---
-        identity_upgrades = principals_retracted = 0
+        identity_upgrades = principals_retracted = identity_aliases = 0
         for engagement_id in sorted(engagements):
             now = datetime.now(UTC)
             reconcile = reconcile_observed_identities(
@@ -330,6 +333,7 @@ class CommitOrchestrator:
             )
             identity_upgrades += reconcile.upgrades
             principals_retracted += reconcile.retracted
+            identity_aliases += reconcile.aliases
 
         if cohorts or observed_values:
             log.info(
@@ -342,6 +346,7 @@ class CommitOrchestrator:
                 yielded_value_edges=yielded_value_edges,
                 observed_identity_upgrades=identity_upgrades,
                 principals_retracted=principals_retracted,
+                observed_identity_aliases=identity_aliases,
             )
         return FlushResult(
             cohorts=cohorts,
@@ -352,6 +357,7 @@ class CommitOrchestrator:
             yielded_value_edges=yielded_value_edges,
             observed_identity_upgrades=identity_upgrades,
             principals_retracted=principals_retracted,
+            observed_identity_aliases=identity_aliases,
         )
 
     def _promotion_events(

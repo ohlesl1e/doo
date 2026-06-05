@@ -62,7 +62,11 @@ from doo.extraction.artifacts import (
     extract_diagnostics,
     extract_input_candidate,
 )
-from doo.extraction.identity_signals import extract_observed_identity_from_headers
+from doo.extraction.identity_signals import (
+    extract_observed_identity_from_headers,
+    extract_observed_identity_from_self_endpoint_body,
+    is_self_endpoint,
+)
 from doo.ids import (
     EngagementId,
     L2EventId,
@@ -289,12 +293,22 @@ def _parse_entry(
             for o in (*_query_input_candidates(query_params), *body_input_candidates)
         )
         value_candidates = (*output_candidates, *input_candidates)
-        # ADR-0029: identity the response asserts about the actor (header signal).
+        # ADR-0029: identity the response asserts about the actor — an identity
+        # header (T-OI1), else a self-endpoint body claim (T-OI2). Header wins.
         observed_identity = (
             extract_observed_identity_from_headers(_header_map(response))
             if isinstance(response, dict)
             else None
         )
+        if (
+            observed_identity is None
+            and is_self_endpoint(concrete_path)
+            and response_body_bytes
+        ):
+            observed_identity = extract_observed_identity_from_self_endpoint_body(
+                response_body_bytes.decode("utf-8", errors="replace"),
+                response_content_type,
+            )
         yield RequestObservation(
             event_id=_new_l2_event_id(),
             trace_id=envelope.trace_id,
