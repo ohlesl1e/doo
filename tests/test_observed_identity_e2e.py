@@ -235,3 +235,63 @@ def test_self_endpoint_body_identity_collapses_synthetic_principals(
         eid=eid,
     )
     assert live[0]["c"] == 0
+
+
+def test_jwt_keyed_principal_gains_me_email_alias(
+    neo4j_client, redis_client, blob_client
+) -> None:
+    """ADR-0029 amendment: a JWT-claim-keyed Principal is NOT re-keyed by an
+    observed `/me` identity (merge-safety) but DOES gain it as an alias —
+    enrichment, so an actor known by an opaque id reads human-readably."""
+
+    eid = "eng-oi-alias-e2e"
+    _seed_engagement(neo4j_client, eid)
+    token = jwt.encode({"sub": "jwt-user"}, SIGNING_KEY, algorithm="HS256")
+    entries = [
+        {
+            "startedDateTime": "2026-06-04T11:00:01.000Z",
+            "request": {
+                "method": "GET",
+                "url": "https://api.example.com/api/users/me",
+                "queryString": [],
+                "headers": [{"name": "Authorization", "value": f"Bearer {token}"}],
+                "cookies": [],
+                "headersSize": -1,
+                "bodySize": 0,
+            },
+            "response": {
+                "status": 200,
+                "bodySize": 2,
+                "headers": [{"name": "Content-Type", "value": "application/json"}],
+                "content": {
+                    "mimeType": "application/json",
+                    "text": json.dumps({"_id": "507f1f77bcf86cd799439011", "email": "alice@corp.com"}),
+                },
+            },
+        }
+    ]
+    har = json.dumps({"log": {"version": "1.2", "entries": entries}}).encode()
+    _run_pipeline(
+        neo4j=neo4j_client,
+        redis_client=redis_client,
+        blob_client=blob_client,
+        engagement_id=eid,
+        har_bytes=har,
+        filename="observed_alias.har",
+    )
+
+    row = neo4j_client.execute_read(
+        "MATCH (p:Principal {engagement_id: $eid, identity_key: 'discovered:jwt:sub:jwt-user'}) "
+        "RETURN p.observed_aliases AS aliases",
+        eid=eid,
+    )
+    # The Principal stays JWT-keyed (not re-keyed) but now records the /me email.
+    assert row and row[0]["aliases"] == ["body=alice@corp.com"]
+
+    # No observed-keyed Principal was created (the JWT one was aliased, not merged).
+    obs_p = neo4j_client.execute_read(
+        "MATCH (p:Principal {engagement_id: $eid}) "
+        "WHERE p.identity_key STARTS WITH 'discovered:observed:' RETURN count(p) AS c",
+        eid=eid,
+    )
+    assert obs_p[0]["c"] == 0
