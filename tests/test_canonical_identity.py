@@ -13,6 +13,7 @@ from doo.canonical.identity import (
     discovered_principal_identity_key,
     endpoint_id,
     host_id,
+    is_synthetic_discovered_key,
 )
 from doo.ids import EngagementId, Sha256Hex
 
@@ -101,7 +102,7 @@ def test_derive_har_source_id_shape() -> None:
     assert derive_har_source_id(3, "2026-05-01T10:00:00.000Z") == "3|2026-05-01T10:00:00.000Z"
 
 
-# --- discovered Principal identity key (ADR-0027 claim-priority) -------------
+# --- discovered Principal identity key (ADR-0030 unified claim-keyed model) ---
 
 _AUTH_HASH = Sha256Hex("a" * 64)
 
@@ -123,7 +124,7 @@ def test_discovered_principal_key_falls_back_to_auth_hash_without_claims() -> No
 def test_discovered_principal_key_namespaces_first_priority_claim() -> None:
     assert (
         discovered_principal_identity_key(_AUTH_HASH, identity_claims={"sub": "uuid-aaa"})
-        == "discovered:jwt:sub:uuid-aaa"
+        == "discovered:sub:uuid-aaa"
     )
 
 
@@ -133,7 +134,7 @@ def test_discovered_principal_key_issuer_scopes_sub() -> None:
         discovered_principal_identity_key(
             _AUTH_HASH, identity_claims={"sub": "12345", "iss": "https://idp.example"}
         )
-        == "discovered:jwt:sub:https://idp.example:12345"
+        == "discovered:sub:https://idp.example:12345"
     )
 
 
@@ -148,7 +149,7 @@ def test_discovered_principal_key_bare_sub_without_iss_unchanged() -> None:
     # No iss → bare sub key (backward-compatible with single-issuer tokens).
     assert (
         discovered_principal_identity_key(_AUTH_HASH, identity_claims={"sub": "uuid-aaa"})
-        == "discovered:jwt:sub:uuid-aaa"
+        == "discovered:sub:uuid-aaa"
     )
 
 
@@ -158,7 +159,7 @@ def test_discovered_principal_key_falls_through_priority_to_uid() -> None:
         discovered_principal_identity_key(
             _AUTH_HASH, identity_claims={"uid": "u-7", "email": "a@x.com"}
         )
-        == "discovered:jwt:uid:u-7"
+        == "discovered:uid:u-7"
     )
 
 
@@ -168,19 +169,19 @@ def test_discovered_principal_key_prefers_sub_over_lower_claims() -> None:
         discovered_principal_identity_key(
             _AUTH_HASH, identity_claims={"email": "a@x.com", "uid": "u-7", "sub": "s-1"}
         )
-        == "discovered:jwt:sub:s-1"
+        == "discovered:sub:s-1"
     )
 
 
 def test_discovered_principal_key_lowercases_email_only() -> None:
     assert (
         discovered_principal_identity_key(_AUTH_HASH, identity_claims={"email": "Alice@X.COM"})
-        == "discovered:jwt:email:alice@x.com"
+        == "discovered:email:alice@x.com"
     )
     # A non-email claim keeps its case.
     assert (
         discovered_principal_identity_key(_AUTH_HASH, identity_claims={"username": "Alice"})
-        == "discovered:jwt:username:Alice"
+        == "discovered:username:Alice"
     )
 
 
@@ -188,7 +189,7 @@ def test_discovered_principal_key_converges_across_reissued_tokens() -> None:
     # Same user (same top claim), two reissued tokens → two auth_hashes, one key.
     key1 = discovered_principal_identity_key(Sha256Hex("b" * 64), identity_claims={"sub": "uuid-aaa"})
     key2 = discovered_principal_identity_key(Sha256Hex("c" * 64), identity_claims={"sub": "uuid-aaa"})
-    assert key1 == key2 == "discovered:jwt:sub:uuid-aaa"
+    assert key1 == key2 == "discovered:sub:uuid-aaa"
 
 
 def test_discovered_principal_key_fragments_honestly_on_differing_claims() -> None:
@@ -203,5 +204,49 @@ def test_discovered_principal_key_ignores_bool_claim() -> None:
     # bool is an int subclass but is never an identifier.
     assert (
         discovered_principal_identity_key(_AUTH_HASH, identity_claims={"sub": True, "uid": "u-9"})
-        == "discovered:jwt:uid:u-9"
+        == "discovered:uid:u-9"
     )
+
+
+def test_discovered_principal_key_email_is_last_resort() -> None:
+    # ADR-0030: `email` is person-level → keys ONLY when no account-unique claim is
+    # present, but is never beaten by anything lower (it is the last in the list).
+    assert (
+        discovered_principal_identity_key(_AUTH_HASH, identity_claims={"email": "alice@x.com"})
+        == "discovered:email:alice@x.com"
+    )
+    # Any account-unique claim outranks email.
+    for stronger in ("sub", "uid", "user_id", "uuid", "_id", "username", "preferred_username"):
+        assert discovered_principal_identity_key(
+            _AUTH_HASH, identity_claims={stronger: "v", "email": "alice@x.com"}
+        ) == f"discovered:{stronger}:v"
+
+
+def test_discovered_principal_key_unified_scheme_drops_jwt_observed_namespaces() -> None:
+    # ADR-0030: the key is source-agnostic — no `jwt`/`observed` namespace segment.
+    key = discovered_principal_identity_key(_AUTH_HASH, identity_claims={"sub": "s-1"})
+    assert key == "discovered:sub:s-1"
+    assert ":jwt:" not in key and ":observed:" not in key
+
+
+def test_cue_and_observed_paths_converge_on_one_key() -> None:
+    # ADR-0030 M3: a bearer JWT `sub` (resolve path) and the same actor's /me `sub`
+    # (observed path) produce the SAME discovered key, so they MERGE to one Principal.
+    cue_key = discovered_principal_identity_key(
+        Sha256Hex("d" * 64), identity_claims={"sub": "actor-1"}
+    )
+    observed_key = discovered_principal_identity_key(
+        Sha256Hex("e" * 64), identity_claims={"sub": "actor-1"}
+    )
+    assert cue_key == observed_key == "discovered:sub:actor-1"
+
+
+def test_is_synthetic_discovered_key() -> None:
+    # The per-credential fallback is synthetic (safe to re-key); claim keys are not.
+    assert is_synthetic_discovered_key(f"discovered:{_AUTH_HASH}")
+    assert not is_synthetic_discovered_key("discovered:sub:actor-1")
+    assert not is_synthetic_discovered_key("discovered:sub:https://idp:1")
+    assert not is_synthetic_discovered_key("discovered:email:alice@x.com")
+    assert not is_synthetic_discovered_key("discovered:x-user-id:alice")
+    assert not is_synthetic_discovered_key("declared:test-user")
+    assert not is_synthetic_discovered_key("anonymous")

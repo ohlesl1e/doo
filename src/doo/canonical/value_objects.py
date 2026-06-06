@@ -128,17 +128,22 @@ class AuthContextCue(BaseModel):
 
 
 class ObservedIdentity(BaseModel):
-    """An actor identity revealed by a *response* (ADR-0029).
+    """A single claim-tagged actor identity revealed by a *response* (ADR-0030).
 
     Extracted at L2 from a response the actor's request elicited — an identity
-    response header, or (later) a self-endpoint body claim — and correlated at
-    flush back to the request's `AuthContext` to upgrade a synthetic discovered
-    `Principal`. `signal` is the namespace token for the discovered identity key
-    `discovered:observed:{signal}:{value}` (e.g. the header name `x-user-id`);
-    `value` must be globally unique per user (the merge-safety requirement).
+    response header, or a self-endpoint body claim — and correlated at flush back
+    to the request's `AuthContext`. `claim` is the **semantic id kind**
+    (`sub`/`uid`/`_id`/`username`/`email`/`nameid`/the identity header name…), so
+    a body `_id` and a body `email` stay distinct identities rather than both
+    collapsing to one `signal="body"`. The *source* of the identity is provenance
+    only; the unified key resolver (`discovered_principal_identity_key`) turns the
+    claim/value into the source-agnostic `discovered:{claim}:{value}` key, so the
+    same actor's identity from any source converges (ADR-0030). `value` must be
+    globally unique per user for an account-unique claim (the merge-safety
+    requirement); `email` is person-level (last-resort key, always an alias).
     """
 
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
 
-    signal: str = Field(min_length=1)
+    claim: str = Field(min_length=1)
     value: str = Field(min_length=1)

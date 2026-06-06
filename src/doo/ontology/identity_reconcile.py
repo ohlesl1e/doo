@@ -1,11 +1,14 @@
-"""Flush-time observed-response identity reconciliation (ADR-0029).
+"""Flush-time observed-response identity reconciliation (ADR-0029, unified ADR-0030).
 
 Upgrades **synthetic** (opaque-credential) discovered `Principal`s using identity
-revealed by responses (an identity header; later, self-endpoint body claims),
-correlated back to the request's `AuthContext`. All AuthContexts that share one
-observed identity are re-pointed onto a single `Principal` keyed
-`discovered:observed:{signal}:{value}`, collapsing a user's reissued opaque
-credentials — the residual ADR-0027 left for non-JWT auth.
+revealed by responses (identity headers; self-endpoint body claims), correlated
+back to the request's `AuthContext`. Every observed identity is a claim-tagged
+`(claim, value)` pair (ADR-0030); all AuthContexts that share one account-unique
+observed identity are re-pointed onto a single `Principal` keyed on the unified
+`discovered:{claim}:{value}` (the same scheme the resolve-time credential cue
+produces), so a bearer-JWT `sub` and a `/me` `sub` converge by identity-key MERGE
+onto ONE Principal — no explicit cross-path merge. This collapses a user's
+reissued opaque credentials, the residual ADR-0027 left for non-JWT auth.
 
 Mirrors `promotion.promote_values` / `templating.retemplate_cohort`: a deep,
 flush-time graph pass, called from `CommitOrchestrator.flush`. Idempotent and
@@ -13,19 +16,26 @@ crash-safe (identity-keyed MERGEs; dirtiness derived from the graph).
 
 Merge-safety is the invariant (the cardinal risk): **only** low-confidence
 synthetic (`discovered:{auth_hash}`) Principals are upgraded — never a declared,
-a JWT-claim-keyed, or an already-observed-keyed Principal; two AuthContexts merge
-only when they share one globally-unique-per-user observed value.
+a claim-keyed, or an already-observed-keyed Principal; two AuthContexts merge only
+when they share one account-unique observed value (`email` and a `transient`
+NameID never key — `email` is person-level and only ever an alias).
 """
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 
-from doo.canonical.identity import principal_id
+from doo.canonical.identity import (
+    _IDENTITY_CLAIM_PRIORITY,
+    discovered_principal_identity_key,
+    is_synthetic_discovered_key,
+    principal_id,
+)
 from doo.extraction.identity_signals import IDENTITY_RESPONSE_HEADERS
-from doo.ids import EngagementId
+from doo.ids import EngagementId, Sha256Hex
 from doo.infra.neo4j_driver import Neo4jClient
 from doo.ontology.resolve import cross_cutting
 
@@ -36,14 +46,28 @@ _HEADER_CONFIDENCE = 0.6
 _BODY_CONFIDENCE = 0.5
 
 
-def _observed_confidence(signal: str) -> float:
-    return _HEADER_CONFIDENCE if signal in IDENTITY_RESPONSE_HEADERS else _BODY_CONFIDENCE
+def _observed_confidence(claim: str) -> float:
+    return _HEADER_CONFIDENCE if claim in IDENTITY_RESPONSE_HEADERS else _BODY_CONFIDENCE
 
 
-# Signal-priority for choosing among the identities an AuthContext accumulated.
-# Header names rank by IDENTITY_RESPONSE_HEADERS; anything else (future body
-# signals) ranks after the headers, in encounter order.
-_SIGNAL_RANK = {name: i for i, name in enumerate(IDENTITY_RESPONSE_HEADERS)}
+# Claim-priority for choosing which observed claim keys an AuthContext, spanning
+# both sources (ADR-0030). Server-asserted identity *headers* (T-OI1) rank first
+# in their precision order, then the account-unique body/JWT claim priority
+# (`sub` -> … -> `email` LAST). Anything unranked sorts after, in encounter order.
+# Keying and confidence are decoupled: a header keys before a body claim, and
+# `email` is the last resort — person-level, only ever an alias when a stronger
+# claim is present.
+_CLAIM_RANK: dict[str, int] = {
+    **{name: i for i, name in enumerate(IDENTITY_RESPONSE_HEADERS)},
+    **{
+        claim: len(IDENTITY_RESPONSE_HEADERS) + i
+        for i, claim in enumerate(_IDENTITY_CLAIM_PRIORITY)
+    },
+}
+
+
+def _claim_rank(claim: str) -> int:
+    return _CLAIM_RANK.get(claim, len(_CLAIM_RANK))
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,46 +82,72 @@ class ReconcileResult:
 def choose_observed_identity(
     identities: Sequence[tuple[str, str]],
 ) -> tuple[str, str] | None:
-    """Pick the one observed identity to key an AuthContext on, or `None`.
+    """Pick the one `(claim, value)` to key an AuthContext on, or `None` (ADR-0030).
 
-    Pure. Among the `(signal, value)` pairs an AuthContext accumulated: take the
-    highest-priority signal present; if that signal carries a **single** distinct
-    value, return `(signal, value)`. If the top signal carries **conflicting**
-    values, return `None` — ambiguous evidence must never cause a merge.
+    Pure. Among the claim-tagged identities an AuthContext accumulated: take the
+    highest-priority claim present (headers first, then `sub` … `email` last); if
+    that claim carries a **single** distinct value, return `(claim, value)`. If the
+    top claim carries **conflicting** values, return `None` — ambiguous evidence
+    at the keying claim must never cause a merge (the merge-safety invariant).
     """
 
     if not identities:
         return None
-    best_rank = min(_SIGNAL_RANK.get(sig, len(_SIGNAL_RANK)) for sig, _ in identities)
-    top_signal = next(
-        sig
-        for sig, _ in sorted(identities, key=lambda sv: _SIGNAL_RANK.get(sv[0], len(_SIGNAL_RANK)))
-        if _SIGNAL_RANK.get(sig, len(_SIGNAL_RANK)) == best_rank
+    best_rank = min(_claim_rank(claim) for claim, _ in identities)
+    top_claim = next(
+        claim
+        for claim, _ in sorted(identities, key=lambda cv: _claim_rank(cv[0]))
+        if _claim_rank(claim) == best_rank
     )
-    values = {value for sig, value in identities if sig == top_signal}
+    values = {value for claim, value in identities if claim == top_claim}
     if len(values) != 1:
-        return None  # conflicting evidence at the top signal — do not merge.
-    return top_signal, values.pop()
+        return None  # conflicting evidence at the top claim — do not merge.
+    return top_claim, values.pop()
 
 
-# A synthetic discovered Principal's key is `discovered:{auth_hash}` — neither a
-# JWT-claim key (`discovered:jwt:…`) nor an observed key (`discovered:observed:…`).
-_SYNTHETIC_PRINCIPAL_WHERE = (
-    "p.tier = 'discovered' "
-    "AND p.identity_key STARTS WITH 'discovered:' "
-    "AND NOT p.identity_key STARTS WITH 'discovered:jwt:' "
-    "AND NOT p.identity_key STARTS WITH 'discovered:observed:'"
-)
+def _observed_identity_key(claim: str, value: str) -> str:
+    """The unified discovered key for an observed `(claim, value)` (ADR-0030).
+
+    Routes account-unique JWT-family claims through the shared resolver so the
+    observed path emits exactly the same `discovered:{claim}:{value}` scheme as the
+    resolve-time cue path (hence the MERGE convergence). Identity headers (which the
+    resolver's claim list does not enumerate) are keyed directly on the same
+    scheme, the header name as the claim namespace.
+    """
+
+    if claim in _IDENTITY_CLAIM_PRIORITY:
+        # `auth_hash` here is a never-used fallback sentinel: a present priority
+        # claim always wins, so the resolver returns the claim-keyed form.
+        return discovered_principal_identity_key(
+            Sha256Hex("0" * 64), identity_claims={claim: value}
+        )
+    return f"discovered:{claim}:{value}"
 
 
-def _is_synthetic_key(identity_key: str) -> bool:
-    """True if `identity_key` is the synthetic `discovered:{auth_hash}` form."""
+def _parse_observed_identities(raw: object) -> list[tuple[str, str]]:
+    """Parse a RequestObservation's serialized `observed_identities` JSON list.
 
-    return (
-        identity_key.startswith("discovered:")
-        and not identity_key.startswith("discovered:jwt:")
-        and not identity_key.startswith("discovered:observed:")
-    )
+    Each entry is an `{claim, value}` object (ADR-0030). Tolerant of malformed
+    entries — anything unparseable is skipped rather than raising in the flush pass.
+    """
+
+    out: list[tuple[str, str]] = []
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        try:
+            obj = json.loads(item)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(obj, dict):
+            continue
+        claim = obj.get("claim")
+        value = obj.get("value")
+        if isinstance(claim, str) and claim and isinstance(value, str) and value:
+            out.append((claim, value))
+    return out
 
 
 def reconcile_observed_identities(
@@ -107,18 +157,18 @@ def reconcile_observed_identities(
     observed_at: datetime,
     ingested_at: datetime,
 ) -> ReconcileResult:
-    """Upgrade synthetic discovered Principals + alias observed identities (ADR-0029)."""
+    """Upgrade synthetic discovered Principals + alias observed identities (ADR-0030)."""
 
-    # Gather, per (non-anonymous) AuthContext, the observed identities its
-    # observations asserted, plus the Principal it currently resolves to.
+    # Gather, per (non-anonymous) AuthContext, the serialized observed-identity
+    # lists its observations asserted, plus the Principal it currently resolves to.
     rows = client.execute_read(
         """
         MATCH (r:RequestObservation {engagement_id: $eid})
               -[:OBSERVED_UNDER]->(ac:AuthContext)-[:OF_PRINCIPAL]->(p:Principal)
-        WHERE r.observed_identity_value IS NOT NULL AND p.is_anonymous = false
+        WHERE r.observed_identities IS NOT NULL AND size(r.observed_identities) > 0
+          AND p.is_anonymous = false
         RETURN ac.auth_hash AS auth_hash, p.identity_key AS principal_key,
-               collect(DISTINCT [r.observed_identity_signal, r.observed_identity_value])
-                 AS identities
+               collect(r.observed_identities) AS identity_lists
         """,
         eid=engagement_id,
     )
@@ -126,64 +176,95 @@ def reconcile_observed_identities(
     upgrades = 0
     aliases = 0
     for row in rows:
-        identities = [(str(s), str(v)) for s, v in row["identities"]]
+        # Flatten the per-observation lists into one claim-tagged identity set for
+        # this AuthContext, de-duplicated.
+        identities: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for lst in row["identity_lists"]:
+            for pair in _parse_observed_identities(lst):
+                if pair not in seen:
+                    seen.add(pair)
+                    identities.append(pair)
+        if not identities:
+            continue
+
         chosen = choose_observed_identity(identities)
-        if chosen is None:
-            continue
-        signal, value = chosen
 
-        # Non-synthetic Principal (JWT-keyed / declared / already observed-keyed):
-        # the observed identity can't safely re-key it (merge-safety), so attach it
-        # as a known *alias* — enrichment, never a merge (ADR-0029 amendment).
-        if not _is_synthetic_key(str(row["principal_key"])):
-            client.execute_write(
-                """
-                MATCH (ac:AuthContext {engagement_id: $eid, auth_hash: $auth_hash})
-                      -[:OF_PRINCIPAL]->(p:Principal)
-                WHERE p.is_anonymous = false
-                WITH p, $alias AS alias
-                SET p.observed_aliases = CASE
-                    WHEN alias IN coalesce(p.observed_aliases, []) THEN p.observed_aliases
-                    ELSE coalesce(p.observed_aliases, []) + alias END
-                """,
-                eid=engagement_id,
-                auth_hash=row["auth_hash"],
-                alias=f"{signal}={value}",
-            )
-            aliases += 1
+        # Record ALL of this AuthContext's claim values as aliases (ADR-0030):
+        # enrichment that never re-keys or merges, so `email` always surfaces as a
+        # label even when an account-unique claim is the key.
+        alias_strings = sorted({f"{claim}={value}" for claim, value in identities})
+
+        # Non-synthetic Principal (claim-keyed / declared / already observed-keyed):
+        # the observed identity can't safely re-key it (merge-safety), so attach the
+        # claims as known *aliases* — enrichment, never a merge (ADR-0030).
+        # A synthetic Principal with no clean keying claim (chosen is None) is also
+        # only aliased, never re-keyed on ambiguous evidence.
+        is_synthetic = is_synthetic_discovered_key(str(row["principal_key"]))
+        if not is_synthetic or chosen is None:
+            if alias_strings:
+                client.execute_write(
+                    """
+                    MATCH (ac:AuthContext {engagement_id: $eid, auth_hash: $auth_hash})
+                          -[:OF_PRINCIPAL]->(p:Principal)
+                    WHERE p.is_anonymous = false
+                    WITH p, $aliases AS aliases
+                    UNWIND aliases AS alias
+                    WITH p, alias
+                    SET p.observed_aliases = CASE
+                        WHEN alias IN coalesce(p.observed_aliases, []) THEN p.observed_aliases
+                        ELSE coalesce(p.observed_aliases, []) + alias END
+                    """,
+                    eid=engagement_id,
+                    auth_hash=row["auth_hash"],
+                    aliases=alias_strings,
+                )
+                aliases += 1
             continue
 
-        target_key = f"discovered:observed:{signal}:{value}"
+        claim, value = chosen
+        target_key = _observed_identity_key(claim, value)
         target_pid = principal_id(engagement_id, target_key)
         p_props = cross_cutting(
             source="har",
             source_id=None,
             observed_at=observed_at,
             ingested_at=ingested_at,
-            confidence=_observed_confidence(signal),
+            confidence=_observed_confidence(claim),
         )
         # Re-point this AuthContext from its synthetic Principal onto the
         # observed-identity Principal (ADR-0010 edge re-pointing). Guard the
-        # synthetic-source again inside the write so a concurrent upgrade can't
-        # re-point an already-upgraded AuthContext.
+        # synthetic source again inside the write (a deterministic id check) so a
+        # concurrent upgrade can't re-point an already-upgraded AuthContext, then
+        # record all claims as aliases on the (possibly merged) target Principal.
         client.execute_write(
-            f"""
-            MATCH (ac:AuthContext {{engagement_id: $eid, auth_hash: $auth_hash}})
+            """
+            MATCH (ac:AuthContext {engagement_id: $eid, auth_hash: $auth_hash})
                   -[old:OF_PRINCIPAL]->(p:Principal)
-            WHERE {_SYNTHETIC_PRINCIPAL_WHERE}
-            MERGE (np:Principal {{engagement_id: $eid, identity_key: $target_key}})
+            WHERE p.tier = 'discovered'
+              AND p.identity_key = $synthetic_key
+              AND p.identity_key =~ 'discovered:[0-9a-f]{64}'
+            MERGE (np:Principal {engagement_id: $eid, identity_key: $target_key})
               ON CREATE SET np.id = $target_pid, np.tier = 'discovered',
                             np.is_anonymous = false, np.unmerged = true,
-                            np.observed_signal = $signal, np += $p_props
+                            np.observed_claim = $claim, np += $p_props
               ON MATCH SET np.last_seen = $p_props.last_seen
             DELETE old
             MERGE (ac)-[:OF_PRINCIPAL]->(np)
+            WITH np, $aliases AS aliases
+            UNWIND aliases AS alias
+            WITH np, alias
+            SET np.observed_aliases = CASE
+                WHEN alias IN coalesce(np.observed_aliases, []) THEN np.observed_aliases
+                ELSE coalesce(np.observed_aliases, []) + alias END
             """,
             eid=engagement_id,
             auth_hash=row["auth_hash"],
+            synthetic_key=str(row["principal_key"]),
             target_key=target_key,
             target_pid=target_pid,
-            signal=signal,
+            claim=claim,
+            aliases=alias_strings,
             p_props=p_props,
         )
         upgrades += 1
@@ -191,9 +272,10 @@ def reconcile_observed_identities(
     # Retract synthetic Principals left orphaned by the re-pointing (ADR-0010:
     # the orphan is marked retracted, not deleted).
     retracted_rows = client.execute_write(
-        f"""
-        MATCH (p:Principal {{engagement_id: $eid}})
-        WHERE {_SYNTHETIC_PRINCIPAL_WHERE}
+        """
+        MATCH (p:Principal {engagement_id: $eid})
+        WHERE p.tier = 'discovered'
+          AND p.identity_key =~ 'discovered:[0-9a-f]{64}'
           AND NOT (p)<-[:OF_PRINCIPAL]-(:AuthContext)
           AND coalesce(p.status, 'active') <> 'retracted'
         SET p.status = 'retracted', p.unmerged = false

@@ -238,10 +238,12 @@ class RequestObservation(L2EventBase):
     value_candidates: tuple[ValueCandidate, ...] = ()
     server_fingerprint: str | None = None
     error_excerpt: str | None = None
-    # ADR-0029: actor identity revealed by this response (an identity header, or a
-    # self-endpoint body claim), correlated at flush to the AuthContext to upgrade
-    # a synthetic discovered Principal. `None` when the response asserts no identity.
-    observed_identity: ObservedIdentity | None = None
+    # ADR-0030: the set of claim-tagged actor identities this response reveals (any
+    # of identity headers + self-endpoint body claims), correlated at flush to the
+    # AuthContext to upgrade a synthetic discovered Principal and record aliases.
+    # Empty when the response asserts no identity. A response can surface several
+    # at once (e.g. a `/me` body with both `_id` and `email`).
+    observed_identities: tuple[ObservedIdentity, ...] = ()
 
     @model_validator(mode="after")
     def _validate(self) -> Self:

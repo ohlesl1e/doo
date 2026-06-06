@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import re
 from collections.abc import Mapping
 from urllib.parse import quote, unquote
 
@@ -293,11 +294,17 @@ def declared_principal_identity_key(label: str) -> str:
     return f"declared:{label}"
 
 
-# Identity claims that can key a discovered Principal, most-canonical first
-# (ADR-0027). The first present, scalar, non-empty claim wins. Every claim is
-# globally unique per user, so keying on any of them is merge-safe; and any claim
-# is >= the synthetic `auth_hash` fallback for fragmentation (the fallback is
-# itself per-token), so the list is generous by design.
+# Identity claims that can *key* a discovered Principal, account-unique first
+# (ADR-0030). The first present, scalar, non-empty claim wins. The list spans all
+# sources (JWT cue, response header, self-endpoint body, SSO id_token / SAML) —
+# the *source* is provenance only; identity is the claim/value. Every listed claim
+# is account-unique per user (issuer-scoped for `sub`), so keying on any of them is
+# merge-safe. `email` is LAST: it is person-level (one human can own several
+# accounts), so it keys only as a last resort and is otherwise an alias. A
+# `transient` SAML NameID is per-session and is therefore NOT in this list (it
+# never keys); a `persistent`/`emailAddress` NameID arrives pre-mapped to one of
+# these claim names by the SAML extractor (ADR-0031), so it needs no special case
+# here.
 _IDENTITY_CLAIM_PRIORITY: tuple[str, ...] = (
     "sub",
     "uid",
@@ -314,18 +321,24 @@ _IDENTITY_CLAIM_PRIORITY: tuple[str, ...] = (
 def discovered_principal_identity_key(
     auth_hash: Sha256Hex, *, identity_claims: Mapping[str, object] | None = None
 ) -> str:
-    """`identity_key` for a discovered (undeclared) Principal (ADR-0010 step 5; ADR-0027).
+    """`identity_key` for a discovered (undeclared) Principal (ADR-0010 step 5; ADR-0030).
 
-    Keyed on a **namespaced claim-priority list**: `discovered:jwt:{claim}:{value}`
-    over the first present of `_IDENTITY_CLAIM_PRIORITY` (`sub` -> ... -> `email`,
-    `email` lowercased). `sub` is **issuer-scoped** when an `iss` claim is present
-    (`discovered:jwt:sub:{iss}:{sub}`) — OIDC `sub` is unique only within its issuer.
-    A user's reissued tokens — which expose the same stable
-    claim — therefore collapse to one discovered Principal, while the per-token
-    `auth_hash` differs. Namespacing by claim name keeps the key honest: tokens
+    Source-agnostic: keyed on `discovered:{claim}:{value}` over the first present of
+    `_IDENTITY_CLAIM_PRIORITY` (`sub` -> ... -> `email` last, `email` lowercased).
+    `sub` is **issuer-scoped** when an `iss` claim is present
+    (`discovered:sub:{iss}:{sub}`) — OIDC `sub` is unique only within its issuer.
+
+    The SAME scheme is produced at resolve-time (from a credential's decoded JWT
+    claims) and at flush-time (from a response's observed identities), so a bearer
+    `sub` and the same actor's `/me` `sub` MERGE on the identity key into one
+    Principal — no explicit cross-path merge (ADR-0030, superseding the split
+    `discovered:jwt:*` / `discovered:observed:*` namespaces). A user's reissued
+    tokens — same stable claim, different per-token `auth_hash` — collapse to one
+    discovered Principal. Tagging by claim name keeps the key honest: identities
     exposing *different* claims fragment rather than wrongly merge. Falls back to
     the per-credential `auth_hash` only when no listed claim is present (an opaque
-    / non-JWT credential). Deterministic, so re-ingest converges.
+    / non-JWT credential, no observed identity). Pure + deterministic, so re-ingest
+    converges.
     """
 
     if identity_claims:
@@ -346,6 +359,24 @@ def discovered_principal_identity_key(
                 # (a single-issuer token), backward-compatible.
                 iss = identity_claims.get("iss")
                 if isinstance(iss, str) and iss.strip():
-                    return f"discovered:jwt:sub:{iss.strip()}:{value}"
-            return f"discovered:jwt:{claim}:{value}"
+                    return f"discovered:sub:{iss.strip()}:{value}"
+            return f"discovered:{claim}:{value}"
     return f"discovered:{auth_hash}"
+
+
+# The synthetic discovered key is `discovered:{auth_hash}` — the per-credential
+# fallback (64 lowercase hex chars after the prefix, no claim segment). A
+# claim-keyed discovered Principal is `discovered:{claim}:{value}` and always
+# carries a further `:` separator, so the two are distinguishable by shape alone.
+_SYNTHETIC_KEY_RE = re.compile(r"^discovered:[0-9a-f]{64}$")
+
+
+def is_synthetic_discovered_key(identity_key: str) -> bool:
+    """True iff `identity_key` is the synthetic `discovered:{auth_hash}` form (ADR-0030).
+
+    Distinguishes a low-confidence per-credential discovered Principal (safe to
+    re-key on a stronger observed identity) from a claim-keyed / declared one
+    (never re-keyed by a weaker signal — the merge-safety invariant).
+    """
+
+    return _SYNTHETIC_KEY_RE.match(identity_key) is not None
