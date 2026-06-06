@@ -462,3 +462,81 @@ def test_oidc_opaque_access_tokens_collapse_via_issued_idtoken(
         eid=eid,
     )
     assert live[0]["c"] == 0
+
+
+def _saml_assertion_b64(name_id: str, issuer: str) -> str:
+    import base64 as _b64
+    xml = (
+        '<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" '
+        'xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">'
+        f"<saml:Issuer>{issuer}</saml:Issuer><saml:Assertion><saml:Subject>"
+        '<saml:NameID Format="urn:oasis:names:tc:SAML:2.0:nameid-format:persistent">'
+        f"{name_id}</saml:NameID></saml:Subject></saml:Assertion></samlp:Response>"
+    )
+    return _b64.b64encode(xml.encode()).decode()
+
+
+def _saml_acs_entry(*, second: int, saml_b64: str, session_value: str) -> dict:
+    from urllib.parse import quote
+    return {
+        "startedDateTime": f"2026-06-05T13:00:{second:02d}.000Z",
+        "request": {
+            "method": "POST", "url": "https://api.example.com/saml/acs", "queryString": [],
+            "headers": [{"name": "Content-Type", "value": "application/x-www-form-urlencoded"}],
+            "cookies": [], "headersSize": -1, "bodySize": 0,
+            "postData": {"mimeType": "application/x-www-form-urlencoded",
+                         "text": f"SAMLResponse={quote(saml_b64)}"},
+        },
+        "response": {
+            "status": 302, "bodySize": 0,
+            "headers": [{"name": "Set-Cookie", "value": f"session={session_value}; Path=/; HttpOnly"}],
+            "content": {"mimeType": "text/html", "text": ""},
+        },
+    }
+
+
+def _session_api_entry(*, second: int, session_value: str) -> dict:
+    return {
+        "startedDateTime": f"2026-06-05T13:00:{second:02d}.000Z",
+        "request": {
+            "method": "GET", "url": "https://api.example.com/api/data", "queryString": [],
+            "headers": [], "cookies": [{"name": "session", "value": session_value}],
+            "headersSize": -1, "bodySize": 0,
+        },
+        "response": {"status": 200, "bodySize": 2,
+                     "headers": [{"name": "Content-Type", "value": "application/json"}],
+                     "content": {"mimeType": "application/json", "text": "{}"}},
+    }
+
+
+def test_saml_session_cookies_collapse_via_assertion(
+    neo4j_client, redis_client, blob_client
+) -> None:
+    """ADR-0031 (SAML): two ACS logins for one user (rotated OPAQUE session cookies),
+    each assertion carrying the same persistent NameID, collapse the later session
+    requests onto ONE Principal keyed discovered:sub:{issuer}:{nameid}."""
+
+    eid = "eng-saml-e2e"
+    _seed_engagement(neo4j_client, eid)
+    issuer = "https://idp.example/saml"
+    saml = _saml_assertion_b64("persistent-user-1", issuer)
+    entries = [
+        _saml_acs_entry(second=1, saml_b64=saml, session_value="sess-opaque-1"),
+        _session_api_entry(second=2, session_value="sess-opaque-1"),
+        _saml_acs_entry(second=3, saml_b64=saml, session_value="sess-opaque-2"),  # re-login
+        _session_api_entry(second=4, session_value="sess-opaque-2"),
+    ]
+    har = json.dumps({"log": {"version": "1.2", "entries": entries}}).encode()
+    _run_pipeline(neo4j=neo4j_client, redis_client=redis_client, blob_client=blob_client,
+                  engagement_id=eid, har_bytes=har, filename="saml.har")
+
+    key = f"discovered:sub:{issuer}:persistent-user-1"
+    row = neo4j_client.execute_read(
+        "MATCH (p:Principal {engagement_id: $eid, identity_key: $key}) "
+        "RETURN count{ (:AuthContext)-[:OF_PRINCIPAL]->(p) } AS acs", eid=eid, key=key)
+    assert row and row[0]["acs"] == 2  # both session cookies collapse onto one actor
+
+    live = neo4j_client.execute_read(
+        "MATCH (ac:AuthContext)-[:OF_PRINCIPAL]->(p:Principal {engagement_id: $eid}) "
+        "WHERE p.identity_key =~ 'discovered:[0-9a-f]{64}' RETURN count(p) AS c", eid=eid)
+    assert live[0]["c"] == 0

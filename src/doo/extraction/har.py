@@ -42,6 +42,7 @@ from doo.canonical.identity import (
     canonicalize_host,
     canonicalize_path,
     compute_auth_hash,
+    compute_cue_auth_hash,
     derive_har_source_id,
 )
 from doo.canonical.value_objects import AuthContextCue, BlobRef, HostRef, ObservedIdentity
@@ -66,6 +67,7 @@ from doo.extraction.identity_signals import (
     extract_observed_identities_from_headers,
     extract_observed_identities_from_self_endpoint_body,
     extract_oidc_login_identity,
+    extract_saml_login_identity,
     is_self_endpoint,
 )
 from doo.ids import (
@@ -320,6 +322,20 @@ def _parse_entry(
             if oidc is not None:
                 issued_identities, issued_access_token = oidc
                 issued_credential_auth_hash = compute_auth_hash("bearer", issued_access_token)
+        # ADR-0031: SAML ACS — a request carrying a `SAMLResponse`; the assertion's
+        # identity binds to the session cookie(s) the ACS response sets (the
+        # credential future requests use). Skipped if an OIDC login already bound.
+        if issued_credential_auth_hash is None and isinstance(response, dict):
+            saml_b64 = next(
+                (bp.value for bp in request_body_params if bp.name == "SAMLResponse" and bp.value),
+                None,
+            )
+            if saml_b64:
+                saml_identities = extract_saml_login_identity(saml_b64)
+                cookie_hash = _saml_issued_auth_hash(response, session_cookie_names)
+                if saml_identities and cookie_hash is not None:
+                    issued_identities = saml_identities
+                    issued_credential_auth_hash = cookie_hash
         yield RequestObservation(
             event_id=_new_l2_event_id(),
             trace_id=envelope.trace_id,
@@ -491,6 +507,54 @@ def _cookie_pairs(request: dict[str, object]) -> list[tuple[str, str]]:
             if isinstance(name, str) and name and isinstance(value, str):
                 out.append((name, _normalize_cookie_value(value)))
     return out
+
+
+def _set_cookie_pairs(response: dict[str, object]) -> list[tuple[str, str]]:
+    """`(name, value)` pairs from a response's `Set-Cookie` headers (ADR-0031).
+
+    Iterates the raw header list (not a name-keyed map) so multiple `Set-Cookie`s
+    are all captured; takes the first `name=value` of each, normalised like a
+    request cookie so the hash matches what a future request computes.
+    """
+
+    out: list[tuple[str, str]] = []
+    raw = response.get("headers")
+    if isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict) or str(item.get("name", "")).lower() != "set-cookie":
+                continue
+            value = item.get("value")
+            if not isinstance(value, str) or "=" not in value:
+                continue
+            name, _, val = value.split(";", 1)[0].partition("=")
+            name, val = name.strip(), val.strip()
+            if name and val:
+                out.append((name, _normalize_cookie_value(val)))
+    return out
+
+
+def _saml_issued_auth_hash(
+    response: dict[str, object], session_cookie_names: tuple[str, ...]
+) -> Sha256Hex | None:
+    """The AuthContext `auth_hash` of the session the SAML ACS response issues.
+
+    Hashes the session-credential cookies the ACS `Set-Cookie`s the same way a
+    later request's cue does (session-scoped per ADR-0026, then `compute_cue_auth_hash`),
+    so the issued-credential binding matches the AuthContext those later requests
+    resolve to. `None` when the response sets no session cookie.
+    """
+
+    allowlist = frozenset(session_cookie_names) if session_cookie_names else None
+    session_hashes = sorted(
+        compute_auth_hash("cookie", val)
+        for name, val in _set_cookie_pairs(response)
+        if cookie_feeds_identity(name, val, allowlist=allowlist)
+    )
+    if not session_hashes:
+        return None
+    return compute_cue_auth_hash(
+        AuthContextCue(is_anonymous=False, cookie_session_hashes=tuple(session_hashes))
+    )
 
 
 def _decode_jwt_claims(token: str) -> dict[str, str | int | float | bool | None]:
