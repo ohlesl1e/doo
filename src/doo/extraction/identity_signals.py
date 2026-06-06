@@ -20,6 +20,8 @@ import json
 import re
 from collections.abc import Mapping
 
+import jwt
+
 from doo.canonical.value_objects import ObservedIdentity
 
 # Conventional identity response headers, highest-precision first. Generic
@@ -145,3 +147,63 @@ def extract_observed_identities_from_self_endpoint_body(
                 if found:
                     break
     return tuple(found)
+
+
+def _decode_id_token(token: str) -> dict[str, object]:
+    """Decode a JWT id_token *without verification* (claim peek; ADR-0015/0031).
+
+    Unverified is correct — we read claims for identity, never act on the token's
+    authority. A non-JWT / malformed string yields `{}` rather than raising.
+    """
+
+    try:
+        decoded = jwt.decode(token, options={"verify_signature": False, "verify_exp": False})
+    except jwt.PyJWTError:
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def _id_token_identities(claims: Mapping[str, object]) -> tuple[ObservedIdentity, ...]:
+    """Claim-tagged identities from decoded id_token claims (ADR-0031).
+
+    Reuses the account-unique-first taxonomy; adds the `iss` carrier when a `sub`
+    is present so the unified resolver can issuer-scope it (`discovered:sub:{iss}:…`).
+    """
+
+    out = list(_identity_claims_of(dict(claims)))
+    iss = claims.get("iss")
+    if isinstance(iss, str) and iss.strip() and any(i.claim == "sub" for i in out):
+        out.append(ObservedIdentity(claim="iss", value=iss.strip()))
+    return tuple(out)
+
+
+def extract_oidc_login_identity(
+    body_text: str, content_type: str
+) -> tuple[tuple[ObservedIdentity, ...], str] | None:
+    """An OIDC token-endpoint response → (identities from its id_token, issued access_token).
+
+    Recognized by shape (ADR-0031), path-agnostic: a JSON body carrying both an
+    `id_token` (JWT) and an `access_token`. The id_token is decoded (unverified)
+    for its identity claims; the `access_token` is the credential the login issues
+    — the caller binds these identities to `hash(access_token)`. Returns `None`
+    when the body isn't such a response, the id_token carries no identity claims,
+    or anything is malformed. Never raises.
+    """
+
+    base_mime = content_type.split(";", 1)[0].strip().lower()
+    if base_mime != "application/json" and not base_mime.endswith("+json"):
+        return None
+    try:
+        doc = json.loads(body_text)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(doc, dict):
+        return None
+    id_token = doc.get("id_token")
+    access_token = doc.get("access_token")
+    if not (isinstance(id_token, str) and isinstance(access_token, str) and access_token.strip()):
+        return None
+    identities = _id_token_identities(_decode_id_token(id_token))
+    if not identities:
+        return None
+    return identities, access_token.strip()

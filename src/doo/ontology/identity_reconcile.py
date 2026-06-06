@@ -27,6 +27,7 @@ import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
 from doo.canonical.identity import (
     _IDENTITY_CLAIM_PRIORITY,
@@ -106,21 +107,30 @@ def choose_observed_identity(
     return top_claim, values.pop()
 
 
-def _observed_identity_key(claim: str, value: str) -> str:
-    """The unified discovered key for an observed `(claim, value)` (ADR-0030).
+def _observed_identity_key(claim: str, value: str, identities: Sequence[tuple[str, str]]) -> str:
+    """The unified discovered key for an observed `(claim, value)` (ADR-0030/0031).
 
     Routes account-unique JWT-family claims through the shared resolver so the
     observed path emits exactly the same `discovered:{claim}:{value}` scheme as the
-    resolve-time cue path (hence the MERGE convergence). Identity headers (which the
-    resolver's claim list does not enumerate) are keyed directly on the same
+    resolve-time cue path (hence the MERGE convergence). For `sub`, the `iss` from
+    the same AuthContext's identity set is carried in so the resolver **issuer-scopes**
+    it (`discovered:sub:{iss}:{value}`) — exactly as the cue path does (ADR-0031:
+    an OIDC id_token `sub` and a bearer-JWT `sub` must converge issuer-scoped).
+    Identity headers (not in the resolver's claim list) key directly on the same
     scheme, the header name as the claim namespace.
     """
 
     if claim in _IDENTITY_CLAIM_PRIORITY:
+        claims: dict[str, object] = {claim: value}
+        if claim == "sub":
+            for c, v in identities:
+                if c == "iss" and v:
+                    claims["iss"] = v
+                    break
         # `auth_hash` here is a never-used fallback sentinel: a present priority
         # claim always wins, so the resolver returns the claim-keyed form.
         return discovered_principal_identity_key(
-            Sha256Hex("0" * 64), identity_claims={claim: value}
+            Sha256Hex("0" * 64), identity_claims=claims
         )
     return f"discovered:{claim}:{value}"
 
@@ -192,9 +202,16 @@ def reconcile_observed_identities(
     flush path honours the same declared claim as the resolve-time path.
     """
 
-    # Gather, per (non-anonymous) AuthContext, the serialized observed-identity
-    # lists its observations asserted, plus the Principal it currently resolves to.
-    rows = client.execute_read(
+    # Gather, per (non-anonymous) AuthContext, the serialized identity lists bound
+    # to it, plus the Principal it currently resolves to. Two sources, merged by
+    # auth_hash:
+    #   (a) identities revealed via the request's OWN credential — an identity
+    #       header or self-endpoint body on a request that used that AuthContext
+    #       (ADR-0029/0030);
+    #   (b) identities a login response ISSUED for that credential — bound by the
+    #       issued credential's `auth_hash`, NOT the login request's own (ADR-0031),
+    #       so a later opaque access-token / session request collapses onto the actor.
+    own_rows = client.execute_read(
         """
         MATCH (r:RequestObservation {engagement_id: $eid})
               -[:OBSERVED_UNDER]->(ac:AuthContext)-[:OF_PRINCIPAL]->(p:Principal)
@@ -205,6 +222,27 @@ def reconcile_observed_identities(
         """,
         eid=engagement_id,
     )
+    issued_rows = client.execute_read(
+        """
+        MATCH (r:RequestObservation {engagement_id: $eid})
+        WHERE r.issued_credential_auth_hash IS NOT NULL
+          AND r.issued_identities IS NOT NULL AND size(r.issued_identities) > 0
+        MATCH (ac:AuthContext {engagement_id: $eid, auth_hash: r.issued_credential_auth_hash})
+              -[:OF_PRINCIPAL]->(p:Principal)
+        WHERE p.is_anonymous = false
+        RETURN ac.auth_hash AS auth_hash, p.identity_key AS principal_key,
+               collect(r.issued_identities) AS identity_lists
+        """,
+        eid=engagement_id,
+    )
+    merged: dict[str, dict[str, Any]] = {}
+    for r in (*own_rows, *issued_rows):
+        entry = merged.setdefault(
+            str(r["auth_hash"]),
+            {"auth_hash": r["auth_hash"], "principal_key": r["principal_key"], "identity_lists": []},
+        )
+        entry["identity_lists"].extend(r["identity_lists"])
+    rows = list(merged.values())
 
     upgrades = 0
     aliases = 0
@@ -256,7 +294,7 @@ def reconcile_observed_identities(
             continue
 
         claim, value = chosen
-        target_key = _observed_identity_key(claim, value)
+        target_key = _observed_identity_key(claim, value, identities)
         target_pid = principal_id(engagement_id, target_key)
         p_props = cross_cutting(
             source="har",

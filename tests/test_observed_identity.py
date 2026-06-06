@@ -1,13 +1,56 @@
-"""Unit tests for observed-response identity extraction + choice (ADR-0030)."""
+"""Unit tests for observed-response identity extraction + choice (ADR-0030/0031)."""
 
 from __future__ import annotations
+
+import json
+
+import jwt as pyjwt
 
 from doo.extraction.identity_signals import (
     extract_observed_identities_from_headers,
     extract_observed_identities_from_self_endpoint_body,
+    extract_oidc_login_identity,
     is_self_endpoint,
 )
 from doo.ontology.identity_reconcile import choose_observed_identity
+
+_OIDC_SK = "oidc-signing-key-at-least-32-bytes-long!!"
+
+
+def test_oidc_login_extracts_idtoken_identities_and_issued_access_token() -> None:
+    idt = pyjwt.encode(
+        {"sub": "u-1", "iss": "https://idp.example", "email": "Admin@X.COM"},
+        _OIDC_SK,
+        algorithm="HS256",
+    )
+    body = json.dumps({"id_token": idt, "access_token": "opaque-at-123", "token_type": "Bearer"})
+    res = extract_oidc_login_identity(body, "application/json")
+    assert res is not None
+    identities, access_token = res
+    assert access_token == "opaque-at-123"
+    claims = {i.claim: i.value for i in identities}
+    assert claims["sub"] == "u-1"
+    assert claims["iss"] == "https://idp.example"  # iss carrier for sub scoping
+    assert claims["email"] == "admin@x.com"  # lowercased
+
+
+def test_oidc_login_none_without_id_token() -> None:
+    assert extract_oidc_login_identity(json.dumps({"access_token": "x"}), "application/json") is None
+
+
+def test_oidc_login_none_without_access_token() -> None:
+    idt = pyjwt.encode({"sub": "u"}, _OIDC_SK, algorithm="HS256")
+    assert extract_oidc_login_identity(json.dumps({"id_token": idt}), "application/json") is None
+
+
+def test_oidc_login_none_on_non_json_or_malformed() -> None:
+    assert extract_oidc_login_identity("not json", "text/plain") is None
+    assert (
+        extract_oidc_login_identity(
+            json.dumps({"id_token": "not-a-jwt", "access_token": "x"}), "application/json"
+        )
+        is None
+    )
 
 # --- header extraction (claim-tagged, multi-value) --------------------------
 
