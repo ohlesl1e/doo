@@ -16,8 +16,12 @@ discovered `Principal` (`ontology/identity_reconcile.py`).
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import re
+import xml.etree.ElementTree as ET
+import zlib
 from collections.abc import Mapping
 
 import jwt
@@ -207,3 +211,104 @@ def extract_oidc_login_identity(
     if not identities:
         return None
     return identities, access_token.strip()
+
+
+# --- SAML assertion (ADR-0031, T-IDV3) --------------------------------------
+
+# Cap on decoded SAML XML size + a DOCTYPE/ENTITY guard: cheap defenses against
+# entity-expansion ("billion laughs") DoS when parsing attacker-influenced
+# assertions with the stdlib XML parser. (defusedxml is the heavier future
+# hardening; this is sufficient for captured-traffic parsing.)
+_SAML_MAX_BYTES = 1_000_000
+
+
+def _decode_saml_xml(saml_response_b64: str) -> bytes | None:
+    """Decode a `SAMLResponse` parameter to its XML bytes, or `None`.
+
+    HTTP-POST binding carries raw base64 XML; HTTP-Redirect carries base64 of
+    raw-DEFLATE-compressed XML — try both. Rejects oversized / DOCTYPE-bearing
+    input. Never raises.
+    """
+
+    try:
+        data = base64.b64decode(saml_response_b64, validate=False)
+    except (binascii.Error, ValueError):
+        return None
+    if b"<" not in data[:64]:  # not raw XML — try raw-DEFLATE (Redirect binding)
+        try:
+            data = zlib.decompress(data, -15)
+        except zlib.error:
+            return None
+    if len(data) > _SAML_MAX_BYTES:
+        return None
+    if b"<!DOCTYPE" in data or b"<!ENTITY" in data:
+        return None  # entity-expansion guard
+    return data
+
+
+def _localname(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def extract_saml_login_identity(saml_response_b64: str) -> tuple[ObservedIdentity, ...]:
+    """Claim-tagged identities from a SAML `SAMLResponse` assertion (ADR-0031).
+
+    Decodes the assertion and maps to the unified claim taxonomy:
+    - a **persistent** (or unspecified/other) `NameID` -> `sub`, with the assertion
+      `Issuer` carried as `iss` so the unified resolver issuer-scopes it
+      (`discovered:sub:{issuer}:{nameid}`) — the SAML subject is the federated
+      subject, exactly like an OIDC `sub`;
+    - an **emailAddress** `NameID` -> `email` (lowercased, person-level);
+    - a **transient** `NameID` -> nothing (per-session — never a key);
+    - an email-shaped `Attribute` -> `email`.
+    Namespace-agnostic (matches by local name). Malformed input -> empty tuple,
+    never raises. Deterministic, no LLM (ADR-0015 standing — same as JWT decode).
+    """
+
+    xml_bytes = _decode_saml_xml(saml_response_b64)
+    if xml_bytes is None:
+        return ()
+    try:
+        root = ET.fromstring(xml_bytes)  # noqa: S314 - DOCTYPE/ENTITY guarded above
+    except ET.ParseError:
+        return ()
+
+    issuer = ""
+    name_id: tuple[str, str] | None = None  # (format-localname-lower, value)
+    emails: list[str] = []
+    for el in root.iter():
+        tag = _localname(el.tag)
+        text = (el.text or "").strip()
+        if tag == "Issuer" and not issuer and text:
+            issuer = text
+        elif tag == "NameID" and name_id is None and text:
+            fmt = (el.get("Format") or "").rsplit(":", 1)[-1].lower()
+            name_id = (fmt, text)
+        elif tag == "Attribute":
+            attr_name = (el.get("Name") or "").lower()
+            if "email" in attr_name or attr_name.endswith("mail"):
+                for child in el:
+                    child_text = (child.text or "").strip()
+                    if _localname(child.tag) == "AttributeValue" and child_text:
+                        emails.append(child_text.lower())
+
+    out: list[ObservedIdentity] = []
+    if name_id is not None:
+        fmt, value = name_id
+        if fmt == "emailaddress":
+            out.append(ObservedIdentity(claim="email", value=value.lower()))
+        elif fmt != "transient":  # persistent / unspecified / other -> federated subject
+            out.append(ObservedIdentity(claim="sub", value=value))
+            if issuer:
+                out.append(ObservedIdentity(claim="iss", value=issuer))
+    for email in emails:
+        out.append(ObservedIdentity(claim="email", value=email))
+
+    seen: set[tuple[str, str]] = set()
+    uniq: list[ObservedIdentity] = []
+    for oi in out:
+        k = (oi.claim, oi.value)
+        if k not in seen:
+            seen.add(k)
+            uniq.append(oi)
+    return tuple(uniq)

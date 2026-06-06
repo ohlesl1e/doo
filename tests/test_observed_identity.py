@@ -10,6 +10,7 @@ from doo.extraction.identity_signals import (
     extract_observed_identities_from_headers,
     extract_observed_identities_from_self_endpoint_body,
     extract_oidc_login_identity,
+    extract_saml_login_identity,
     is_self_endpoint,
 )
 from doo.ontology.identity_reconcile import choose_observed_identity
@@ -195,3 +196,61 @@ def test_body_identity_no_claim_is_empty() -> None:
     assert extract_observed_identities_from_self_endpoint_body(
         '{"role": "admin", "mfaEnabled": false}', "application/json"
     ) == ()
+
+
+# --- SAML assertion extraction (ADR-0031, T-IDV3) ---------------------------
+
+import base64 as _b64  # noqa: E402
+
+
+def _saml_b64(*, name_id: str, fmt: str, issuer: str = "https://idp.example/saml",
+              email_attr: str | None = None) -> str:
+    attr = (
+        f'<saml:AttributeStatement><saml:Attribute Name="email">'
+        f"<saml:AttributeValue>{email_attr}</saml:AttributeValue>"
+        f"</saml:Attribute></saml:AttributeStatement>"
+        if email_attr else ""
+    )
+    xml = (
+        '<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" '
+        'xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">'
+        f"<saml:Issuer>{issuer}</saml:Issuer><saml:Assertion><saml:Subject>"
+        f'<saml:NameID Format="urn:oasis:names:tc:SAML:2.0:nameid-format:{fmt}">'
+        f"{name_id}</saml:NameID></saml:Subject>{attr}</saml:Assertion></samlp:Response>"
+    )
+    return _b64.b64encode(xml.encode()).decode()
+
+
+def test_saml_persistent_nameid_maps_to_issuer_scoped_sub() -> None:
+    ids = {i.claim: i.value for i in extract_saml_login_identity(
+        _saml_b64(name_id="persistent-abc", fmt="persistent"))}
+    assert ids["sub"] == "persistent-abc"
+    assert ids["iss"] == "https://idp.example/saml"  # SAML Issuer scopes the sub
+
+
+def test_saml_emailaddress_nameid_maps_to_email() -> None:
+    ids = {i.claim: i.value for i in extract_saml_login_identity(
+        _saml_b64(name_id="Bob@Y.COM", fmt="emailAddress"))}
+    assert ids == {"email": "bob@y.com"}  # lowercased, person-level; no sub/iss
+
+
+def test_saml_transient_nameid_is_never_a_key() -> None:
+    # transient is per-session — yields no sub/iss; only a present email attribute.
+    ids = extract_saml_login_identity(
+        _saml_b64(name_id="ephemeral-xyz", fmt="transient", email_attr="carol@z.com"))
+    claims = {i.claim: i.value for i in ids}
+    assert "sub" not in claims
+    assert claims.get("email") == "carol@z.com"
+
+
+def test_saml_email_attribute_extracted() -> None:
+    ids = {i.claim: i.value for i in extract_saml_login_identity(
+        _saml_b64(name_id="p-1", fmt="persistent", email_attr="Dave@W.com"))}
+    assert ids["sub"] == "p-1"
+    assert ids["email"] == "dave@w.com"
+
+
+def test_saml_malformed_and_doctype_yield_empty() -> None:
+    assert extract_saml_login_identity("not-base64-!!!") == ()
+    assert extract_saml_login_identity(_b64.b64encode(b"<notxml").decode()) == ()
+    assert extract_saml_login_identity(_b64.b64encode(b"<!DOCTYPE x><r/>").decode()) == ()
