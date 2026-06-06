@@ -51,7 +51,8 @@ class Neo4jGraphState:
             RETURN e.id AS id, e.name AS name, e.description AS description,
                    s.content_hash AS scope_content_hash,
                    e.kill_switch AS kill_switch,
-                   e.session_cookie_names AS session_cookie_names
+                   e.session_cookie_names AS session_cookie_names,
+                   e.identity_key AS identity_key
             LIMIT 1
             """,
             engagement_id=engagement_id,
@@ -72,6 +73,7 @@ class Neo4jGraphState:
             kill_switch_ttl_seconds=int(kill_switch.get("lease_ttl_seconds", 60)),
             kill_switch_refresh_seconds=int(kill_switch.get("refresh_interval_seconds", 30)),
             session_cookie_names=tuple(row.get("session_cookie_names") or ()),
+            identity_key=row.get("identity_key"),
             declared_principals=self._fetch_declared_principals(engagement_id),
         )
 
@@ -90,6 +92,22 @@ class Neo4jGraphState:
         if not rows:
             return ()
         return tuple(rows[0].get("names") or ())
+
+    def get_identity_key(self, engagement_id: EngagementId) -> str | None:
+        """The engagement's declared `identity_key` claim override (ADR-0032).
+
+        Lightweight read for L3 keying. Returns `None` when unset or the
+        engagement is absent (fall back to the heuristic priority).
+        """
+
+        rows = self._client.execute_read(
+            "MATCH (e:Engagement {id: $engagement_id}) "
+            "RETURN e.identity_key AS identity_key LIMIT 1",
+            engagement_id=engagement_id,
+        )
+        if not rows:
+            return None
+        return rows[0].get("identity_key")
 
     def _fetch_declared_principals(
         self, engagement_id: EngagementId
@@ -242,6 +260,7 @@ def _engagement_update(client: Neo4jClient, m: PlannedMutation) -> None:
         SET e.name = $props.name, e.description = $props.description,
             e.kill_switch = $props.kill_switch,
             e.session_cookie_names = $props.session_cookie_names,
+            e.identity_key = $props.identity_key,
             e.last_seen = $props.last_seen
         """,
         id=props["id"],

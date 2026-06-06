@@ -57,6 +57,7 @@ class FakeGraphState:
             kill_switch_ttl_seconds=base.kill_switch_ttl_seconds,
             kill_switch_refresh_seconds=base.kill_switch_refresh_seconds,
             session_cookie_names=base.session_cookie_names,
+            identity_key=base.identity_key,
             declared_principals=dict(self.principals.get(engagement_id, {})),
         )
 
@@ -118,6 +119,7 @@ class FakeGraphState:
                         "refresh_interval_seconds"
                     ],
                     session_cookie_names=tuple(m.properties.get("session_cookie_names") or ()),
+                    identity_key=m.properties.get("identity_key"),
                 )
             elif m.kind == "engagement_rebind_scope":
                 eid = m.properties["engagement_id"]
@@ -130,6 +132,7 @@ class FakeGraphState:
                     kill_switch_ttl_seconds=prev.kill_switch_ttl_seconds,
                     kill_switch_refresh_seconds=prev.kill_switch_refresh_seconds,
                     session_cookie_names=prev.session_cookie_names,
+                    identity_key=prev.identity_key,
                 )
             elif m.kind == "engagement_update":
                 eid = m.properties["id"]
@@ -148,6 +151,11 @@ class FakeGraphState:
                         m.properties.get("session_cookie_names")
                         if m.properties.get("session_cookie_names") is not None
                         else prev.session_cookie_names
+                    ),
+                    identity_key=(
+                        m.properties.get("identity_key")
+                        if "identity_key" in m.properties
+                        else prev.identity_key
                     ),
                 )
 
@@ -373,3 +381,74 @@ def test_loader_rejects_inline_token_and_non_kebab_label() -> None:
     d2["principals"] = [{"label": "Test_User_A"}]
     with pytest.raises(ValidationError):
         _build_config(d2)
+
+
+# ---------------------------------------------------------------------------
+# auth.identity_key tests (ADR-0032)
+# ---------------------------------------------------------------------------
+
+
+def test_config_accepts_identity_key_and_defaults_none() -> None:
+    """Default: no auth block → identity_key is None."""
+    assert _build_config().auth.identity_key is None
+
+    # Explicit value parses correctly.
+    d = _base_config_dict()
+    d["auth"] = {"identity_key": "_id"}
+    assert _build_config(d).auth.identity_key == "_id"
+
+    # Source-qualified prefix is accepted as-is (stripping is in the resolver).
+    d2 = _base_config_dict()
+    d2["auth"] = {"identity_key": "claim:_id"}
+    assert _build_config(d2).auth.identity_key == "claim:_id"
+
+
+def test_loader_identity_key_round_trips_on_create() -> None:
+    """identity_key is stored on the engagement_create mutation and round-trips."""
+    state = FakeGraphState()
+    d = _base_config_dict()
+    d["auth"] = {"identity_key": "_id"}
+    config = _build_config(d)
+    load_engagement(config, state)
+
+    create = next(m for m in state.applied if m.kind == "engagement_create")
+    assert create.properties["identity_key"] == "_id"
+    # Identical reload is a noop (the field round-trips through the diff).
+    result = load_engagement(config, state)
+    assert result.noop
+    assert result.mutations == ()
+
+
+def test_loader_identity_key_change_is_material() -> None:
+    """Changing identity_key is a material change that requires confirmation."""
+    state = FakeGraphState()
+    load_engagement(_build_config(), state)  # starts with None
+
+    d2 = _base_config_dict()
+    d2["auth"] = {"identity_key": "_id"}
+    result = load_engagement(_build_config(d2), state, apply=True)
+    assert not result.noop
+    assert result.material_changes_applied
+    update = next(m for m in result.mutations if m.kind == "engagement_update")
+    assert update.properties["identity_key"] == "_id"
+
+
+def test_loader_identity_key_none_to_none_is_noop() -> None:
+    """Re-loading with identity_key=None when current is None is a no-op."""
+    state = FakeGraphState()
+    config = _build_config()
+    load_engagement(config, state)
+    result = load_engagement(config, state)
+    assert result.noop
+
+
+def test_loader_identity_key_with_session_cookie_names_coexist() -> None:
+    """Both auth fields can be set simultaneously."""
+    state = FakeGraphState()
+    d = _base_config_dict()
+    d["auth"] = {"session_cookie_names": ["sid"], "identity_key": "username"}
+    config = _build_config(d)
+    load_engagement(config, state)
+    create = next(m for m in state.applied if m.kind == "engagement_create")
+    assert create.properties["session_cookie_names"] == ["sid"]
+    assert create.properties["identity_key"] == "username"

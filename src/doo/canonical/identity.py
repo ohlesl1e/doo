@@ -318,8 +318,31 @@ _IDENTITY_CLAIM_PRIORITY: tuple[str, ...] = (
 )
 
 
+# Source-qualifier prefixes that the tester may attach to `auth.identity_key`
+# (ADR-0032). Stripped to a bare claim name before use — full source routing is
+# out of scope for this ADR.
+_SOURCE_PREFIXES: tuple[str, ...] = ("claim:", "header:", "body:")
+
+
+def _strip_source_prefix(name: str) -> str:
+    """Strip an optional source-qualifier prefix from an `auth.identity_key` value.
+
+    ``claim:_id`` → ``_id``, ``header:x-user-id`` → ``x-user-id``,
+    ``body:accountRef`` → ``accountRef``. A bare name is returned unchanged.
+    Pure helper so the resolver stays readable.
+    """
+
+    for prefix in _SOURCE_PREFIXES:
+        if name.startswith(prefix):
+            return name[len(prefix):]
+    return name
+
+
 def discovered_principal_identity_key(
-    auth_hash: Sha256Hex, *, identity_claims: Mapping[str, object] | None = None
+    auth_hash: Sha256Hex,
+    *,
+    identity_claims: Mapping[str, object] | None = None,
+    preferred_claim: str | None = None,
 ) -> str:
     """`identity_key` for a discovered (undeclared) Principal (ADR-0010 step 5; ADR-0030).
 
@@ -327,6 +350,14 @@ def discovered_principal_identity_key(
     `_IDENTITY_CLAIM_PRIORITY` (`sub` -> ... -> `email` last, `email` lowercased).
     `sub` is **issuer-scoped** when an `iss` claim is present
     (`discovered:sub:{iss}:{sub}`) — OIDC `sub` is unique only within its issuer.
+
+    When `preferred_claim` is set (from `auth.identity_key`, ADR-0032) **and** that
+    claim is present, scalar, and non-empty in `identity_claims`, it overrides the
+    heuristic priority list. The key is formed on `discovered:{claim}:{value}` with
+    the same email-lowercasing and sub-issuer-scoping rules. When the declared claim
+    is absent, the function falls back to the heuristic priority without penalty —
+    absence is not punished into a synthetic. Any source-qualifier prefix
+    (``claim:``, ``header:``, ``body:``) is stripped before use.
 
     The SAME scheme is produced at resolve-time (from a credential's decoded JWT
     claims) and at flush-time (from a response's observed identities), so a bearer
@@ -342,6 +373,22 @@ def discovered_principal_identity_key(
     """
 
     if identity_claims:
+        # ADR-0032: preferred_claim overrides the priority when present + scalar + non-empty.
+        if preferred_claim is not None:
+            claim = _strip_source_prefix(preferred_claim)
+            raw = identity_claims.get(claim)
+            if isinstance(raw, str | int) and not isinstance(raw, bool):
+                value = str(raw).strip()
+                if value:
+                    if claim == "email":
+                        value = value.lower()
+                    if claim == "sub":
+                        iss = identity_claims.get("iss")
+                        if isinstance(iss, str) and iss.strip():
+                            return f"discovered:sub:{iss.strip()}:{value}"
+                    return f"discovered:{claim}:{value}"
+            # Declared claim absent → fall through to heuristic.
+
         for claim in _IDENTITY_CLAIM_PRIORITY:
             raw = identity_claims.get(claim)
             # Scalar identity claims only; bool is an int subclass but never an id.

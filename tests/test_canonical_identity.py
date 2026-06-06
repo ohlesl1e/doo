@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from doo.canonical.identity import (
+    _strip_source_prefix,
     canonicalize_host,
     canonicalize_path,
     compute_anonymous_auth_hash,
@@ -250,3 +251,94 @@ def test_is_synthetic_discovered_key() -> None:
     assert not is_synthetic_discovered_key("discovered:x-user-id:alice")
     assert not is_synthetic_discovered_key("declared:test-user")
     assert not is_synthetic_discovered_key("anonymous")
+
+
+# --- ADR-0032: preferred_claim override ---
+
+
+def test_preferred_claim_overrides_priority_when_present() -> None:
+    """When preferred_claim is set and the claim is present, it wins over priority."""
+    # `sub` would normally rank first, but tester declared `_id` as the key.
+    key = discovered_principal_identity_key(
+        _AUTH_HASH,
+        identity_claims={"sub": "s-1", "_id": "mongo-id-42"},
+        preferred_claim="_id",
+    )
+    assert key == "discovered:_id:mongo-id-42"
+
+
+def test_preferred_claim_falls_back_to_heuristic_when_absent() -> None:
+    """When the preferred_claim is not in the claim set, fall back to heuristic."""
+    key = discovered_principal_identity_key(
+        _AUTH_HASH,
+        identity_claims={"sub": "s-1", "uid": "u-7"},
+        preferred_claim="username",  # not present
+    )
+    # Heuristic: sub beats uid
+    assert key == "discovered:sub:s-1"
+
+
+def test_preferred_claim_falls_back_to_synthetic_when_no_claims() -> None:
+    """Preferred claim absent and no other claims → synthetic fallback."""
+    key = discovered_principal_identity_key(
+        _AUTH_HASH,
+        identity_claims={},
+        preferred_claim="_id",
+    )
+    assert key == f"discovered:{_AUTH_HASH}"
+
+
+def test_preferred_claim_strips_source_qualifier_prefix() -> None:
+    """Source-qualifier prefixes (claim:, header:, body:) are stripped."""
+    claims = {"_id": "mongo-42", "sub": "s-1"}
+    assert (
+        discovered_principal_identity_key(_AUTH_HASH, identity_claims=claims, preferred_claim="claim:_id")
+        == "discovered:_id:mongo-42"
+    )
+    assert (
+        discovered_principal_identity_key(_AUTH_HASH, identity_claims=claims, preferred_claim="header:_id")
+        == "discovered:_id:mongo-42"
+    )
+    assert (
+        discovered_principal_identity_key(_AUTH_HASH, identity_claims=claims, preferred_claim="body:_id")
+        == "discovered:_id:mongo-42"
+    )
+
+
+def test_preferred_claim_sub_still_iss_scoped() -> None:
+    """preferred_claim='sub' still applies issuer scoping (same rules as heuristic)."""
+    key = discovered_principal_identity_key(
+        _AUTH_HASH,
+        identity_claims={"sub": "u-1", "iss": "https://idp.example", "_id": "mongo-99"},
+        preferred_claim="sub",
+    )
+    assert key == "discovered:sub:https://idp.example:u-1"
+
+
+def test_preferred_claim_email_lowercased() -> None:
+    """preferred_claim='email' still lowercases the value."""
+    key = discovered_principal_identity_key(
+        _AUTH_HASH,
+        identity_claims={"email": "Alice@Example.COM", "sub": "s-1"},
+        preferred_claim="email",
+    )
+    assert key == "discovered:email:alice@example.com"
+
+
+def test_preferred_claim_none_behaves_as_before() -> None:
+    """No preferred_claim → identical to calling without the argument."""
+    claims = {"sub": "s-1", "_id": "m-42"}
+    assert discovered_principal_identity_key(
+        _AUTH_HASH, identity_claims=claims
+    ) == discovered_principal_identity_key(
+        _AUTH_HASH, identity_claims=claims, preferred_claim=None
+    )
+
+
+def test_strip_source_prefix_removes_known_prefixes() -> None:
+    """_strip_source_prefix strips claim:, header:, body: and leaves bare names."""
+    assert _strip_source_prefix("claim:_id") == "_id"
+    assert _strip_source_prefix("header:x-user-id") == "x-user-id"
+    assert _strip_source_prefix("body:accountRef") == "accountRef"
+    assert _strip_source_prefix("_id") == "_id"
+    assert _strip_source_prefix("sub") == "sub"
