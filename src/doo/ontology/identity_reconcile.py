@@ -30,6 +30,7 @@ from datetime import datetime
 
 from doo.canonical.identity import (
     _IDENTITY_CLAIM_PRIORITY,
+    _strip_source_prefix,
     discovered_principal_identity_key,
     is_synthetic_discovered_key,
     principal_id,
@@ -150,14 +151,46 @@ def _parse_observed_identities(raw: object) -> list[tuple[str, str]]:
     return out
 
 
+def _choose_observed_identity_with_preferred(
+    identities: Sequence[tuple[str, str]],
+    *,
+    preferred_claim: str | None,
+) -> tuple[str, str] | None:
+    """Like `choose_observed_identity` but honours `preferred_claim` (ADR-0032).
+
+    When `preferred_claim` is set, strip its source-qualifier prefix and check
+    whether that claim is present in `identities` with a single unambiguous value.
+    If yes, return `(claim, value)` directly — overriding the rank ordering. If
+    the preferred claim has conflicting values, return `None` (merge-safety).
+    If the preferred claim is absent, fall back to the standard rank ordering.
+    """
+
+    if preferred_claim is not None and identities:
+        claim = _strip_source_prefix(preferred_claim)
+        preferred_values = {value for c, value in identities if c == claim}
+        if preferred_values:
+            if len(preferred_values) != 1:
+                return None  # conflicting values — do not merge.
+            return claim, preferred_values.pop()
+        # Preferred claim absent → fall back to heuristic.
+
+    return choose_observed_identity(identities)
+
+
 def reconcile_observed_identities(
     client: Neo4jClient,
     *,
     engagement_id: EngagementId,
     observed_at: datetime,
     ingested_at: datetime,
+    preferred_claim: str | None = None,
 ) -> ReconcileResult:
-    """Upgrade synthetic discovered Principals + alias observed identities (ADR-0030)."""
+    """Upgrade synthetic discovered Principals + alias observed identities (ADR-0030).
+
+    `preferred_claim` is the engagement-global `auth.identity_key` override
+    (ADR-0032). When set, it is forwarded into the keying decision so that the
+    flush path honours the same declared claim as the resolve-time path.
+    """
 
     # Gather, per (non-anonymous) AuthContext, the serialized observed-identity
     # lists its observations asserted, plus the Principal it currently resolves to.
@@ -188,7 +221,7 @@ def reconcile_observed_identities(
         if not identities:
             continue
 
-        chosen = choose_observed_identity(identities)
+        chosen = _choose_observed_identity_with_preferred(identities, preferred_claim=preferred_claim)
 
         # Record ALL of this AuthContext's claim values as aliases (ADR-0030):
         # enrichment that never re-keys or merges, so `email` always surfaces as a

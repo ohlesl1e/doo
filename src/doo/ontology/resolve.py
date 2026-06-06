@@ -148,6 +148,7 @@ def resolve_auth_context(
     observed_at: datetime,
     ingested_at: datetime,
     cue: AuthContextCue | None = None,
+    preferred_claim: str | None = None,
 ) -> ResolvedAuthContext:
     """Resolve the AuthContext + Principal a request's auth cue maps to (ADR-0010).
 
@@ -162,6 +163,11 @@ def resolve_auth_context(
        declared Principals' `known_signals`. On a match the discovered AuthContext
        attaches to the matched **declared** Principal (no phantom twin). On no
        match a discovered Principal is synthesised (`unmerged=true`).
+
+    `preferred_claim` is the engagement-global `auth.identity_key` override
+    (ADR-0032). When set, it is forwarded to `discovered_principal_identity_key`
+    so step 5 keys on the declared claim rather than the heuristic priority.
+    Anonymous, declared-match, and re-attach paths are unaffected.
     """
 
     if cue is None or cue.is_anonymous:
@@ -218,7 +224,10 @@ def resolve_auth_context(
     # the namespaced claim-priority list (sub → … → email) decoded from the cue's
     # credential, so a user's reissued tokens collapse to one Principal (ADR-0027);
     # else on the per-credential auth_hash.
-    p_key = discovered_principal_identity_key(auth_hash, identity_claims=cue.identity_claims)
+    # ADR-0032: preferred_claim overrides the heuristic when set.
+    p_key = discovered_principal_identity_key(
+        auth_hash, identity_claims=cue.identity_claims, preferred_claim=preferred_claim
+    )
     p_id = principal_id(engagement_id, p_key)
     _write_discovered_principal_and_auth_context(
         client,

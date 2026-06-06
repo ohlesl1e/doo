@@ -101,6 +101,7 @@ class CurrentEngagementState:
     kill_switch_ttl_seconds: int
     kill_switch_refresh_seconds: int
     session_cookie_names: tuple[str, ...] = ()
+    identity_key: str | None = None
     declared_principals: dict[str, dict[str, Any]] = dataclasses.field(default_factory=dict)
 
 
@@ -365,6 +366,7 @@ def _build_diff(
     desired_scope_view: dict[str, Any],
     desired_kill_switch: dict[str, Any],
     desired_session_cookie_names: list[str],
+    desired_identity_key: str | None,
     current_scope_view: dict[str, Any] | None,
     desired_principal_views: dict[str, dict[str, Any]] | None = None,
 ) -> str:
@@ -383,12 +385,14 @@ def _build_diff(
             "refresh_interval_seconds": current.kill_switch_refresh_seconds,
         },
         "session_cookie_names": list(current.session_cookie_names),
+        "identity_key": current.identity_key,
         "principals": current.declared_principals,
     }
     desired_view = {
         "scope": desired_scope_view,
         "kill_switch": desired_kill_switch,
         "session_cookie_names": desired_session_cookie_names,
+        "identity_key": desired_identity_key,
         "principals": desired_principal_views if desired_principal_views is not None else {},
     }
 
@@ -606,6 +610,7 @@ def load_engagement(
                     else None,
                     "kill_switch": desired_kill_switch,
                     "session_cookie_names": list(config.auth.session_cookie_names),
+                    "identity_key": config.auth.identity_key,
                     # Cross-cutting fields per ADR-0005.
                     "source": "manual",
                     "source_id": None,
@@ -665,6 +670,7 @@ def load_engagement(
     session_cookies_changed = tuple(current.session_cookie_names) != tuple(
         config.auth.session_cookie_names
     )
+    identity_key_changed = current.identity_key != config.auth.identity_key
 
     # Principal diff (ADR-0019): adds, removes, and mods are material. The
     # comparison is over the secret-free `_principal_view` dicts.
@@ -685,7 +691,11 @@ def load_engagement(
     )
 
     material = (
-        scope_changed or killswitch_changed or principals_changed or session_cookies_changed
+        scope_changed
+        or killswitch_changed
+        or principals_changed
+        or session_cookies_changed
+        or identity_key_changed
     )
     cosmetic = name_changed or description_changed
 
@@ -709,6 +719,7 @@ def load_engagement(
             desired_scope_view=desired_scope_view,
             desired_kill_switch=desired_kill_switch,
             desired_session_cookie_names=list(config.auth.session_cookie_names),
+            desired_identity_key=config.auth.identity_key,
             current_scope_view=None,
             desired_principal_views=desired_principal_views,
         )
@@ -761,7 +772,13 @@ def load_engagement(
             )
         )
 
-    if killswitch_changed or name_changed or description_changed or session_cookies_changed:
+    if (
+        killswitch_changed
+        or name_changed
+        or description_changed
+        or session_cookies_changed
+        or identity_key_changed
+    ):
         mutations.append(
             PlannedMutation(
                 kind="engagement_update",
@@ -771,6 +788,7 @@ def load_engagement(
                     "description": config.engagement.description,
                     "kill_switch": desired_kill_switch,
                     "session_cookie_names": list(config.auth.session_cookie_names),
+                    "identity_key": config.auth.identity_key,
                     "last_seen": now,
                 },
             )

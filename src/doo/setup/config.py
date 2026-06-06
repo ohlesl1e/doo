@@ -252,11 +252,20 @@ class AuthConfig(BaseModel):
     multi-host engagement because cookies are host-scoped at request time, so the
     union partitions naturally. Cookie names are matched exactly (case-sensitive,
     per RFC 6265).
+
+    `identity_key` is the authoritative engagement-global claim name that
+    identifies a user (ADR-0032). When set and an actor exposes that claim, it
+    overrides the heuristic claim-priority. When absent or the actor never
+    exposes the claim, the resolver falls back to the heuristic. Accepts an
+    optional source-qualifier prefix (`claim:`, `header:`, `body:`); the prefix
+    is stripped — only the claim name is used for keying (full source routing is
+    out of scope for this ADR).
     """
 
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
 
     session_cookie_names: tuple[str, ...] = ()
+    identity_key: str | None = None
 
     _coerce_names = field_validator("session_cookie_names", mode="before")(_list_to_tuple)
 

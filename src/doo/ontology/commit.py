@@ -141,6 +141,25 @@ class CommitOrchestrator:
         # When set, every committed event must match this engagement (the
         # commit-time scoping gate; ADR-0017). The worker sets it per-envelope.
         self._expected_engagement_id = expected_engagement_id
+        # ADR-0032: per-engagement `identity_key` override cache. Read once per
+        # engagement from the Engagement node; avoids a per-observation query.
+        self._identity_key_cache: dict[EngagementId, str | None] = {}
+
+    def _get_preferred_claim(self, engagement_id: EngagementId) -> str | None:
+        """Return the cached `auth.identity_key` for this engagement (ADR-0032).
+
+        Read once per engagement from the Engagement node (a cheap property
+        lookup) and stored in a dict keyed by engagement_id. Avoids a per-
+        observation graph read for a value that never changes mid-engagement.
+        """
+
+        if engagement_id not in self._identity_key_cache:
+            from doo.ontology.graph_state import Neo4jGraphState
+
+            self._identity_key_cache[engagement_id] = Neo4jGraphState(
+                self._neo4j
+            ).get_identity_key(engagement_id)
+        return self._identity_key_cache[engagement_id]
 
     def commit(self, event: L2Event) -> CommitResult:
         """Commit one event; idempotent on its semantic key (ADR-0016)."""
@@ -175,7 +194,8 @@ class CommitOrchestrator:
             )
 
         if isinstance(event, RequestObservation):
-            result = self._commit_request_observation(event, commit_id, span_id)
+            preferred_claim = self._get_preferred_claim(event.engagement_id)
+            result = self._commit_request_observation(event, commit_id, span_id, preferred_claim)
         elif isinstance(event, ParseFailure):
             result = self._commit_parse_failure(event, commit_id, span_id)
         else:  # pragma: no cover - the union is exhaustive above
@@ -199,7 +219,11 @@ class CommitOrchestrator:
         return result
 
     def _commit_request_observation(
-        self, obs: RequestObservation, commit_id: CommitId, span_id: str
+        self,
+        obs: RequestObservation,
+        commit_id: CommitId,
+        span_id: str,
+        preferred_claim: str | None = None,
     ) -> CommitResult:
         host_node_id = resolve_host(
             self._neo4j,
@@ -214,6 +238,7 @@ class CommitOrchestrator:
             observed_at=obs.observed_at,
             ingested_at=obs.ingested_at,
             cue=obs.auth_context_cue,
+            preferred_claim=preferred_claim,
         )
         # Commit the observation node + its non-HIT edges. Endpoint inference
         # (HIT grouping, path templating, Parameter aggregation) is DEFERRED to
@@ -325,11 +350,13 @@ class CommitOrchestrator:
         identity_upgrades = principals_retracted = identity_aliases = 0
         for engagement_id in sorted(engagements):
             now = datetime.now(UTC)
+            preferred_claim = self._get_preferred_claim(engagement_id)
             reconcile = reconcile_observed_identities(
                 self._neo4j,
                 engagement_id=engagement_id,
                 observed_at=now,
                 ingested_at=now,
+                preferred_claim=preferred_claim,
             )
             identity_upgrades += reconcile.upgrades
             principals_retracted += reconcile.retracted
