@@ -65,6 +65,7 @@ from doo.extraction.artifacts import (
 from doo.extraction.identity_signals import (
     extract_observed_identities_from_headers,
     extract_observed_identities_from_self_endpoint_body,
+    extract_oidc_login_identity,
     is_self_endpoint,
 )
 from doo.ids import (
@@ -306,6 +307,19 @@ def _parse_entry(
                 response_body_bytes.decode("utf-8", errors="replace"),
                 response_content_type,
             )
+        # ADR-0031: OIDC login exchange — the id_token's identity binds to the
+        # credential the response ISSUES (the access_token future requests use),
+        # not this request's own AuthContext.
+        issued_credential_auth_hash: Sha256Hex | None = None
+        issued_identities: tuple[ObservedIdentity, ...] = ()
+        if response_body_bytes:
+            oidc = extract_oidc_login_identity(
+                response_body_bytes.decode("utf-8", errors="replace"),
+                response_content_type,
+            )
+            if oidc is not None:
+                issued_identities, issued_access_token = oidc
+                issued_credential_auth_hash = compute_auth_hash("bearer", issued_access_token)
         yield RequestObservation(
             event_id=_new_l2_event_id(),
             trace_id=envelope.trace_id,
@@ -339,6 +353,8 @@ def _parse_entry(
             server_fingerprint=diagnostics.server_fingerprint,
             error_excerpt=diagnostics.error_excerpt,
             observed_identities=observed_identities,
+            issued_credential_auth_hash=issued_credential_auth_hash,
+            issued_identities=issued_identities,
         )
         return
     except _EntryError as err:
