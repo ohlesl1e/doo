@@ -244,6 +244,13 @@ class RequestObservation(L2EventBase):
     # Empty when the response asserts no identity. A response can surface several
     # at once (e.g. a `/me` body with both `_id` and `email`).
     observed_identities: tuple[ObservedIdentity, ...] = ()
+    # ADR-0031: SSO login binds identity to the credential the login response
+    # ISSUES (not this request's own AuthContext). For an OIDC token response, the
+    # id_token's identities bind to `hash(access_token)`. `issued_credential_auth_hash`
+    # is that AuthContext id; `issued_identities` are the claims to attach to it at
+    # flush. Empty/None when this isn't a login exchange.
+    issued_credential_auth_hash: Sha256Hex | None = None
+    issued_identities: tuple[ObservedIdentity, ...] = ()
 
     @model_validator(mode="after")
     def _validate(self) -> Self:

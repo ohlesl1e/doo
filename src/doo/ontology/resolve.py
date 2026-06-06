@@ -607,6 +607,9 @@ def commit_request_observation(
     # `observed_identity_signal`/`observed_identity_value` scalar pair — so the flush
     # reconciler can build a claim->value map per AuthContext.
     observed_identities = [oi.model_dump_json() for oi in obs.observed_identities]
+    # ADR-0031: SSO login binding — identities the login ISSUES, attached at flush
+    # to the AuthContext of the issued credential (not this observation's own).
+    issued_identities = [oi.model_dump_json() for oi in obs.issued_identities]
     client.execute_write(
         """
         MERGE (r:RequestObservation {engagement_id: $engagement_id,
@@ -622,6 +625,8 @@ def commit_request_observation(
                       r.server_fingerprint = $server_fingerprint,
                       r.error_excerpt = $error_excerpt,
                       r.observed_identities = $observed_identities,
+                      r.issued_credential_auth_hash = $issued_credential_auth_hash,
+                      r.issued_identities = $issued_identities,
                       r.envelope_event_id = $envelope_event_id,
                       r += $props
         ON MATCH SET r.last_seen = $props.last_seen
@@ -645,6 +650,8 @@ def commit_request_observation(
         server_fingerprint=obs.server_fingerprint,
         error_excerpt=obs.error_excerpt,
         observed_identities=observed_identities,
+        issued_credential_auth_hash=obs.issued_credential_auth_hash,
+        issued_identities=issued_identities,
         envelope_event_id=str(obs.envelope_event_id),
         host_id=host_node_id,
         auth_context_id=auth_context_node_id,

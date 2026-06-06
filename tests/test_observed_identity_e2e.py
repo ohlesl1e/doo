@@ -390,3 +390,75 @@ def test_jwt_keyed_principal_gains_me_email_alias(
         eid=eid,
     )
     assert obs_p[0]["keys"] == ["discovered:sub:jwt-user"]
+
+
+def _token_exchange_entry(*, second: int, id_token: str, access_token: str) -> dict:
+    """An OIDC token-endpoint exchange: anonymous request, JSON response carrying
+    an id_token + the issued (opaque) access_token (ADR-0031)."""
+    return {
+        "startedDateTime": f"2026-06-05T12:00:{second:02d}.000Z",
+        "request": {
+            "method": "POST", "url": "https://api.example.com/oauth/token",
+            "queryString": [], "headers": [], "cookies": [], "headersSize": -1, "bodySize": 0,
+        },
+        "response": {
+            "status": 200, "bodySize": 2,
+            "headers": [{"name": "Content-Type", "value": "application/json"}],
+            "content": {"mimeType": "application/json",
+                        "text": json.dumps({"id_token": id_token, "access_token": access_token,
+                                            "token_type": "Bearer"})},
+        },
+    }
+
+
+def _bearer_api_entry(*, second: int, access_token: str) -> dict:
+    return {
+        "startedDateTime": f"2026-06-05T12:00:{second:02d}.000Z",
+        "request": {
+            "method": "GET", "url": "https://api.example.com/api/data", "queryString": [],
+            "headers": [{"name": "Authorization", "value": f"Bearer {access_token}"}],
+            "cookies": [], "headersSize": -1, "bodySize": 0,
+        },
+        "response": {"status": 200, "bodySize": 2,
+                     "headers": [{"name": "Content-Type", "value": "application/json"}],
+                     "content": {"mimeType": "application/json", "text": "{}"}},
+    }
+
+
+def test_oidc_opaque_access_tokens_collapse_via_issued_idtoken(
+    neo4j_client, redis_client, blob_client
+) -> None:
+    """ADR-0031: two OIDC token exchanges for one user (rotated OPAQUE access tokens),
+    each id_token carrying the same (iss,sub), collapse the later Bearer API requests
+    onto ONE Principal keyed `discovered:sub:{iss}:{sub}`."""
+
+    eid = "eng-oidc-e2e"
+    _seed_engagement(neo4j_client, eid)
+    iss = "https://idp.example"
+    idt = jwt.encode({"sub": "oidc-user", "iss": iss}, SIGNING_KEY, algorithm="HS256")
+    entries = [
+        _token_exchange_entry(second=1, id_token=idt, access_token="opaque-at-1"),
+        _bearer_api_entry(second=2, access_token="opaque-at-1"),
+        _token_exchange_entry(second=3, id_token=idt, access_token="opaque-at-2"),  # refresh
+        _bearer_api_entry(second=4, access_token="opaque-at-2"),
+    ]
+    har = json.dumps({"log": {"version": "1.2", "entries": entries}}).encode()
+    _run_pipeline(neo4j=neo4j_client, redis_client=redis_client, blob_client=blob_client,
+                  engagement_id=eid, har_bytes=har, filename="oidc.har")
+
+    key = f"discovered:sub:{iss}:oidc-user"
+    row = neo4j_client.execute_read(
+        "MATCH (p:Principal {engagement_id: $eid, identity_key: $key}) "
+        "RETURN count{ (:AuthContext)-[:OF_PRINCIPAL]->(p) } AS acs",
+        eid=eid, key=key,
+    )
+    # The two opaque access-token AuthContexts collapse onto one issuer-scoped sub Principal.
+    assert row and row[0]["acs"] == 2
+
+    # No leftover synthetic (auth_hash-keyed) Principal with a live AuthContext.
+    live = neo4j_client.execute_read(
+        "MATCH (ac:AuthContext)-[:OF_PRINCIPAL]->(p:Principal {engagement_id: $eid}) "
+        "WHERE p.identity_key =~ 'discovered:[0-9a-f]{64}' RETURN count(p) AS c",
+        eid=eid,
+    )
+    assert live[0]["c"] == 0
