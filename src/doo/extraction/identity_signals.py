@@ -52,7 +52,7 @@ def extract_observed_identity_from_headers(
 # Generic self-endpoint path patterns (T-OI2): a request that asks "who am I?".
 # Each segment is anchored (`/me`, not `/method`) so ordinary paths don't match.
 _SELF_ENDPOINT_RE = re.compile(
-    r"/(?:me|whoami|profile|account|session|current[-_]?user|user/current)(?:/|$)",
+    r"/(?:me|whoami|profile|account|session|userinfo|current[-_]?user|user/current)(?:/|$)",
     re.IGNORECASE,
 )
 
@@ -120,4 +120,9 @@ def extract_observed_identity_from_self_endpoint_body(
                     break
     if found is None:
         return None
-    return ObservedIdentity(signal="body", value=found[1])
+    claim, value = found
+    # Email is case-insensitive — lowercase it so two casings of one account don't
+    # split into two identities (consistent with the JWT-claim path, ADR-0027).
+    if claim == "email":
+        value = value.lower()
+    return ObservedIdentity(signal="body", value=value)

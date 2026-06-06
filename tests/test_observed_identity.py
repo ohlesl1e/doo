@@ -75,7 +75,8 @@ def test_choose_header_outranks_body() -> None:
 
 def test_self_endpoint_matches_common_patterns() -> None:
     for path in ("/me", "/api/wireless/users/me", "/profile", "/whoami", "/account",
-                 "/me/password", "/user/current", "/current-user"):
+                 "/me/password", "/user/current", "/current-user",
+                 "/userinfo", "/connect/userinfo"):  # OIDC userinfo (SSO)
         assert is_self_endpoint(path), path
 
 
@@ -110,6 +111,14 @@ def test_body_identity_from_wrapper_object() -> None:
     )
     assert oi is not None
     assert oi.value == "user-9"
+
+
+def test_body_identity_email_is_lowercased() -> None:
+    oi = extract_observed_identity_from_self_endpoint_body(
+        '{"email": "Admin@Example.COM"}', "application/json"
+    )
+    assert oi is not None
+    assert oi.value == "admin@example.com"
 
 
 def test_body_identity_non_json_is_none() -> None:
