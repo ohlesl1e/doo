@@ -210,7 +210,7 @@ def test_reissued_unknown_tokens_same_sub_collapse_to_one_discovered_principal(
 ) -> None:
     """ADR-0027: an *undeclared* user whose JWT is reissued each request (new
     `iat`/`exp`/signature → new token → new auth_hash) collapses to ONE discovered
-    Principal keyed on `discovered:jwt:sub:{sub}`, with one AuthContext per token.
+    Principal keyed on `discovered:sub:{sub}`, with one AuthContext per token.
 
     This is the 46→~1 fix: before, each reissued token minted a fresh discovered
     Principal keyed on the per-token auth_hash.
@@ -238,7 +238,7 @@ def test_reissued_unknown_tokens_same_sub_collapse_to_one_discovered_principal(
     pcount = neo4j_client.execute_read(
         "MATCH (p:Principal {engagement_id: $eid, tier: 'discovered'}) "
         "WHERE p.is_anonymous = false AND p.unmerged = true "
-        "AND p.identity_key = 'discovered:jwt:sub:uuid-zzz' RETURN count(p) AS c",
+        "AND p.identity_key = 'discovered:sub:uuid-zzz' RETURN count(p) AS c",
         eid=eid,
     )
     assert pcount[0]["c"] == 1
@@ -246,7 +246,7 @@ def test_reissued_unknown_tokens_same_sub_collapse_to_one_discovered_principal(
     # per-token validity windows are preserved as signal (AuthContexts stay per-token).
     acs = neo4j_client.execute_read(
         "MATCH (ac:AuthContext {engagement_id: $eid})-[:OF_PRINCIPAL]->"
-        "(p:Principal {identity_key: 'discovered:jwt:sub:uuid-zzz'}) RETURN count(ac) AS c",
+        "(p:Principal {identity_key: 'discovered:sub:uuid-zzz'}) RETURN count(ac) AS c",
         eid=eid,
     )
     assert acs[0]["c"] == 3
@@ -271,8 +271,8 @@ def test_opaque_bearer_without_sub_falls_back_to_per_credential_principal(
     # keyed on the auth_hash (synthetic fallback).
     pcount = neo4j_client.execute_read(
         "MATCH (p:Principal {engagement_id: $eid, tier: 'discovered'}) "
-        "WHERE p.is_anonymous = false AND p.identity_key STARTS WITH 'discovered:' "
-        "AND NOT p.identity_key STARTS WITH 'discovered:jwt:' RETURN count(p) AS c",
+        "WHERE p.is_anonymous = false AND p.identity_key =~ 'discovered:[0-9a-f]{64}' "
+        "RETURN count(p) AS c",
         eid=eid,
     )
     assert pcount[0]["c"] == 2
@@ -282,7 +282,7 @@ def test_reissued_tokens_keyed_on_uid_when_no_sub_collapse_to_one_principal(
     neo4j_client,
 ) -> None:
     """ADR-0027: an undeclared user whose JWTs carry `uid` (no `sub`) still collapses
-    to ONE discovered Principal keyed on `discovered:jwt:uid:{uid}` — the
+    to ONE discovered Principal keyed on `discovered:uid:{uid}` — the
     claim-priority fallback beyond `sub`."""
 
     eid = "eng-recon-uid"
@@ -302,13 +302,13 @@ def test_reissued_tokens_keyed_on_uid_when_no_sub_collapse_to_one_principal(
 
     pcount = neo4j_client.execute_read(
         "MATCH (p:Principal {engagement_id: $eid, tier: 'discovered'}) "
-        "WHERE p.identity_key = 'discovered:jwt:uid:u-555' RETURN count(p) AS c",
+        "WHERE p.identity_key = 'discovered:uid:u-555' RETURN count(p) AS c",
         eid=eid,
     )
     assert pcount[0]["c"] == 1
     acs = neo4j_client.execute_read(
         "MATCH (ac:AuthContext {engagement_id: $eid})-[:OF_PRINCIPAL]->"
-        "(p:Principal {identity_key: 'discovered:jwt:uid:u-555'}) RETURN count(ac) AS c",
+        "(p:Principal {identity_key: 'discovered:uid:u-555'}) RETURN count(ac) AS c",
         eid=eid,
     )
     assert acs[0]["c"] == 3
@@ -340,13 +340,13 @@ def test_reissued_jwt_cookies_collapse_to_one_discovered_principal(
 
     pcount = neo4j_client.execute_read(
         "MATCH (p:Principal {engagement_id: $eid, tier: 'discovered'}) "
-        "WHERE p.identity_key = 'discovered:jwt:sub:uuid-cookie-zzz' RETURN count(p) AS c",
+        "WHERE p.identity_key = 'discovered:sub:uuid-cookie-zzz' RETURN count(p) AS c",
         eid=eid,
     )
     assert pcount[0]["c"] == 1
     acs = neo4j_client.execute_read(
         "MATCH (ac:AuthContext {engagement_id: $eid})-[:OF_PRINCIPAL]->"
-        "(p:Principal {identity_key: 'discovered:jwt:sub:uuid-cookie-zzz'}) RETURN count(ac) AS c",
+        "(p:Principal {identity_key: 'discovered:sub:uuid-cookie-zzz'}) RETURN count(ac) AS c",
         eid=eid,
     )
     assert acs[0]["c"] == 3
@@ -355,7 +355,7 @@ def test_reissued_jwt_cookies_collapse_to_one_discovered_principal(
 def test_quoted_jwt_cookies_keyed_on_mongo_id_collapse(neo4j_client) -> None:
     """Real-capture case (ADR-0027): a DQUOTE-wrapped JWT cookie carrying a Mongo
     `_id` (no `sub`) — reissued tokens for one `_id` collapse to ONE discovered
-    Principal keyed on `discovered:jwt:_id:{_id}`, one AuthContext per token."""
+    Principal keyed on `discovered:_id:{_id}`, one AuthContext per token."""
 
     eid = "eng-recon-mongoid"
     _seed_declared_principal(neo4j_client, eid)
@@ -374,14 +374,14 @@ def test_quoted_jwt_cookies_keyed_on_mongo_id_collapse(neo4j_client) -> None:
 
     pcount = neo4j_client.execute_read(
         "MATCH (p:Principal {engagement_id: $eid, tier: 'discovered'}) "
-        "WHERE p.identity_key = 'discovered:jwt:_id:6614a9412c25a5000df5d4d6' "
+        "WHERE p.identity_key = 'discovered:_id:6614a9412c25a5000df5d4d6' "
         "RETURN count(p) AS c",
         eid=eid,
     )
     assert pcount[0]["c"] == 1
     acs = neo4j_client.execute_read(
         "MATCH (ac:AuthContext {engagement_id: $eid})-[:OF_PRINCIPAL]->"
-        "(p:Principal {identity_key: 'discovered:jwt:_id:6614a9412c25a5000df5d4d6'}) "
+        "(p:Principal {identity_key: 'discovered:_id:6614a9412c25a5000df5d4d6'}) "
         "RETURN count(ac) AS c",
         eid=eid,
     )

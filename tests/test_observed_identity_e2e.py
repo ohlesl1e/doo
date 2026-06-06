@@ -117,7 +117,7 @@ def test_observed_header_identity_collapses_synthetic_principals(
     # three AuthContexts beneath it.
     alice = neo4j_client.execute_read(
         "MATCH (p:Principal {engagement_id: $eid, "
-        "identity_key: 'discovered:observed:x-user-id:alice-id'}) "
+        "identity_key: 'discovered:x-user-id:alice-id'}) "
         "RETURN count{ (:AuthContext)-[:OF_PRINCIPAL]->(p) } AS acs, p.confidence AS conf",
         eid=eid,
     )
@@ -127,7 +127,7 @@ def test_observed_header_identity_collapses_synthetic_principals(
     # bob stays distinct — no false merge with alice.
     bob = neo4j_client.execute_read(
         "MATCH (p:Principal {engagement_id: $eid, "
-        "identity_key: 'discovered:observed:x-user-id:bob-id'}) "
+        "identity_key: 'discovered:x-user-id:bob-id'}) "
         "RETURN count{ (:AuthContext)-[:OF_PRINCIPAL]->(p) } AS acs",
         eid=eid,
     )
@@ -135,7 +135,7 @@ def test_observed_header_identity_collapses_synthetic_principals(
 
     # The JWT-claim-keyed Principal is NOT upgraded despite carrying X-User-Id.
     jwtp = neo4j_client.execute_read(
-        "MATCH (p:Principal {engagement_id: $eid, identity_key: 'discovered:jwt:sub:jwt-user'}) "
+        "MATCH (p:Principal {engagement_id: $eid, identity_key: 'discovered:sub:jwt-user'}) "
         "RETURN count{ (:AuthContext)-[:OF_PRINCIPAL]->(p) } AS acs",
         eid=eid,
     )
@@ -145,9 +145,7 @@ def test_observed_header_identity_collapses_synthetic_principals(
     # and carry no live AuthContext.
     synthetic = neo4j_client.execute_read(
         "MATCH (p:Principal {engagement_id: $eid, tier: 'discovered'}) "
-        "WHERE p.identity_key STARTS WITH 'discovered:' "
-        "AND NOT p.identity_key STARTS WITH 'discovered:jwt:' "
-        "AND NOT p.identity_key STARTS WITH 'discovered:observed:' "
+        "WHERE p.identity_key =~ 'discovered:[0-9a-f]{64}' "
         "RETURN p.status AS status, count{ (:AuthContext)-[:OF_PRINCIPAL]->(p) } AS acs",
         eid=eid,
     )
@@ -157,13 +155,105 @@ def test_observed_header_identity_collapses_synthetic_principals(
     # No live non-anonymous Principal keyed on a raw auth_hash remains.
     live_synthetic = neo4j_client.execute_read(
         "MATCH (ac:AuthContext)-[:OF_PRINCIPAL]->(p:Principal {engagement_id: $eid}) "
-        "WHERE p.identity_key STARTS WITH 'discovered:' "
-        "AND NOT p.identity_key STARTS WITH 'discovered:jwt:' "
-        "AND NOT p.identity_key STARTS WITH 'discovered:observed:' "
+        "WHERE p.identity_key =~ 'discovered:[0-9a-f]{64}' "
         "RETURN count(p) AS c",
         eid=eid,
     )
     assert live_synthetic[0]["c"] == 0
+
+
+def test_bearer_sub_and_me_sub_converge_to_one_principal(
+    neo4j_client, redis_client, blob_client
+) -> None:
+    """ADR-0030 M3: a bearer-JWT `sub` (resolve/cue path) and the same actor's `/me`
+    response `sub` (observed path) produce the SAME unified `discovered:sub:{value}`
+    key, so they MERGE into ONE Principal — the cross-signal unification.
+
+    Two different opaque-bearer requests, each `/me` body asserting `sub: actor-9`,
+    plus one bearer JWT carrying `sub: actor-9`: all three AuthContexts end up under
+    the single `discovered:sub:actor-9` Principal.
+    """
+
+    eid = "eng-oi-converge-e2e"
+    _seed_engagement(neo4j_client, eid)
+    sub = "actor-9"
+    jwt_token = jwt.encode({"sub": sub}, SIGNING_KEY, algorithm="HS256")
+    entries = [
+        # Opaque bearer, /me body reveals sub -> observed path keys discovered:sub.
+        _me_sub_entry(second=1, bearer="opaque-x-1", sub=sub),
+        _me_sub_entry(second=2, bearer="opaque-x-2", sub=sub),
+        # Bearer JWT with the same sub -> resolve/cue path keys discovered:sub.
+        {
+            "startedDateTime": "2026-06-04T12:00:03.000Z",
+            "request": {
+                "method": "GET",
+                "url": "https://api.example.com/dashboard",
+                "queryString": [],
+                "headers": [{"name": "Authorization", "value": f"Bearer {jwt_token}"}],
+                "cookies": [],
+                "headersSize": -1,
+                "bodySize": 0,
+            },
+            "response": {
+                "status": 200,
+                "bodySize": 2,
+                "headers": [{"name": "Content-Type", "value": "application/json"}],
+                "content": {"mimeType": "application/json", "text": "{}"},
+            },
+        },
+    ]
+    har = json.dumps({"log": {"version": "1.2", "entries": entries}}).encode()
+    _run_pipeline(
+        neo4j=neo4j_client,
+        redis_client=redis_client,
+        blob_client=blob_client,
+        engagement_id=eid,
+        har_bytes=har,
+        filename="observed_converge.har",
+    )
+
+    # ONE Principal keyed on the unified discovered:sub:actor-9, with all THREE
+    # AuthContexts (two opaque + one JWT) beneath it — the cue + observed paths
+    # converged by identity-key MERGE.
+    row = neo4j_client.execute_read(
+        "MATCH (p:Principal {engagement_id: $eid, identity_key: 'discovered:sub:" + sub + "'}) "
+        "RETURN count{ (:AuthContext)-[:OF_PRINCIPAL]->(p) } AS acs",
+        eid=eid,
+    )
+    assert row and row[0]["acs"] == 3
+
+    # No live synthetic Principal remains (the two opaque ones were re-pointed).
+    live = neo4j_client.execute_read(
+        "MATCH (ac:AuthContext)-[:OF_PRINCIPAL]->(p:Principal {engagement_id: $eid}) "
+        "WHERE p.identity_key =~ 'discovered:[0-9a-f]{64}' RETURN count(p) AS c",
+        eid=eid,
+    )
+    assert live[0]["c"] == 0
+
+
+def _me_sub_entry(*, second: int, bearer: str, sub: str) -> dict:
+    """A self-endpoint (`/me`) request whose JSON body carries the actor's `sub`."""
+    return {
+        "startedDateTime": f"2026-06-04T12:00:{second:02d}.000Z",
+        "request": {
+            "method": "GET",
+            "url": "https://api.example.com/api/users/me",
+            "queryString": [],
+            "headers": [{"name": "Authorization", "value": f"Bearer {bearer}"}],
+            "cookies": [],
+            "headersSize": -1,
+            "bodySize": 0,
+        },
+        "response": {
+            "status": 200,
+            "bodySize": 2,
+            "headers": [{"name": "Content-Type", "value": "application/json"}],
+            "content": {
+                "mimeType": "application/json",
+                "text": json.dumps({"sub": sub, "role": "user"}),
+            },
+        },
+    }
 
 
 def _me_entry(*, second: int, bearer: str, user_id: str) -> dict:
@@ -216,21 +306,20 @@ def test_self_endpoint_body_identity_collapses_synthetic_principals(
         filename="observed_body_identity.har",
     )
 
+    # ADR-0030: the body `_id` claim keys the unified `discovered:_id:{value}`.
     row = neo4j_client.execute_read(
         "MATCH (p:Principal {engagement_id: $eid, "
-        "identity_key: 'discovered:observed:body:" + user_id + "'}) "
+        "identity_key: 'discovered:_id:" + user_id + "'}) "
         "RETURN count{ (:AuthContext)-[:OF_PRINCIPAL]->(p) } AS acs, p.confidence AS conf",
         eid=eid,
     )
     assert row and row[0]["acs"] == 3
-    assert row[0]["conf"] == 0.5  # body signal ranks below a header (ADR-0029)
+    assert row[0]["conf"] == 0.5  # body claim ranks below a header (ADR-0030)
 
     # No live synthetic (auth_hash-keyed) Principal remains.
     live = neo4j_client.execute_read(
         "MATCH (ac:AuthContext)-[:OF_PRINCIPAL]->(p:Principal {engagement_id: $eid}) "
-        "WHERE p.identity_key STARTS WITH 'discovered:' "
-        "AND NOT p.identity_key STARTS WITH 'discovered:jwt:' "
-        "AND NOT p.identity_key STARTS WITH 'discovered:observed:' "
+        "WHERE p.identity_key =~ 'discovered:[0-9a-f]{64}' "
         "RETURN count(p) AS c",
         eid=eid,
     )
@@ -281,17 +370,23 @@ def test_jwt_keyed_principal_gains_me_email_alias(
     )
 
     row = neo4j_client.execute_read(
-        "MATCH (p:Principal {engagement_id: $eid, identity_key: 'discovered:jwt:sub:jwt-user'}) "
+        "MATCH (p:Principal {engagement_id: $eid, identity_key: 'discovered:sub:jwt-user'}) "
         "RETURN p.observed_aliases AS aliases",
         eid=eid,
     )
-    # The Principal stays JWT-keyed (not re-keyed) but now records the /me email.
-    assert row and row[0]["aliases"] == ["body=alice@corp.com"]
+    # The Principal stays claim-keyed (not re-keyed) but records ALL /me claims as
+    # aliases — both the `_id` and the human-readable `email` (ADR-0030).
+    assert row and sorted(row[0]["aliases"]) == [
+        "_id=507f1f77bcf86cd799439011",
+        "email=alice@corp.com",
+    ]
 
-    # No observed-keyed Principal was created (the JWT one was aliased, not merged).
+    # No NEW claim-keyed Principal was created (the existing one was aliased, not
+    # merged): the only non-anonymous discovered Principal is the original sub one.
     obs_p = neo4j_client.execute_read(
         "MATCH (p:Principal {engagement_id: $eid}) "
-        "WHERE p.identity_key STARTS WITH 'discovered:observed:' RETURN count(p) AS c",
+        "WHERE p.is_anonymous = false AND p.identity_key STARTS WITH 'discovered:' "
+        "RETURN collect(p.identity_key) AS keys",
         eid=eid,
     )
-    assert obs_p[0]["c"] == 0
+    assert obs_p[0]["keys"] == ["discovered:sub:jwt-user"]

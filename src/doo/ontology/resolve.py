@@ -576,6 +576,11 @@ def commit_request_observation(
     candidates carry only hash + length + preview, never a raw value (ADR-0015).
     One-per-response diagnostics (`server_fingerprint`, `error_excerpt`) are inline
     scalar properties, not nodes.
+
+    The claim-tagged observed identities this response asserted (ADR-0030) are
+    stored as ONE serialized JSON list (`observed_identities`), each entry an
+    `{claim, value}` object — replacing the prior single-value scalar pair. The
+    flush-time reconciler reads this list to key/alias the request's Principal.
     """
 
     props = cross_cutting(
@@ -597,6 +602,11 @@ def commit_request_observation(
         obs.response_body_ref.model_dump_json() if obs.response_body_ref is not None else None
     )
     value_candidates = [vc.model_dump_json() for vc in obs.value_candidates]
+    # ADR-0030: the claim-tagged observed identities are persisted as ONE serialized
+    # JSON list (`observed_identities`) — replacing the prior single-value
+    # `observed_identity_signal`/`observed_identity_value` scalar pair — so the flush
+    # reconciler can build a claim->value map per AuthContext.
+    observed_identities = [oi.model_dump_json() for oi in obs.observed_identities]
     client.execute_write(
         """
         MERGE (r:RequestObservation {engagement_id: $engagement_id,
@@ -611,8 +621,7 @@ def commit_request_observation(
                       r.value_candidates = $value_candidates,
                       r.server_fingerprint = $server_fingerprint,
                       r.error_excerpt = $error_excerpt,
-                      r.observed_identity_signal = $observed_identity_signal,
-                      r.observed_identity_value = $observed_identity_value,
+                      r.observed_identities = $observed_identities,
                       r.envelope_event_id = $envelope_event_id,
                       r += $props
         ON MATCH SET r.last_seen = $props.last_seen
@@ -635,12 +644,7 @@ def commit_request_observation(
         value_candidates=value_candidates,
         server_fingerprint=obs.server_fingerprint,
         error_excerpt=obs.error_excerpt,
-        observed_identity_signal=(
-            obs.observed_identity.signal if obs.observed_identity is not None else None
-        ),
-        observed_identity_value=(
-            obs.observed_identity.value if obs.observed_identity is not None else None
-        ),
+        observed_identities=observed_identities,
         envelope_event_id=str(obs.envelope_event_id),
         host_id=host_node_id,
         auth_context_id=auth_context_node_id,
