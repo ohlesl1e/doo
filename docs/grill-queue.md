@@ -1,6 +1,8 @@
-# MVP Grill Queue
+# Grill Queue
 
-Design decisions still open before the MVP slice (L1 ingestion + L3 graph + L2 coverage, per `ARCHITECTURE.md` build order) can be implemented confidently.
+Tracker for design decisions that want a `/grill-with-docs` pass before code lands, plus the running list of deliberate deferrals.
+
+**The slices themselves are defined in `ARCHITECTURE.md` → "Build order (the slices)"** — that is the canonical roadmap. Current status: **slice 1 (ingestion + graph) and slice 2 (coverage C1/C2/C2b/C3) are shipped**; **slice 3 (LLM-assisted hypothesis generation / the Planner) is next**. This file no longer gates an "MVP slice" — it tracks what is still worth grilling and what is parked.
 
 Items are split into three buckets:
 
@@ -18,25 +20,13 @@ Closed 2026-05-28. Outputs: **ADR-0012** (setup boundary is tester-side facts on
 
 Closed 2026-05-30. Outputs: **ADR-0015** (L2 is the secrets-hashing boundary; raw tokens never enter L3), **ADR-0016** (L3 commit idempotency is keyed semantically on `(event_kind, source, source_id, engagement_id)`). `ARCHITECTURE.md` gained a "Layer contracts (L1 → L2 → L3)" section sketching the `IngestionEnvelope`, the `L2Event` tagged union (`RequestObservation` / `ResponseArtifact` / `ParseFailure`), the L3 commit interface, and the `l3-events` low-level structural events stream. `CONTEXT.md` gained the `ParseFailure` term. Pydantic models are described as types-and-fields in `ARCHITECTURE.md`; concrete `.py` definitions land with slice-1 code.
 
-### G3. Entity-resolution timing and the write path
+### G3. Entity-resolution timing and the write path ✅ resolved (in slice 1)
 
-**Why grill.** Sync-on-write (latency on every ingest, strong consistency for queries) vs. async batch (cheap ingest, eventual consistency, harder reasoning). Re-templating triggers — every N observations, every N minutes, on-demand from query failure? Decides the shape of the writer service and where transactions live.
+Resolved by the slice-1 implementation, never needed a formal grill. The write path is **async**: L1 → Redis Streams → L2/L3 workers, with entity resolution at commit and endpoint re-templating deferred to a per-drain `flush` at the settle point (**ADR-0022**). No mid-drain reader exists, so eventual-within-a-drain consistency is acceptable. Continuous-mode `flush` performance is a tracked deferral (see Defer: incremental re-templating).
 
-Defaults can work but the trade-offs are real and should be deliberate.
+### G4. Body and secret blob layout ✅ resolved (in slice 1)
 
-**Order: grill during early L1+L2 prototyping** — more concrete than abstract, benefits from a working prototype to test against.
-
-### G4. Body and secret blob layout
-
-**Why grill.** Bodies go to object storage with hashes in the graph (already decided). But the *access pattern* isn't:
-- Key format — engagement/source/hash, or content-addressed only?
-- Retention rules and cleanup.
-- Access control for high-entropy `kind = secret` values (per ADR-0009 the full value should *only* live in the originating observation in object storage).
-- How ADR-0009's secrets-handling composes with body-on-disk: a JWT in a body is a secret too.
-
-Decide once before any real bytes flow.
-
-**Order: grill alongside G3.**
+Resolved by the slice-1 `blobs.py` implementation. Key layout is engagement-scoped + content-addressed: `engagement/{id}/source/{kind}/{sha256}.{ext}` for HAR blobs and a parallel body-key scheme. Secrets never store the full value — `kind ∈ {secret, token, opaque_token}` carry `value_hash` + length + preview only (**ADR-0009 / 0015 / 0024**), so the "JWT in a body is a secret too" case is handled at the L2 extraction boundary. Retention/cleanup is left to object-store lifecycle policy (not yet needed).
 
 ## Pick a default and move
 
@@ -87,14 +77,19 @@ first exist in slice 4.
 
 Until after slice 1+2 lands; revisit when the implementation forces the question.
 
-- **C4 (auth-state transitions never exercised).** Needs capability-tier
-  `TrustBoundary` nodes, which nothing infers yet. The inference (drawing
+- **C4 (auth-state transitions never exercised) → slice 3.** Needs capability-tier
+  `TrustBoundary` nodes, which nothing infers yet. That inference (drawing
   boundaries between an actor's `AuthContext`s from passive evidence) is an L3
-  ontology write-path feature — its own work item (slice 2.5 / slice 3), kept
-  separate from coverage's read-path queries. C4 is passively answerable once
-  the boundaries exist (no active testing required).
-- **C5 (`TrustBoundary`s with no `TestCase`).** Vacuous until slice 4 — no
-  `TestCase` nodes exist until the dispatcher runs. Revisit with slice 4.
+  ontology write-path feature the **slice-3 planner pulls in** (it wants boundaries
+  as first-class, test-targetable nodes). Once they exist, C4 falls out as a
+  passive coverage query — no active testing required. Build it *with* the planner,
+  not speculatively ahead, so the boundary granularity matches a real consumer.
+- **C5 (`TrustBoundary`s with no *executed* `TestCase`) → slice 4.** Needs
+  `TrustBoundary` nodes *and* `EXECUTED_AS` edges to mean "untested boundary".
+  `TestCase` nodes are created (proposed) in slice 3, but they only carry
+  `EXECUTED_AS` once the dispatcher runs (slice 4) — so "no executed test" is the
+  meaningful reading and it lands in slice 4. ("No *proposed* test" is a weaker
+  slice-3 variant; pick the semantics when grilling slice 4.)
 - **Passive login-redirect / 3xx classification (ADR-0033).** Slice-2 C2/C2b
   treat success as 2xx only; 3xx is not-reached. A passive login-redirect
   classifier (the dispatch-side detector from ADR-0013, reused for passive
@@ -122,12 +117,20 @@ Until after slice 1+2 lands; revisit when the implementation forces the question
 - **Cross-engagement inference priors.** Per ADR-0017 a fresh `Engagement` against the same target starts cold (re-templating, re-inferring `ParameterSemantic`s, etc.). When this re-discovery cost becomes painful, add explicit opt-in prior loading in the engagement YAML — e.g. `prior_engagements: [{id: acme-2026-q2, use_for: [endpoint_templates, parameter_semantics, tenant_inferences], confidence_decay: 0.5}]`. Loader does a one-time inference-import with `source = "prior_engagement:<id>"` and decayed confidence so fresh evidence in the new engagement can override. Explicit opt-in keeps the Q1-of-G1 setup-boundary discipline intact (ADR-0012): the tester is declaring their own prior work, which is tester-side knowledge.
 - **Incremental re-templating (continuous-mode performance).** ADR-0022 deferred endpoint re-templating to a per-drain `flush`, which makes the offline-HAR (`--once`) workload O(N). A debounced `flush` in *continuous* mode still re-templates the whole growing cohort each tick (→ O(N²/K)). Two graded fixes, both behind the `flush` seam so callers don't change: (1) a within-`flush` fast path that skips the `template_paths` re-run when a cohort gained no new *distinct* concrete path and just attaches the new observations' `HIT`s; (2) full incremental templating — maintain the trie and recompute only the affected sub-tree per new distinct path, writing only diffs (~O(N log N)). Revisit when Logger++ streaming capture lands or cohorts get large enough that continuous-mode flush latency bites.
 
-## Suggested grilling order
+## Grilling order / history
 
-1. ~~**G1** — Engagement / Scope / declared-Principal setup~~ ✅ closed 2026-05-28.
-2. ~~**G2** — Layer-boundary Pydantic contracts~~ ✅ closed 2026-05-30.
-3. **Start L1 + L3 code** against G1 + G2 outputs.
-4. **G3** — write-path timing (grill against the prototype, not abstractly).
-5. **G4** — blob layout (grill alongside G3).
+1. ~~**G1** — Engagement / Scope / declared-Principal setup~~ ✅ closed 2026-05-28 (ADR-0012/0013/0014).
+2. ~~**G2** — Layer-boundary Pydantic contracts~~ ✅ closed 2026-05-30 (ADR-0015/0016).
+3. ~~**Slice 1** — L1 ingestion + L3 graph~~ ✅ shipped (ADRs 0001–0032).
+4. ~~**G3 / G4** — write-path timing & blob layout~~ ✅ resolved by the slice-1 implementation (ADR-0022; `blobs.py` key layout) — never needed a formal grill.
+5. ~~**Slice 2** — coverage C1/C2/C2b/C3~~ ✅ shipped 2026-06-08 (ADR-0033/0034/0035).
+6. **Next — Slice 3: LLM-assisted hypothesis generation (the Planner).** Likely grill targets:
+   - graph → LLM **context selection & windowing** (coverage output is the natural input);
+   - the structured **proposal schema** (`{test_class, target_node_id, parameters, justification}`) + the deterministic Validator;
+   - **planner-side OPA** against the still-skeletal Rego (write the real host/path/payload rules, or stub deliberately);
+   - **`TrustBoundary` inference** granularity (unblocks **C4**);
+   - **`TestCase`** node creation & dedup (ADR-0007);
+   - **local LiteLLM vs Anthropic API** split by data sensitivity (standing `ARCHITECTURE.md` open question);
+   - where slice 3 **stops** (propose + validate + human-review, with dispatch deferred to slice 4).
 
-After all four resolve, the MVP slice (ingest a HAR, see it in the graph, run the coverage queries C1–C5) should be buildable without further design grilling — implementation gaps will surface their own questions, but they're code questions, not design ones.
+Slice 4 (bounded execution) then brings `EXECUTED_AS` / `dispatch_status`, **C5**, executed-vs-proposed coverage, and reporting.

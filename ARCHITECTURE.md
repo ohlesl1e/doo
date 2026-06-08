@@ -247,14 +247,34 @@ This matters disproportionately for bug bounty work: when something goes wrong, 
 
 **Do NOT use LLMs for:** parsing inputs (L1/L2), policy decisions (L4), or directly constructing the requests sent (L5 execution).
 
-## Build order
+## Build order (the slices)
 
-Build vertically, not horizontally. One thin slice through all relevant layers before broadening.
+Build vertically, not horizontally — one thin slice through all relevant layers before broadening. **Ontology (L3) is not a separate slice:** the bulk of it was built in slice 1, and each later slice extends it only when a consumer needs a new inference (e.g. `TrustBoundary` lands in slice 3 because the planner needs it). Do not scaffold a layer ahead of its consumer.
 
-1. **Ingestion + graph** — Burp/HAR ingestion, graph construction, queryable. Useful on its own.
-2. **Coverage analysis** — pure deterministic queries: "endpoints hit as admin but not as user," "parameters in responses but never fuzzed," "auth state transitions not exercised." Probably 60% of the value with 10% of the risk.
-3. **LLM-assisted hypothesis generation** — feed graph subsets to an LLM, propose test ideas, human approves before dispatch.
-4. **Bounded agent execution** — only after 1-3 are solid.
+This is the canonical definition of what lands in each slice. The coverage queries are labelled C1–C5 (see the canonical query set under "L3 → consumers" / `ONTOLOGY.md` Step 6).
+
+### Slice 1 — Ingestion + graph ✅ shipped
+
+Burp/HAR → L1 intake → L2 extraction → L3 graph, queryable on its own. Builds the bulk of the ontology: `Host` / `Endpoint` / `Parameter` / `RequestObservation` / `Principal` / `AuthContext` / `ObservedValue` / `Tenant`, entity resolution, endpoint re-templating, identity reconciliation, plus the engagement loader and the kill-switch lease. Decisions: ADRs 0001–0032 (G1, G2 closed; G3 write-path timing settled by ADR-0022; G4 blob layout settled by the `blobs.py` key scheme).
+
+### Slice 2 — Coverage analysis ✅ shipped
+
+A **pull / ephemeral** deterministic query library (`doo coverage`) + CLI, also consumed by the slice-3 planner as a shared library (ADR-0034). Writes nothing back — gaps derive at query time. ~60% of the value, ~10% of the risk; **no LLM.** Queries shipped:
+
+- **C1** — in-scope `Endpoint`s never hit (any `HIT`; vacuous on purely-passive data until a discovery source exists).
+- **C2** — reached as `Principal` A but not B (2xx-"reached", deliberately asymmetric from C1; ADR-0033).
+- **C2b** — role-differentiated 200s: ≥2 principals reach 2xx with differing `response_body_sha256`/`response_size_bytes` (BOLA/IDOR hotspots).
+- **C3** — cross-endpoint leak-to-input pivots.
+
+Decisions: ADRs 0033 (authz-coverage semantics), 0034 (shared library), 0035 (scope patterns are glob, not regex).
+
+### Slice 3 — LLM-assisted hypothesis generation (next)
+
+The first slice with an LLM. **Planner** (LLM proposes structured `{test_class, target_node_id, parameters, justification}` — never request strings) → **Validator** (deterministic: planner-side OPA, graph consistency, dedup). Human approves; **nothing is dispatched yet.** Pulls in the remaining ontology piece — **`TrustBoundary` inference** — so authz boundaries become first-class, test-targetable nodes, which unblocks **C4** (capability-tier transitions never exercised) as a coverage query. Creates `TestCase` nodes (proposed, content-addressed per ADR-0007; no `EXECUTED_AS` edge yet). Dependency to resolve early: the Rego is still a deny-all skeleton (ADR-0003/0020), so planner-side OPA needs the real host/path/payload rules or an explicit stub.
+
+### Slice 4 — Bounded agent execution
+
+**Executor** (narrow MCP tools, dispatcher-side OPA + stateful guards, kill-switch) → **Interpreter** (LLM judges responses, proposes follow-ups). Adds `EXECUTED_AS` edges + `dispatch_status` (ADR-0013), at which point **C5** (`TrustBoundary`s with no *executed* `TestCase`) and executed-vs-proposed coverage become meaningful. Reporting / disclosure templates also land here. Only after 1–3 are solid.
 
 ## Tech stack summary
 
