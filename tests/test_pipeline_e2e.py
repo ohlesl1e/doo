@@ -317,7 +317,7 @@ def test_bearer_har_reconciles_to_declared_principal_no_raw_token(
     eid = "eng-e2e-bearer"
     d = _base_config_dict()
     d["engagement"]["id"] = eid
-    d["scope"]["host_patterns"] = ["^api\\.example\\.com$"]
+    d["scope"]["host_patterns"] = ["api.example.com"]
     d["principals"] = [
         {
             "label": "test-user-a",

@@ -168,9 +168,9 @@ def _base_config_dict() -> dict:
             "description": "Bug bounty research against Acme",
         },
         "scope": {
-            "host_patterns": ["^api\\.acme\\.example$"],
+            "host_patterns": ["api.acme.example"],
             "allowed_methods": ["GET", "POST"],
-            "allowed_path_patterns": ["^/api/v[0-9]+/.*$"],
+            "allowed_path_patterns": ["/api/*/**"],
             "payload_class_denylist": ["destructive-sql"],
         },
         "kill_switch": {
@@ -260,7 +260,7 @@ def test_loader_requires_confirmation_on_scope_change() -> None:
     load_engagement(config1, state)
 
     d2 = _base_config_dict()
-    d2["scope"]["host_patterns"] = ["^api\\.acme\\.example$", "^admin\\.acme\\.example$"]
+    d2["scope"]["host_patterns"] = ["api.acme.example", "admin.acme.example"]
     config2 = _build_config(d2)
 
     # Without --apply and no stdin → refuses.
@@ -275,7 +275,7 @@ def test_loader_applies_scope_change_with_apply_flag() -> None:
     h1 = compute_scope_content_hash(config1.scope)
 
     d2 = _base_config_dict()
-    d2["scope"]["host_patterns"] = ["^api\\.acme\\.example$", "^admin\\.acme\\.example$"]
+    d2["scope"]["host_patterns"] = ["api.acme.example", "admin.acme.example"]
     config2 = _build_config(d2)
     h2 = compute_scope_content_hash(config2.scope)
     assert h1 != h2

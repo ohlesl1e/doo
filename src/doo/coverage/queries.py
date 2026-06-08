@@ -113,6 +113,38 @@ def _to_aware(value: Any, *, fallback: datetime) -> datetime:
     return native
 
 
+def _warn_if_scope_matches_nothing(
+    *,
+    engagement_id: EngagementId,
+    query: str,
+    total_endpoints: int,
+    in_scope_endpoints: int,
+) -> None:
+    """Emit a likely-misconfigured-scope warning (ADR-0035, #55).
+
+    When the graph holds active endpoints for the engagement but the Scope
+    matched **zero** of them, the most likely cause is a bad scope pattern (e.g.
+    a regex that slipped through, or a host/path that names nothing real). A
+    silent empty coverage result reads as "doo found nothing"; this surfaces the
+    far-more-likely "your scope matched nothing" instead. Shared by all four
+    queries so the signal is uniform.
+    """
+
+    if total_endpoints > 0 and in_scope_endpoints == 0:
+        log.warning(
+            "coverage.scope_matched_nothing",
+            engagement_id=engagement_id,
+            query=query,
+            total_active_endpoints=total_endpoints,
+            in_scope_endpoints=0,
+            hint=(
+                "the engagement scope matched zero of the active endpoints in the "
+                "graph — likely a misconfigured host_patterns/allowed_path_patterns "
+                "(patterns are glob/segment, not regex; see ADR-0035)"
+            ),
+        )
+
+
 def run_c1(
     client: Neo4jClient,
     engagement_id: EngagementId,
@@ -153,12 +185,9 @@ def run_c1(
 
     rows = client.execute_read(cypher, **frag.parameters)
 
+    in_scope_count = 0
     results: list[C1Result] = []
     for row in rows:
-        if row["has_hit"]:
-            # Any HIT — even a 401 — proves the endpoint is not dead (ADR-0033).
-            continue
-
         endpoint = _EndpointView(
             method=str(row["method"]),
             host=_HostView(
@@ -170,6 +199,11 @@ def run_c1(
             path_template=str(row["path_template"]),
         )
         if not is_in_scope(endpoint, scope):
+            continue
+        in_scope_count += 1
+
+        if row["has_hit"]:
+            # Any HIT — even a 401 — proves the endpoint is not dead (ADR-0033).
             continue
 
         stored = float(row["confidence"]) if row["confidence"] is not None else 1.0
@@ -194,6 +228,12 @@ def run_c1(
             )
         )
 
+    _warn_if_scope_matches_nothing(
+        engagement_id=engagement_id,
+        query="c1",
+        total_endpoints=len(rows),
+        in_scope_endpoints=in_scope_count,
+    )
     log.info(
         "coverage.c1.complete",
         engagement_id=engagement_id,
@@ -282,6 +322,7 @@ def _load_in_scope_endpoints(
     scope: ScopeRules,
     *,
     run_at: datetime,
+    query: str,
 ) -> dict[str, dict[str, Any]]:
     """Return `{endpoint_id: {method, host_label, path_template, eff_conf}}`.
 
@@ -331,6 +372,12 @@ def _load_in_scope_endpoints(
             "path_template": endpoint.path_template,
             "effective_confidence": effective_confidence(stored, last_seen, now=run_at),
         }
+    _warn_if_scope_matches_nothing(
+        engagement_id=engagement_id,
+        query=query,
+        total_endpoints=len(rows),
+        in_scope_endpoints=len(out),
+    )
     return out
 
 
@@ -376,7 +423,9 @@ def run_c2(
     run_at = now or datetime.now(UTC)
     scope = _load_scope_rules(client, engagement_id)
     principals = _load_principals(client, engagement_id)
-    endpoints = _load_in_scope_endpoints(client, engagement_id, scope, run_at=run_at)
+    endpoints = _load_in_scope_endpoints(
+        client, engagement_id, scope, run_at=run_at, query="c2"
+    )
     reached = reached_map(client, engagement_id)
 
     a_candidates = [p for p in principals if as_label is None or p.label == as_label]
@@ -488,7 +537,9 @@ def run_c2b(
     run_at = now or datetime.now(UTC)
     scope = _load_scope_rules(client, engagement_id)
     principals = _load_principals(client, engagement_id)
-    endpoints = _load_in_scope_endpoints(client, engagement_id, scope, run_at=run_at)
+    endpoints = _load_in_scope_endpoints(
+        client, engagement_id, scope, run_at=run_at, query="c2b"
+    )
     reached = reached_map(client, engagement_id)
 
     label_by_id = {p.principal_id: p.label for p in principals}
@@ -677,6 +728,11 @@ def run_c3(
 
     rows = client.execute_read(cypher, **frag.parameters)
 
+    # Track distinct target (input) endpoints for the zero-in-scope-match warning
+    # (#55): C3's in-scope predicate applies to the TARGET endpoint only.
+    seen_targets: set[str] = set()
+    in_scope_targets: set[str] = set()
+
     results: list[C3Result] = []
     for row in rows:
         target = _EndpointView(
@@ -689,11 +745,12 @@ def run_c3(
             ),
             path_template=str(row["target_path_template"]),
         )
+        target_id = str(row["target_endpoint_id"])
+        seen_targets.add(target_id)
         # The TARGET (input) endpoint must be in scope; the source need not be.
         if not is_in_scope(target, scope):
             continue
-
-        target_id = str(row["target_endpoint_id"])
+        in_scope_targets.add(target_id)
 
         # Cross-endpoint by default: drop the target from the source list, and
         # decide same-endpoint inclusion on whether any source is the target.
@@ -777,6 +834,12 @@ def run_c3(
             r.parameter_name or "",
             r.value_hash,
         )
+    )
+    _warn_if_scope_matches_nothing(
+        engagement_id=engagement_id,
+        query="c3",
+        total_endpoints=len(seen_targets),
+        in_scope_endpoints=len(in_scope_targets),
     )
     log.info(
         "coverage.c3.complete",
