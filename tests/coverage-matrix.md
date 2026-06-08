@@ -51,6 +51,16 @@ file-level where a story is covered broadly across a module's cases.
 | 42 | Typer CLI with clear subcommands | `src/doo/cli.py` (engagement start/status/keepalive, ingest har); exercised by `tests/test_keepalive.py` + intake tests |
 | 43 | All layer-boundary data validated by strict Pydantic | `tests/test_envelope.py`, `tests/test_l2_events.py`, `tests/test_l3_events.py` (strict, extra=forbid) |
 
+## Slice-2 coverage queries (issue #49 / #50)
+
+Maps each coverage query (per ADR-0033 / ADR-0034) to the test(s) that exercise
+it. Extends the slice-1 matrix above.
+
+| Query | What it surfaces | Test(s) |
+|-------|------------------|---------|
+| C1 | In-scope `Endpoint`s with no `HIT` edge of any kind (dead endpoints); "hit" = any `HIT` regardless of status/source, asymmetric from C2's "reached" (ADR-0033); in-scope decided by `is_in_scope` in Python (ADR-0020); engagement-scoped + `status='active'` (ADR-0017); effective confidence decayed (ADR-0005), `--min-confidence` opt-in. | `tests/test_coverage_c1_e2e.py::test_c1_returns_only_in_scope_never_hit_endpoints` (golden e2e: in-scope-never-hit returned, any-HIT excluded, out-of-scope-hit excluded), `…::test_c1_min_confidence_does_not_hide_by_default`; `tests/test_coverage_c1_unit.py` (any-HIT-not-dead, scope filter, decay + `--min-confidence`, JSON round-trip); `tests/test_coverage_cli.py` (table + `--json` rendering) |
+| C2 / C2b / C3 | Authz-coverage + leak-to-input pivots. | *Deferred to later slice-2 tracers; spine + C1 land first (issue #50).* |
+
 ## Comprehensive integration
 
 `tests/e2e/test_slice1_full.py::test_slice1_comprehensive_pipeline` exercises
