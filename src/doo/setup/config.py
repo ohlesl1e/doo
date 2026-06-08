@@ -248,6 +248,12 @@ _ENV_REF_RE = re.compile(r"^\$\{(?P<name>[A-Za-z_][A-Za-z0-9_]*)\}$")
 # Stable kebab-case label for a declared Principal (the manual `identity_key`).
 _LABEL_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
+# Labels reserved for system-generated principals; a declared label may not
+# collide. `anon` is the anonymous-singleton display label the coverage layer
+# emits (`_principal_label`); letting a tester declare it would make the two
+# indistinguishable in C2/C2b output and `--as/--not-as` pins.
+_RESERVED_LABELS = frozenset({"anon"})
+
 
 class DeclaredAuthContext(BaseModel):
     """One declared `AuthContext` for a Principal (ADR-0012).
@@ -322,6 +328,11 @@ class DeclaredPrincipal(BaseModel):
         if not _LABEL_RE.match(self.label):
             raise ValueError(
                 f"principal label must be kebab-case ([a-z0-9-]); got {self.label!r}"
+            )
+        if self.label in _RESERVED_LABELS:
+            raise ValueError(
+                f"principal label {self.label!r} is reserved for a system principal "
+                "(the anonymous singleton); choose another label"
             )
         return self
 

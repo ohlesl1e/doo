@@ -104,6 +104,21 @@ def test_3xx_is_not_reached() -> None:
     assert _map(rows) == {}
 
 
+def test_sized_2xx_beats_null_size_2xx_for_same_pair() -> None:
+    # Representative selection (ADR-0033): for one (endpoint, principal) pair with
+    # a NULL-size 2xx and a sized 2xx, the SIZED one must be the representative.
+    # Neo4j sorts NULL first under DESC, so the query uses coalesce(size, 0); a
+    # regression silently collapses C2b evidence to (None, None) and drops
+    # role-differentiated-200 leads.
+    rows = [
+        _obs_row(endpoint_id="e1", principal_id="pA", status=200, size=None, sha=None),
+        _obs_row(endpoint_id="e1", principal_id="pA", status=200, size=400, sha="sha-big"),
+    ]
+    ev = _map(rows)[("e1", "pA")]
+    assert ev.response_size_bytes == 400
+    assert ev.response_body_sha256 == "sha-big"
+
+
 def test_c1_vs_c2_asymmetry_a_401_hit_is_not_reached() -> None:
     """The locked asymmetry (ADR-0033): a 401 is a HIT (C1 counts it as 'not
     dead') but is NOT a 2xx, so `reached` is False for it. C1 and C2 deliberately

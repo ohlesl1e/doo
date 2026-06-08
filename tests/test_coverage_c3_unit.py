@@ -32,8 +32,18 @@ _SCOPE_RULES = {
 }
 
 
-def _src(endpoint_id: str, *, method: str = "GET", path: str) -> dict[str, Any]:
-    return {"endpoint_id": endpoint_id, "method": method, "path_template": path}
+def _src(
+    endpoint_id: str, *, method: str = "GET", path: str, host: str = "shop.example.com"
+) -> dict[str, Any]:
+    return {
+        "endpoint_id": endpoint_id,
+        "method": method,
+        "path_template": path,
+        "scheme": "https",
+        "canonical_hostname": host,
+        "port": None,
+        "is_ip_literal": False,
+    }
 
 
 def _pivot_row(
@@ -83,6 +93,10 @@ class _FakeClient:
             return [{"rules": json.dumps(_SCOPE_RULES)}]
         if "YIELDED_VALUE" in cypher and "SENT_VALUE" in cypher:
             return self._pivots
+        # `_load_in_scope_endpoints` (the zero-match-warning side-channel) — these
+        # unit tests don't exercise the warning, so an empty endpoint set is fine.
+        if "Endpoint)-[:ON_HOST]" in cypher:
+            return []
         raise AssertionError(f"unexpected query: {cypher[:80]!r}")
 
 
@@ -98,7 +112,7 @@ def test_cross_endpoint_pivot_is_surfaced() -> None:
     assert row.value_hash == "h-uuid"
     assert row.target_path_template == "/widget-detail"
     assert row.parameter_name == "widget_id"
-    assert row.source_endpoints == ("GET /widgets",)
+    assert row.source_endpoints == ("GET shop.example.com /widgets",)
     assert row.same_endpoint is False
 
 
@@ -111,7 +125,7 @@ def test_same_endpoint_reuse_excluded_by_default_included_with_flag() -> None:
     out = _run(pivots=[pivot], include_same_endpoint=True)
     assert len(out) == 1
     assert out[0].same_endpoint is True
-    assert out[0].source_endpoints == ("GET /widget-detail",)
+    assert out[0].source_endpoints == ("GET shop.example.com /widget-detail",)
 
 
 def test_mixed_sources_keep_cross_endpoint_only() -> None:
@@ -125,7 +139,7 @@ def test_mixed_sources_keep_cross_endpoint_only() -> None:
     )
     out = _run(pivots=[pivot])
     assert len(out) == 1
-    assert out[0].source_endpoints == ("GET /widgets",)
+    assert out[0].source_endpoints == ("GET shop.example.com /widgets",)
     assert out[0].same_endpoint is False
 
 
@@ -135,15 +149,39 @@ def test_target_out_of_scope_excluded() -> None:
 
 
 def test_source_out_of_scope_still_surfaces() -> None:
-    # The source host need not be in scope (ADR-0020): the source label carries no
-    # host, and the target stays in scope, so the pivot is a valid lead.
+    # The source host need not be in scope (ADR-0020): the target stays in scope,
+    # so the pivot is a valid lead. The source label carries its own host.
     out = _run(
         pivots=[
-            _pivot_row(source_endpoints=[_src("eSso", method="POST", path="/sso/callback")])
+            _pivot_row(
+                source_endpoints=[
+                    _src(
+                        "eSso", method="POST", path="/sso/callback",
+                        host="idp.external.example",
+                    )
+                ]
+            )
         ]
     )
     assert len(out) == 1
-    assert out[0].source_endpoints == ("POST /sso/callback",)
+    assert out[0].source_endpoints == ("POST idp.external.example /sso/callback",)
+
+
+def test_source_endpoints_distinguish_distinct_hosts() -> None:
+    # Same method+path on two different hosts must NOT collapse — the host is the
+    # actionable signal (internal-leak vs federated-SSO). Two distinct labels.
+    pivot = _pivot_row(
+        source_endpoints=[
+            _src("eInt", method="GET", path="/me", host="internal-billing.corp.example"),
+            _src("ePub", method="GET", path="/me", host="api.public.example"),
+        ],
+    )
+    out = _run(pivots=[pivot])
+    assert len(out) == 1
+    assert out[0].source_endpoints == (
+        "GET api.public.example /me",
+        "GET internal-billing.corp.example /me",
+    )
 
 
 def test_secret_shaped_value_surfaces_hash_and_preview_only() -> None:
@@ -163,8 +201,9 @@ def test_secret_shaped_value_surfaces_hash_and_preview_only() -> None:
     row = out[0]
     assert row.value_hash == "deadbeef"
     assert row.value_preview == "eyJhbGci"
-    # No raw-value field exists on the model; round-trip never exposes one.
-    assert "value" not in row.model_dump() or "value_hash" in row.model_dump()
+    # No raw-value field exists on the model; round-trip never exposes one
+    # (ADR-0015 secret invariant — fails loudly if a `value` field is ever added).
+    assert "value" not in row.model_dump()
 
 
 def test_shape_rank_orders_uuid_email_jwt_above_opaque_above_integer() -> None:

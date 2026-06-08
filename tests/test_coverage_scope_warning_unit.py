@@ -90,7 +90,15 @@ class _FakeClient:
                     "is_ip_literal": False,
                     "parameter_name": "id",
                     "source_endpoints": [
-                        {"endpoint_id": "ep-src", "method": "GET", "path_template": "/me"}
+                        {
+                            "endpoint_id": "ep-src",
+                            "method": "GET",
+                            "path_template": "/me",
+                            "scheme": "https",
+                            "canonical_hostname": "shop.example.com",
+                            "port": None,
+                            "is_ip_literal": False,
+                        }
                     ],
                 }
             ]
@@ -148,15 +156,19 @@ def test_c2b_warns_when_scope_matches_nothing() -> None:
 
 
 def test_c3_warns_when_scope_matches_nothing() -> None:
-    client = _FakeClient(scope=_SCOPE_MATCHES_NOTHING, endpoint_rows=[])
+    # C3 now derives the warning from the full active-endpoint set (merged_bug_002),
+    # so it fires even with zero pivots as long as the graph has endpoints.
+    rows = [_endpoint_row(endpoint_id="ep-1", path_template="/orders/{id}")]
+    client = _FakeClient(scope=_SCOPE_MATCHES_NOTHING, endpoint_rows=rows)
     with structlog.testing.capture_logs() as caplog:
         out = run_c3(client, _eid(), now=_NOW)  # type: ignore[arg-type]
-    assert out == []
+    assert out == []  # target out of scope → no pivots surface
     assert _warned(caplog)
 
 
 def test_c3_does_not_warn_when_target_in_scope() -> None:
-    client = _FakeClient(scope=_SCOPE_MATCHES, endpoint_rows=[])
+    rows = [_endpoint_row(endpoint_id="ep-1", path_template="/orders/{id}")]
+    client = _FakeClient(scope=_SCOPE_MATCHES, endpoint_rows=rows)
     with structlog.testing.capture_logs() as caplog:
         run_c3(client, _eid(), now=_NOW)  # type: ignore[arg-type]
     assert not _warned(caplog)

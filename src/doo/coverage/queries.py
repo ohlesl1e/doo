@@ -29,6 +29,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from pydantic import ValidationError
+
 from doo.canonical.value_objects import Scheme
 from doo.coverage.decay import effective_confidence
 from doo.coverage.models import C1Result, C2bResult, C2Result, C3Result, PrincipalEvidence
@@ -92,7 +94,19 @@ def _load_scope_rules(client: Neo4jClient, engagement_id: EngagementId) -> Scope
         )
     raw = rows[0]["rules"]
     rules_dict = json.loads(raw) if isinstance(raw, str) else raw
-    return ScopeRules.model_validate(rules_dict)
+    try:
+        return ScopeRules.model_validate(rules_dict)
+    except ValidationError as exc:
+        # A Scope persisted before ADR-0035 may hold regex patterns that the
+        # glob validator now rejects on rehydrate. Surface an actionable
+        # migration hint instead of a raw Pydantic stack trace (the strict
+        # validator still runs on fresh `engagement start`).
+        raise ValueError(
+            f"engagement {engagement_id!r}: stored Scope.rules predate ADR-0035 "
+            "(scope patterns are now glob/segment, not regex). Re-run "
+            "`doo engagement start` to migrate. Underlying validation error: "
+            f"{exc}"
+        ) from exc
 
 
 def _to_aware(value: Any, *, fallback: datetime) -> datetime:
@@ -431,6 +445,24 @@ def run_c2(
     a_candidates = [p for p in principals if as_label is None or p.label == as_label]
     b_candidates = [p for p in principals if not_as_label is None or p.label == not_as_label]
 
+    # A pinned --as/--not-as label that names no active principal yields an empty
+    # result indistinguishable from "no gaps" — warn so a typo (or confusing a
+    # declared label with a `discovered:…` identity_key) isn't read as "clean".
+    if as_label is not None and not a_candidates:
+        log.warning(
+            "coverage.c2.pinned_label_unmatched",
+            engagement_id=engagement_id,
+            side="as",
+            label=as_label,
+        )
+    if not_as_label is not None and not b_candidates:
+        log.warning(
+            "coverage.c2.pinned_label_unmatched",
+            engagement_id=engagement_id,
+            side="not_as",
+            label=not_as_label,
+        )
+
     results: list[C2Result] = []
     for a in a_candidates:
         for b in b_candidates:
@@ -694,20 +726,26 @@ def run_c3(
 
     run_at = now or datetime.now(UTC)
     scope = _load_scope_rules(client, engagement_id)
+    # Emit the misconfigured-scope warning (#55 / ADR-0035) based on the full
+    # active-endpoint set — so it fires even when C3 finds no pivots at all
+    # (the pivot-row count would otherwise be 0 and suppress the signal).
+    _load_in_scope_endpoints(client, engagement_id, scope, run_at=run_at, query="c3")
 
     frag = for_engagement(engagement_id, var="v")
     cypher = f"""
         MATCH (v:ObservedValue)
         {frag.and_("v.status = 'active'")}
         MATCH (out:RequestObservation)-[:YIELDED_VALUE]->(v)
-        MATCH (out)-[:HIT]->(oe:Endpoint)
-        WHERE oe.status = 'active'
+        MATCH (out)-[:HIT]->(oe:Endpoint)-[:ON_HOST]->(oh:Host)
+        WHERE oe.status = 'active' AND out.status = 'active'
         MATCH (inp:RequestObservation)-[s:SENT_VALUE]->(v)
         MATCH (inp)-[:HIT]->(ie:Endpoint)-[:ON_HOST]->(ih:Host)
-        WHERE ie.status = 'active'
+        WHERE ie.status = 'active' AND inp.status = 'active'
         WITH v, ie, ih, s.parameter_name AS parameter_name,
              collect(DISTINCT {{
-                 endpoint_id: oe.id, method: oe.method, path_template: oe.path_template
+                 endpoint_id: oe.id, method: oe.method, path_template: oe.path_template,
+                 scheme: oh.scheme, canonical_hostname: oh.canonical_hostname,
+                 port: oh.port, is_ip_literal: oh.is_ip_literal
              }}) AS source_endpoints
         RETURN v.value_hash AS value_hash,
                v.kind AS kind,
@@ -728,11 +766,6 @@ def run_c3(
 
     rows = client.execute_read(cypher, **frag.parameters)
 
-    # Track distinct target (input) endpoints for the zero-in-scope-match warning
-    # (#55): C3's in-scope predicate applies to the TARGET endpoint only.
-    seen_targets: set[str] = set()
-    in_scope_targets: set[str] = set()
-
     results: list[C3Result] = []
     for row in rows:
         target = _EndpointView(
@@ -746,11 +779,9 @@ def run_c3(
             path_template=str(row["target_path_template"]),
         )
         target_id = str(row["target_endpoint_id"])
-        seen_targets.add(target_id)
         # The TARGET (input) endpoint must be in scope; the source need not be.
         if not is_in_scope(target, scope):
             continue
-        in_scope_targets.add(target_id)
 
         # Cross-endpoint by default: drop the target from the source list, and
         # decide same-endpoint inclusion on whether any source is the target.
@@ -777,9 +808,17 @@ def run_c3(
         if eff < min_confidence:
             continue
 
+        # Identity-tuple label `method host path` (C3Result contract); include
+        # the source host so leaks from distinct hosts don't collapse, and dedup
+        # with a set (same method+host+path across observations is one source).
         source_labels = tuple(
             sorted(
-                f"{src['method']} {src['path_template']}" for src in kept_sources
+                {
+                    f"{src['method']} "
+                    f"{_host_label(_HostView(scheme=src['scheme'], canonical_hostname=str(src['canonical_hostname']), port=src['port'], is_ip_literal=bool(src['is_ip_literal'])))} "
+                    f"{src['path_template']}"
+                    for src in kept_sources
+                }
             )
         )
 
@@ -834,12 +873,6 @@ def run_c3(
             r.parameter_name or "",
             r.value_hash,
         )
-    )
-    _warn_if_scope_matches_nothing(
-        engagement_id=engagement_id,
-        query="c3",
-        total_endpoints=len(seen_targets),
-        in_scope_endpoints=len(in_scope_targets),
     )
     log.info(
         "coverage.c3.complete",

@@ -383,6 +383,17 @@ def test_loader_rejects_inline_token_and_non_kebab_label() -> None:
         _build_config(d2)
 
 
+def test_loader_rejects_reserved_anon_label() -> None:
+    """A declared label may not collide with the anonymous-singleton label `anon`
+    (it would be indistinguishable in C2/C2b output and --as/--not-as pins)."""
+    from pydantic import ValidationError
+
+    d = _base_config_dict()
+    d["principals"] = [{"label": "anon"}]
+    with pytest.raises(ValidationError):
+        _build_config(d)
+
+
 # ---------------------------------------------------------------------------
 # auth.identity_key tests (ADR-0032)
 # ---------------------------------------------------------------------------

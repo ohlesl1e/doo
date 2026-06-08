@@ -91,7 +91,7 @@ def reached_map(
                r.response_status AS status,
                r.response_size_bytes AS response_size_bytes,
                r.response_body_sha256 AS response_body_sha256
-        ORDER BY status DESC, response_size_bytes DESC
+        ORDER BY status DESC, coalesce(response_size_bytes, 0) DESC
     """
 
     rows = client.execute_read(cypher, **frag.parameters)
