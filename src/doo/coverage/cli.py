@@ -57,7 +57,9 @@ def _render_c1_table(rows: list[C1Result]) -> None:
 
 @coverage_app.command("c1")
 def c1(
-    engagement: str = typer.Option(..., "--engagement", help="Engagement id to analyze."),
+    engagement: str = typer.Option(
+        ..., "--engagement", "-e", help="Engagement id to analyze."
+    ),
     min_confidence: float = typer.Option(
         0.0,
         "--min-confidence",
@@ -121,7 +123,9 @@ def _render_c2_table(rows: list[C2Result]) -> None:
 
 @coverage_app.command("c2")
 def c2(
-    engagement: str = typer.Option(..., "--engagement", help="Engagement id to analyze."),
+    engagement: str = typer.Option(
+        ..., "--engagement", "-e", help="Engagement id to analyze."
+    ),
     as_label: str | None = typer.Option(
         None, "--as", help="Pin principal A by label (the side that reached). Default: all."
     ),
@@ -191,7 +195,9 @@ def _render_c2b_table(rows: list[C2bResult]) -> None:
 
 @coverage_app.command("c2b")
 def c2b(
-    engagement: str = typer.Option(..., "--engagement", help="Engagement id to analyze."),
+    engagement: str = typer.Option(
+        ..., "--engagement", "-e", help="Engagement id to analyze."
+    ),
     min_confidence: float = typer.Option(
         0.0,
         "--min-confidence",
@@ -256,7 +262,9 @@ def _render_c3_table(rows: list[C3Result]) -> None:
 
 @coverage_app.command("c3")
 def c3(
-    engagement: str = typer.Option(..., "--engagement", help="Engagement id to analyze."),
+    engagement: str = typer.Option(
+        ..., "--engagement", "-e", help="Engagement id to analyze."
+    ),
     include_same_endpoint: bool = typer.Option(
         False,
         "--include-same-endpoint",

@@ -73,6 +73,21 @@ def test_c1_empty_table_message(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "no in-scope endpoints are dead" in result.output
 
 
+def test_coverage_commands_accept_short_engagement_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`-e` is the short alias for `--engagement` on every coverage command,
+    matching `doo ingest har -e` (#57)."""
+    from doo.cli import app
+
+    for fn in ("run_c1", "run_c2", "run_c2b", "run_c3"):
+        monkeypatch.setattr(cli_mod, fn, lambda *a, **k: [])
+    for sub in ("c1", "c2", "c2b", "c3"):
+        result = CliRunner().invoke(app, ["coverage", sub, "-e", "eng-1"])
+        assert result.exit_code == 0, f"{sub} -e failed: {result.output}"
+        assert "No such option" not in result.output
+
+
 # --- C2 rendering ---------------------------------------------------------
 
 _C2_ROWS = [
