@@ -25,9 +25,65 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from doo.events.slice4 import PayloadClass
 from doo.ids import EngagementId, EngagementName, ScopeContentHash
 
-PathPattern = str  # Regex-or-glob pattern; canonical Scope rule format.
+PathPattern = str  # Glob/segment pattern; canonical Scope rule format (ADR-0035).
 
 HttpMethod = str  # Kept open here; OPA's data bundle constrains it strictly.
+
+
+# ---------------------------------------------------------------------------
+# Scope-pattern syntax guard (ADR-0035): patterns are glob/segment, NOT regex.
+#
+# `is_in_scope` (src/doo/policy/scope.py) matches host patterns as exact /
+# single-leading-`*.` glob and path patterns segment-wise (`*` = one segment,
+# trailing `**` = the rest). A regex pattern (`^.*$`, `^/.*$`) is matched
+# *literally* and so matches nothing real — a silent false-negative (#55). We
+# reject regex at load so the failure is loud and actionable instead.
+#
+# The rejected set is the regex-only metacharacters that are NOT meaningful glob
+# syntax. We must NOT reject the characters a legitimate glob/segment pattern
+# uses:
+#   - `*`        — glob wildcard (`*.example.com`, `*` segment, trailing `**`)
+#   - `.`        — hostname label separator (`api.example.com`)
+#   - `/`        — path segment separator
+#   - `{` `}`    — `{param}` path-template placeholder a `*` segment matches
+#   - `:` `-`    — port pin (`:8443`), scheme (`https://`), hostname hyphens
+# Rejected (regex-only, never valid glob here):
+#   ^  $        — anchors
+#   [ ]         — character class
+#   ( )         — group
+#   |           — alternation
+#   +  ?        — quantifiers
+#   \           — escape
+#   .*          — the dot-star regex idiom (a bare `.` is fine; `.*` is not, it
+#                 is the single most common regex-scope mistake and unambiguous)
+# ---------------------------------------------------------------------------
+
+# Single regex-only metacharacters that are never valid glob/segment syntax.
+_REGEX_ONLY_CHARS = frozenset("^$[]()|+?\\")
+# Multi-char regex idiom that uses otherwise-legal glob chars (`.` and `*`) but
+# is unambiguously regex when adjacent.
+_REGEX_DOT_STAR = ".*"
+
+
+def _reject_regex_pattern(pattern: str, *, field: str) -> None:
+    """Raise if `pattern` contains regex-only metacharacters (ADR-0035).
+
+    Glob/segment is the one canonical scope syntax; a regex pattern silently
+    matches nothing (#55), so we fail fast at load with an actionable error
+    naming the offending pattern and the disallowed token.
+    """
+
+    offending = sorted({ch for ch in pattern if ch in _REGEX_ONLY_CHARS})
+    if _REGEX_DOT_STAR in pattern:
+        offending.append(_REGEX_DOT_STAR)
+    if offending:
+        tokens = ", ".join(repr(t) for t in offending)
+        raise ValueError(
+            f"{field} pattern {pattern!r} looks like regex, but Scope patterns are "
+            f"glob/segment, not regex (ADR-0035). Disallowed token(s): {tokens}. "
+            f"Use glob instead, e.g. host '*.example.com' or an exact host, and "
+            f"path '/**' (all paths) or '/users/*' (one segment)."
+        )
 
 
 def _list_to_tuple(v: Any) -> Any:
@@ -82,8 +138,26 @@ class RateLimit(BaseModel):
 class ScopeRules(BaseModel):
     """The Scope rule document. Hashed for `Scope.content_hash` (ADR-0017).
 
-    `host_patterns` are the allowlist (regex). `payload_class_denylist` is the
-    program's prohibited payload classes (per CONTEXT.md PayloadClass).
+    Patterns are **glob/segment, not regex** (ADR-0035) — the exact syntax
+    `is_in_scope` (`src/doo/policy/scope.py`) and the future Rego evaluate:
+
+    - `host_patterns` — the host allowlist. Each entry is an exact host
+      (case-insensitive, e.g. ``api.example.com`` or an IP literal
+      ``172.30.146.0``) or a single leading ``*.`` wildcard
+      (``*.example.com`` matches sub-domains, not the apex). A pattern may pin a
+      scheme (``https://host``) and/or a port (``host:8443``). IP literals match
+      exact patterns only, never a wildcard.
+    - `allowed_path_patterns` — segment-wise path globs. A ``*`` segment matches
+      exactly one path-template segment (including a ``{param}`` placeholder); a
+      trailing ``**`` (i.e. ``/**``) matches all remaining segments; literal
+      segments match exactly. ``/users/*`` matches ``/users/{user_id}``;
+      ``/**`` matches every path.
+    - `payload_class_denylist` — the program's prohibited payload classes (per
+      CONTEXT.md PayloadClass).
+
+    Regex is rejected at load (``^``, ``$``, ``.*``, ``[``, ``(``, ``|`` …): a
+    regex pattern matches nothing under the glob matcher and would silently
+    return empty coverage (#55), so the loader fails fast naming the pattern.
     """
 
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
@@ -105,6 +179,16 @@ class ScopeRules(BaseModel):
         "required_headers",
         mode="before",
     )(_list_to_tuple)
+
+    @model_validator(mode="after")
+    def _patterns_are_glob_not_regex(self) -> Self:
+        """Reject regex host/path patterns at load (ADR-0035, #55)."""
+
+        for p in self.host_patterns:
+            _reject_regex_pattern(p, field="host")
+        for p in self.allowed_path_patterns:
+            _reject_regex_pattern(p, field="path")
+        return self
 
 
 class KillSwitchConfig(BaseModel):
@@ -163,6 +247,12 @@ _ENV_REF_RE = re.compile(r"^\$\{(?P<name>[A-Za-z_][A-Za-z0-9_]*)\}$")
 
 # Stable kebab-case label for a declared Principal (the manual `identity_key`).
 _LABEL_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+# Labels reserved for system-generated principals; a declared label may not
+# collide. `anon` is the anonymous-singleton display label the coverage layer
+# emits (`_principal_label`); letting a tester declare it would make the two
+# indistinguishable in C2/C2b output and `--as/--not-as` pins.
+_RESERVED_LABELS = frozenset({"anon"})
 
 
 class DeclaredAuthContext(BaseModel):
@@ -238,6 +328,11 @@ class DeclaredPrincipal(BaseModel):
         if not _LABEL_RE.match(self.label):
             raise ValueError(
                 f"principal label must be kebab-case ([a-z0-9-]); got {self.label!r}"
+            )
+        if self.label in _RESERVED_LABELS:
+            raise ValueError(
+                f"principal label {self.label!r} is reserved for a system principal "
+                "(the anonymous singleton); choose another label"
             )
         return self
 

@@ -610,6 +610,15 @@ def commit_request_observation(
     response_body_ref = (
         obs.response_body_ref.model_dump_json() if obs.response_body_ref is not None else None
     )
+    # ADR-0033 body-metadata promotion: lift the response body sha256 out of the
+    # `response_body_ref` JSON string onto a top-level node property so the
+    # coverage C2/C2b queries can compare it without JSON-extracting in Cypher,
+    # and confirm `response_size_bytes` lands as a queryable scalar. Both are the
+    # per-principal evidence the authz-coverage queries surface (null body sha256
+    # when there was no response body).
+    response_body_sha256 = (
+        obs.response_body_ref.sha256 if obs.response_body_ref is not None else None
+    )
     value_candidates = [vc.model_dump_json() for vc in obs.value_candidates]
     # ADR-0030: the claim-tagged observed identities are persisted as ONE serialized
     # JSON list (`observed_identities`) — replacing the prior single-value
@@ -629,6 +638,8 @@ def commit_request_observation(
                       r.body_param_names = $body_param_names,
                       r.request_body_ref = $request_body_ref,
                       r.response_body_ref = $response_body_ref,
+                      r.response_body_sha256 = $response_body_sha256,
+                      r.response_size_bytes = $response_size_bytes,
                       r.response_status = $response_status,
                       r.value_candidates = $value_candidates,
                       r.server_fingerprint = $server_fingerprint,
@@ -654,6 +665,8 @@ def commit_request_observation(
         body_param_names=body_param_names,
         request_body_ref=request_body_ref,
         response_body_ref=response_body_ref,
+        response_body_sha256=response_body_sha256,
+        response_size_bytes=obs.response_size_bytes,
         response_status=obs.response_status,
         value_candidates=value_candidates,
         server_fingerprint=obs.server_fingerprint,

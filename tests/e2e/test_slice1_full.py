@@ -68,7 +68,7 @@ def _load_engagement_with_declared_principal(neo4j_client) -> None:
 
     d = _base_config_dict()
     d["engagement"]["id"] = _EID
-    d["scope"]["host_patterns"] = ["^api\\.example\\.com$"]
+    d["scope"]["host_patterns"] = ["api.example.com"]
     d["principals"] = [
         {
             "label": "test-user-a",
