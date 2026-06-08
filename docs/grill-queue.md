@@ -53,9 +53,64 @@ Worth writing down (in `ARCHITECTURE.md` or a new `DECISIONS.md`), but not worth
 | OPA deployment | Sidecar process; bundle generated from `Scope` nodes | Per ADR-0003 |
 | Burp extension language | Kotlin | More pleasant Montoya API surface (per `ARCHITECTURE.md` open question) |
 
+## Slice 2 scope (coverage analysis)
+
+Grilled 2026-06-06. The coverage analyzer is **pull / ephemeral**: a library of
+deterministic Cypher queries plus a CLI that reads the graph at a settle point,
+returns Pydantic result models, and writes nothing back. Gaps are derived at
+query time (same discipline as `is_in_scope`, ADR-0020, and confidence decay,
+ADR-0005) — never materialised as `CoverageGap` nodes. The `l3-events`
+`coverage` consumer group stays reserved for a future live-coverage view
+(Logger++ streaming), not slice 2.
+
+**In scope: C1, C2, C2b, C3.** Buildable against today's graph; the "60% of
+value" set (dead endpoints, auth-presence-differential, auth-content-differential,
+leak-to-input pivots).
+
+C2 success semantics are settled in **ADR-0033**: "reached as P" requires a 2xx
+observation (asymmetric from C1, which counts any `HIT`); C2 surfaces
+present-as-A-but-not-B (B's 401/403 count as *not reached* so bypass candidates
+are not suppressed); **C2b** is the content-differential query (≥2 principals
+reach 2xx but `response_body_sha256`/`response_size_bytes` differ) — the handle
+on role-differentiated 200s. Coverage surfaces per-principal evidence
+`(status, size, body_sha256)`, it does not adjudicate soft-200.
+
+Slice-2 prerequisites (per ADR-0033): promote `response_body_sha256` to a
+top-level node property; confirm `response_size_bytes` is queryable.
+
+**Deferred: C4, C5** (see Defer section). Their substrate doesn't exist yet:
+C4 needs inferred capability-tier `TrustBoundary` nodes (an L3 *write-path*
+feature, not a coverage query); C5 additionally needs `TestCase` nodes, which
+first exist in slice 4.
+
 ## Defer
 
 Until after slice 1+2 lands; revisit when the implementation forces the question.
+
+- **C4 (auth-state transitions never exercised).** Needs capability-tier
+  `TrustBoundary` nodes, which nothing infers yet. The inference (drawing
+  boundaries between an actor's `AuthContext`s from passive evidence) is an L3
+  ontology write-path feature — its own work item (slice 2.5 / slice 3), kept
+  separate from coverage's read-path queries. C4 is passively answerable once
+  the boundaries exist (no active testing required).
+- **C5 (`TrustBoundary`s with no `TestCase`).** Vacuous until slice 4 — no
+  `TestCase` nodes exist until the dispatcher runs. Revisit with slice 4.
+- **Passive login-redirect / 3xx classification (ADR-0033).** Slice-2 C2/C2b
+  treat success as 2xx only; 3xx is not-reached. A passive login-redirect
+  classifier (the dispatch-side detector from ADR-0013, reused for passive
+  observations) would let redirect-following count as reached. Conservative
+  2xx-only only reduces leads, so safe to defer.
+- **Principal/tenant-aware C3 (leak-to-input).** Slice-2 C3 is principal-agnostic:
+  cross-*endpoint* pivot (value in endpoint X's response → input to a different
+  in-scope endpoint Y), ranked by shape specificity then confidence; target
+  endpoint must be `is_in_scope`, source endpoint need not be (ADR-0020);
+  temporality ignored. The high-value refinement — value leaked *to* Principal A
+  appears as input *under* Principal B, or tenant 42's id used by tenant 43 (the
+  IDOR/BOLA jackpot) — layers principal-awareness on C3 and overlaps C7; defer.
+- **Per-engagement `success_match`/`failure_match` (ADR-0033).** Soft-200
+  disambiguation for apps that always 200 with a body-level success flag —
+  tester-declared string/regex (ADR-0012-legal), the sqlmap `--string` pattern.
+  Defer until a real always-200 target forces it.
 
 - **Burp extension.** HAR-first MVP — drop a HAR file into ingestion, see it land in the graph. No Java/Kotlin yet. For continuous capture later, **Logger++** (existing Burp extension) is the planned integration point: it ships auto CSV export and a live Elasticsearch-stream output. The integration is a small HTTP shim that speaks the ES bulk-index protocol and pipes the indexed documents into L1 ingestion as raw observations — Logger++ thinks it's writing to ES, we get streaming Burp traffic with zero custom Burp code. A custom Montoya extension is only justified if Logger++'s exported document shape lacks something we need; revisit then.
 - **OpenTelemetry SDK + collector + exporters.** Refined to "OTel-ready, OTel-not-yet" per ADR-0018: `trace_id` / `span_id` ride in `IngestionEnvelope`, `L2Event`, and `l3-events` from slice 1; structured logs include the same IDs; the SDK and exporters are deferred until slice 2-3 when distributed tracing pays off.

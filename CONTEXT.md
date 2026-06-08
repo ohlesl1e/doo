@@ -116,6 +116,14 @@ _Avoid_: result, outcome (those names conflate the deterministic dispatch classi
 A signal raised when two concrete paths that canonicalize to the same Endpoint return materially different responses — evidence of case/slash/encoding-sensitive backend handling, and a candidate auth-bypass or path-traversal bug.
 _Avoid_: Duplicate, Collision.
 
+**coverage gap**:
+A deterministically-derived absence in what the target has been exercised against — surfaced by the coverage analyzer (slice 2) as **candidates**, never verdicts. The analyzer is **pull / ephemeral**: it reads the graph at a settle point and computes gaps at query time (like `is_in_scope` and confidence decay), writing nothing back — there is no `CoverageGap` node. Slice-2 queries: C1 (in-scope Endpoints never hit), C2 / C2b (authz coverage, see **reached**), C3 (leak-to-input pivot). C4/C5 deferred (no `TrustBoundary`/`TestCase` substrate yet).
+_Avoid_: Finding (a gap is an untested *candidate*, not a confirmed vuln).
+
+**reached** (as a Principal):
+For authz-coverage queries (C2/C2b, ADR-0033), an Endpoint is *reached* by a Principal only when an observation under that Principal's AuthContext returned **2xx** — a request alone is not enough. This is deliberately asymmetric from C1's "hit", which counts *any* `HIT` edge (a 401 still proves an endpoint is not dead). **C2** surfaces reached-as-A-but-not-as-B (B's 401/403 count as *not reached*, so a possibly-bypassable boundary is not suppressed). **C2b** surfaces Endpoints reached by ≥2 Principals whose responses differ by body hash/size — the handle on role-differentiated 200s where BOLA/IDOR lives. The **soft-200** case (200 + denial in the body) is not adjudicated deterministically; coverage carries per-Principal evidence `(status, size, body_sha256)` and leaves the call to a human or the slice-3 interpreter.
+_Avoid_: hit (reserved for C1's any-request sense), accessed.
+
 ### Provenance, confidence, time
 
 These three concerns are recorded uniformly on *every* node and *every* edge (see ADR-0005 and `ONTOLOGY.md` Step 4).
