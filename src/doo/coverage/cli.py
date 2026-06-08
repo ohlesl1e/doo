@@ -17,8 +17,8 @@ import os
 
 import typer
 
-from doo.coverage.models import C1Result
-from doo.coverage.queries import run_c1
+from doo.coverage.models import C1Result, C2Result
+from doo.coverage.queries import run_c1, run_c2
 from doo.ids import EngagementId
 from doo.infra.neo4j_driver import Neo4jClient
 
@@ -90,3 +90,81 @@ def c1(
         typer.echo(_json.dumps([r.model_dump(mode="json") for r in rows], indent=2))
     else:
         _render_c1_table(rows)
+
+
+def _evidence_cell(ev: object) -> str:
+    """Render a per-principal evidence tuple (or '-' when B never reached)."""
+
+    if ev is None:
+        return "-"
+    status = getattr(ev, "status", None)
+    size = getattr(ev, "response_size_bytes", None)
+    return f"{status}/{size if size is not None else '?'}b"
+
+
+def _render_c2_table(rows: list[C2Result]) -> None:
+    if not rows:
+        typer.echo("C2: no presence-differential authz gaps for the selected principals.")
+        return
+    typer.echo(f"C2 — reached as A but not as B (authz-coverage gaps): {len(rows)}")
+    typer.echo(
+        f"{'A':<16} {'B':<16} {'METHOD':<7} {'PATH':<32} "
+        f"{'A(stat/sz)':<12} {'B(stat/sz)':<12} {'CONF':>6}"
+    )
+    for r in rows:
+        typer.echo(
+            f"{r.principal_a_label:<16} {r.principal_b_label:<16} {r.method:<7} "
+            f"{r.path_template:<32} {_evidence_cell(r.evidence_a):<12} "
+            f"{_evidence_cell(r.evidence_b):<12} {r.effective_confidence:>6.3f}"
+        )
+
+
+@coverage_app.command("c2")
+def c2(
+    engagement: str = typer.Option(..., "--engagement", help="Engagement id to analyze."),
+    as_label: str | None = typer.Option(
+        None, "--as", help="Pin principal A by label (the side that reached). Default: all."
+    ),
+    not_as_label: str | None = typer.Option(
+        None,
+        "--not-as",
+        help="Pin principal B by label (the side that did NOT reach). Default: all.",
+    ),
+    min_confidence: float = typer.Option(
+        0.0,
+        "--min-confidence",
+        help="Drop rows below this effective (decayed) confidence. Default 0 = "
+        "surface everything (low-confidence leads are never silently hidden).",
+    ),
+    as_json: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit the typed result models as JSON (round-trippable) instead of a table.",
+    ),
+) -> None:
+    """C2: endpoints reached (2xx) as principal A but not as principal B."""
+
+    from doo.observability.ids import new_span_id, new_trace_id
+    from doo.observability.logging import bind_correlation, configure_logging
+
+    configure_logging()
+    bind_correlation(trace_id=new_trace_id(), span_id=new_span_id())
+
+    client = _build_client()
+    try:
+        rows = run_c2(
+            client,
+            EngagementId(engagement),
+            as_label=as_label,
+            not_as_label=not_as_label,
+            min_confidence=min_confidence,
+        )
+    finally:
+        client.close()
+
+    if as_json:
+        import json as _json
+
+        typer.echo(_json.dumps([r.model_dump(mode="json") for r in rows], indent=2))
+    else:
+        _render_c2_table(rows)

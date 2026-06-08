@@ -43,6 +43,54 @@ class CoverageResult(BaseModel):
     generated_at: datetime
 
 
+class PrincipalEvidence(BaseModel):
+    """Per-principal response evidence on a C2 row (ADR-0033).
+
+    Coverage *surfaces evidence, it does not adjudicate* the soft-200 case, so a
+    C2 row carries the concrete observation that backs (or fails to back) each
+    side rather than a bare boolean. The **A** side always has a real 2xx
+    (`status` 200..299, `reached`); the **B** side is `None` when B never reached
+    the endpoint (either never tried or was blocked — both bypass candidates).
+
+    `response_body_sha256` is null until the body-metadata promotion has data and
+    for empty-body responses; consumers tolerate null.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    principal_id: str
+    label: str
+    status: int
+    response_size_bytes: int | None = None
+    response_body_sha256: str | None = None
+
+
+class C2Result(CoverageResult):
+    """One endpoint reached as principal A but not as principal B (ADR-0033).
+
+    The presence-differential authz signal: A got a 2xx, B did not (B never
+    tried, or B was blocked with 401/403/404/5xx). Both are IDOR / privilege-
+    escalation candidates, so the boundary is surfaced rather than suppressed.
+
+    The row names the ordered pair by `(principal_a_label, principal_b_label)`
+    and the endpoint's `(method, host, path_template)` identity, and carries A's
+    real success evidence plus B's evidence-or-null per ADR-0033. `reached` is
+    deliberately asymmetric from C1's any-`HIT` "hit".
+    """
+
+    query_id: str = Field(default="C2", frozen=True)
+
+    endpoint_id: str
+    method: str
+    host: str
+    path_template: str
+    principal_a_label: str
+    principal_b_label: str
+    evidence_a: PrincipalEvidence
+    evidence_b: PrincipalEvidence | None = None
+    effective_confidence: float
+
+
 class C1Result(CoverageResult):
     """One in-scope `Endpoint` with no `HIT` edge of any kind (a dead endpoint).
 
