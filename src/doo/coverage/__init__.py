@@ -9,9 +9,11 @@ Public surface:
 
 - `run_c1` — C1 dead-endpoint query.
 - `run_c2` — C2 presence-differential authz-coverage query (ADR-0033).
+- `run_c2b` — C2b content-differential authz-coverage query (ADR-0033).
 - `reached` / `reached_map` — the shared 2xx `reached` predicate (ADR-0033).
-- `CoverageResult` / `C1Result` / `C2Result` — the result-model base and the
-  per-query typed models (C2 carries per-principal evidence).
+- `CoverageResult` / `C1Result` / `C2Result` / `C2bResult` — the result-model
+  base and the per-query typed models (C2 carries per-principal evidence; C2b
+  carries the divergent per-principal evidence list).
 - `effective_confidence` — the shared query-time decay (ADR-0005).
 - `coverage_app` — the Typer sub-app mounted at `doo coverage`.
 """
@@ -20,13 +22,20 @@ from __future__ import annotations
 
 from doo.coverage.cli import coverage_app
 from doo.coverage.decay import effective_confidence
-from doo.coverage.models import C1Result, C2Result, CoverageResult, PrincipalEvidence
-from doo.coverage.queries import run_c1, run_c2
+from doo.coverage.models import (
+    C1Result,
+    C2bResult,
+    C2Result,
+    CoverageResult,
+    PrincipalEvidence,
+)
+from doo.coverage.queries import run_c1, run_c2, run_c2b
 from doo.coverage.reached import reached, reached_map
 
 __all__ = [
     "C1Result",
     "C2Result",
+    "C2bResult",
     "CoverageResult",
     "PrincipalEvidence",
     "coverage_app",
@@ -35,4 +44,5 @@ __all__ = [
     "reached_map",
     "run_c1",
     "run_c2",
+    "run_c2b",
 ]

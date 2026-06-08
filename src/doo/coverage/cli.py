@@ -17,8 +17,8 @@ import os
 
 import typer
 
-from doo.coverage.models import C1Result, C2Result
-from doo.coverage.queries import run_c1, run_c2
+from doo.coverage.models import C1Result, C2bResult, C2Result
+from doo.coverage.queries import run_c1, run_c2, run_c2b
 from doo.ids import EngagementId
 from doo.infra.neo4j_driver import Neo4jClient
 
@@ -168,3 +168,59 @@ def c2(
         typer.echo(_json.dumps([r.model_dump(mode="json") for r in rows], indent=2))
     else:
         _render_c2_table(rows)
+
+
+def _render_c2b_table(rows: list[C2bResult]) -> None:
+    if not rows:
+        typer.echo(
+            "C2b: no content-differential authz divergence "
+            "(no endpoint was reached by ≥2 principals with differing responses)."
+        )
+        return
+    typer.echo(
+        f"C2b — reached by ≥2 principals with DIFFERING responses "
+        f"(role-differentiated 200s): {len(rows)}"
+    )
+    typer.echo(f"{'METHOD':<7} {'PATH':<40} {'PRINCIPALS (label: stat/sz)':<48} {'CONF':>6}")
+    for r in rows:
+        cells = ", ".join(
+            f"{ev.label}: {_evidence_cell(ev)}" for ev in r.evidence
+        )
+        typer.echo(f"{r.method:<7} {r.path_template:<40} {cells:<48} {r.effective_confidence:>6.3f}")
+
+
+@coverage_app.command("c2b")
+def c2b(
+    engagement: str = typer.Option(..., "--engagement", help="Engagement id to analyze."),
+    min_confidence: float = typer.Option(
+        0.0,
+        "--min-confidence",
+        help="Drop rows below this effective (decayed) confidence. Default 0 = "
+        "surface everything (low-confidence leads are never silently hidden).",
+    ),
+    as_json: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit the typed result models as JSON (round-trippable) instead of a table.",
+    ),
+) -> None:
+    """C2b: endpoints reached (2xx) by ≥2 principals whose responses differ (body/size)."""
+
+    from doo.observability.ids import new_span_id, new_trace_id
+    from doo.observability.logging import bind_correlation, configure_logging
+
+    configure_logging()
+    bind_correlation(trace_id=new_trace_id(), span_id=new_span_id())
+
+    client = _build_client()
+    try:
+        rows = run_c2b(client, EngagementId(engagement), min_confidence=min_confidence)
+    finally:
+        client.close()
+
+    if as_json:
+        import json as _json
+
+        typer.echo(_json.dumps([r.model_dump(mode="json") for r in rows], indent=2))
+    else:
+        _render_c2b_table(rows)

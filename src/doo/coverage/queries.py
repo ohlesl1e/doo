@@ -30,7 +30,7 @@ from typing import Any
 
 from doo.canonical.value_objects import Scheme
 from doo.coverage.decay import effective_confidence
-from doo.coverage.models import C1Result, C2Result, PrincipalEvidence
+from doo.coverage.models import C1Result, C2bResult, C2Result, PrincipalEvidence
 from doo.coverage.reached import ReachedEvidence, reached_map
 from doo.ids import EngagementId
 from doo.infra.neo4j_driver import Neo4jClient
@@ -429,6 +429,116 @@ def run_c2(
         "coverage.c2.complete",
         engagement_id=engagement_id,
         gaps=len(results),
+        principals=len(principals),
+        min_confidence=min_confidence,
+    )
+    return results
+
+
+# ---------------------------------------------------------------------------
+# C2b — content-differential authz coverage (ADR-0033).
+# ---------------------------------------------------------------------------
+
+
+def _diverges(group: list[ReachedEvidence]) -> bool:
+    """True iff the reached evidence in this endpoint group is not all identical.
+
+    Pure metadata comparison (ADR-0033): a group diverges when its principals do
+    not all share the same `(response_body_sha256, response_size_bytes)`. A group
+    where every principal returned the same hash AND size is *not* a divergence
+    (the role-differentiated-200 signal is absent), and a group of <2 principals
+    can never diverge. No body is parsed — only the promoted node properties.
+    """
+
+    if len(group) < 2:
+        return False
+    signatures = {(ev.response_body_sha256, ev.response_size_bytes) for ev in group}
+    return len(signatures) > 1
+
+
+def run_c2b(
+    client: Neo4jClient,
+    engagement_id: EngagementId,
+    *,
+    min_confidence: float = 0.0,
+    now: datetime | None = None,
+) -> list[C2bResult]:
+    """C2b — endpoints reached (2xx) by ≥2 principals whose responses DIFFER (ADR-0033).
+
+    The content-differential sibling of C2. Where C2 surfaces *presence* gaps
+    (A reached, B did not), C2b surfaces *content* divergence among principals who
+    ALL reached the endpoint with a 2xx — the role-differentiated-200 case C2 is
+    blind to (both "reached"), and where BOLA/IDOR lives.
+
+    Reuses the `reached_map` 2xx traversal (no re-derived predicate): it groups the
+    reached pairs by endpoint, keeps the groups with ≥2 active principals, and
+    emits one row per group whose per-principal `response_body_sha256` OR
+    `response_size_bytes` differ. Groups where every principal returned the
+    IDENTICAL hash AND size are dropped. The comparison is **pure metadata** — no
+    body is parsed or fetched. Each row carries the full per-principal evidence
+    list so the divergence is visible; coverage surfaces it, it does not adjudicate.
+
+    Engagement-scoped (ADR-0017), `status='active'` throughout (via `reached_map` /
+    `_load_principals` / `_load_in_scope_endpoints`), in-scope via `is_in_scope`
+    (ADR-0020), effective confidence decayed (ADR-0005) with opt-in
+    `min_confidence`. No `dispatch_status` filter (slice 4). `now` injectable.
+    """
+
+    run_at = now or datetime.now(UTC)
+    scope = _load_scope_rules(client, engagement_id)
+    principals = _load_principals(client, engagement_id)
+    endpoints = _load_in_scope_endpoints(client, engagement_id, scope, run_at=run_at)
+    reached = reached_map(client, engagement_id)
+
+    label_by_id = {p.principal_id: p.label for p in principals}
+
+    # Group the reached evidence per endpoint, keeping only active principals.
+    groups: dict[str, list[ReachedEvidence]] = {}
+    for (endpoint_id, principal_id), ev in reached.items():
+        if endpoint_id not in endpoints:
+            continue  # out of scope / inactive endpoint (filtered upstream)
+        if principal_id not in label_by_id:
+            continue  # retracted / inactive principal
+        groups.setdefault(endpoint_id, []).append(ev)
+
+    results: list[C2bResult] = []
+    for endpoint_id, group in groups.items():
+        if not _diverges(group):
+            continue
+
+        ep = endpoints[endpoint_id]
+        eff = ep["effective_confidence"]
+        if eff < min_confidence:
+            continue
+
+        evidence = tuple(
+            PrincipalEvidence(
+                principal_id=ev.principal_id,
+                label=label_by_id[ev.principal_id],
+                status=ev.status,
+                response_size_bytes=ev.response_size_bytes,
+                response_body_sha256=ev.response_body_sha256,
+            )
+            for ev in sorted(group, key=lambda e: label_by_id[e.principal_id])
+        )
+        results.append(
+            C2bResult(
+                engagement_id=engagement_id,
+                generated_at=run_at,
+                endpoint_id=endpoint_id,
+                method=str(ep["method"]),
+                host=str(ep["host"]),
+                path_template=str(ep["path_template"]),
+                evidence=evidence,
+                effective_confidence=eff,
+            )
+        )
+
+    results.sort(key=lambda r: (r.host, r.path_template, r.method))
+    log.info(
+        "coverage.c2b.complete",
+        engagement_id=engagement_id,
+        divergent_endpoints=len(results),
         principals=len(principals),
         min_confidence=min_confidence,
     )

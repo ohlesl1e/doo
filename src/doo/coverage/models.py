@@ -91,6 +91,36 @@ class C2Result(CoverageResult):
     effective_confidence: float
 
 
+class C2bResult(CoverageResult):
+    """One endpoint reached (2xx) by ≥2 principals whose responses DIFFER (ADR-0033).
+
+    The content-differential sibling of C2's presence query. C2 is blind to
+    *role-differentiated 200s* — apps where every principal gets a 200 but the
+    body is rendered per role/account (both principals "reached", so C2 finds no
+    gap). C2b surfaces exactly those: the endpoint was reached by two or more
+    active principals, but their per-principal `response_body_sha256` OR
+    `response_size_bytes` differ. That divergence is the deterministic black-box
+    handle on where BOLA/IDOR lives.
+
+    The comparison is **pure metadata** (ADR-0033) — no body is parsed or fetched.
+    Endpoints reached by ≥2 principals with IDENTICAL body hash AND size are not a
+    divergence and do not appear. The row names the endpoint's
+    `(method, host, path_template)` identity and carries the full per-principal
+    evidence list `(principal, status, response_size_bytes, response_body_sha256)`
+    so the differential is visible; coverage surfaces it, it does not adjudicate
+    whether the difference is a vulnerability (the human's / slice-3 call).
+    """
+
+    query_id: str = Field(default="C2b", frozen=True)
+
+    endpoint_id: str
+    method: str
+    host: str
+    path_template: str
+    evidence: tuple[PrincipalEvidence, ...]
+    effective_confidence: float
+
+
 class C1Result(CoverageResult):
     """One in-scope `Endpoint` with no `HIT` edge of any kind (a dead endpoint).
 
