@@ -17,8 +17,8 @@ import os
 
 import typer
 
-from doo.coverage.models import C1Result, C2bResult, C2Result
-from doo.coverage.queries import run_c1, run_c2, run_c2b
+from doo.coverage.models import C1Result, C2bResult, C2Result, C3Result
+from doo.coverage.queries import run_c1, run_c2, run_c2b, run_c3
 from doo.ids import EngagementId
 from doo.infra.neo4j_driver import Neo4jClient
 
@@ -224,3 +224,79 @@ def c2b(
         typer.echo(_json.dumps([r.model_dump(mode="json") for r in rows], indent=2))
     else:
         _render_c2b_table(rows)
+
+
+_SHAPE_RANK_LABELS = {0: "specific", 1: "opaque", 2: "integer", 3: "other"}
+
+
+def _render_c3_table(rows: list[C3Result]) -> None:
+    if not rows:
+        typer.echo(
+            "C3: no leak-to-input pivots "
+            "(no promoted value is both a response output and a request input "
+            "to an in-scope endpoint)."
+        )
+        return
+    typer.echo(f"C3 — leak-to-input pivots: {len(rows)}")
+    typer.echo(
+        f"{'SHAPE':<9} {'KIND':<16} {'PREVIEW':<18} {'TARGET (method path)':<32} "
+        f"{'PARAM':<16} {'SOURCES':<28} {'CONF':>6}"
+    )
+    for r in rows:
+        preview = r.value_preview if r.value_preview is not None else r.value_hash[:8]
+        target = f"{r.target_method} {r.target_path_template}"
+        sources = ", ".join(r.source_endpoints) if r.source_endpoints else "(same)"
+        shape = _SHAPE_RANK_LABELS.get(r.shape_rank, str(r.shape_rank))
+        param = r.parameter_name or "-"
+        typer.echo(
+            f"{shape:<9} {r.kind:<16} {preview:<18} {target:<32} "
+            f"{param:<16} {sources:<28} {r.effective_confidence:>6.3f}"
+        )
+
+
+@coverage_app.command("c3")
+def c3(
+    engagement: str = typer.Option(..., "--engagement", help="Engagement id to analyze."),
+    include_same_endpoint: bool = typer.Option(
+        False,
+        "--include-same-endpoint",
+        help="Also surface same-endpoint value reuse (e.g. a pagination token "
+        "echoed back). Off by default: cross-endpoint pivots only.",
+    ),
+    min_confidence: float = typer.Option(
+        0.0,
+        "--min-confidence",
+        help="Drop rows below this effective (decayed) confidence. Default 0 = "
+        "surface everything (low-confidence leads are never silently hidden).",
+    ),
+    as_json: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit the typed result models as JSON (round-trippable) instead of a table.",
+    ),
+) -> None:
+    """C3: values leaked in one endpoint's response and sent as input to another."""
+
+    from doo.observability.ids import new_span_id, new_trace_id
+    from doo.observability.logging import bind_correlation, configure_logging
+
+    configure_logging()
+    bind_correlation(trace_id=new_trace_id(), span_id=new_span_id())
+
+    client = _build_client()
+    try:
+        rows = run_c3(
+            client,
+            EngagementId(engagement),
+            include_same_endpoint=include_same_endpoint,
+            min_confidence=min_confidence,
+        )
+    finally:
+        client.close()
+
+    if as_json:
+        import json as _json
+
+        typer.echo(_json.dumps([r.model_dump(mode="json") for r in rows], indent=2))
+    else:
+        _render_c3_table(rows)

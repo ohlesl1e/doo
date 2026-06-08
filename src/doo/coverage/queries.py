@@ -24,13 +24,14 @@ documents this and may trigger a flush first. Coverage writes nothing back.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
 from doo.canonical.value_objects import Scheme
 from doo.coverage.decay import effective_confidence
-from doo.coverage.models import C1Result, C2bResult, C2Result, PrincipalEvidence
+from doo.coverage.models import C1Result, C2bResult, C2Result, C3Result, PrincipalEvidence
 from doo.coverage.reached import ReachedEvidence, reached_map
 from doo.ids import EngagementId
 from doo.infra.neo4j_driver import Neo4jClient
@@ -540,6 +541,248 @@ def run_c2b(
         engagement_id=engagement_id,
         divergent_endpoints=len(results),
         principals=len(principals),
+        min_confidence=min_confidence,
+    )
+    return results
+
+
+# ---------------------------------------------------------------------------
+# C3 — leak-to-input pivot (issue #53). INDEPENDENT of C2/C2b: it does not use
+# the `reached` predicate. A pivot is an ObservedValue that is BOTH a response
+# output (YIELDED_VALUE) and a request input (SENT_VALUE), where the input
+# endpoint is in scope (the source need not be, ADR-0020).
+# ---------------------------------------------------------------------------
+
+# Value-shape specificity buckets for ranking (issue #53). Lower sorts first:
+# the more specific / globally-unique the shape, the higher the lead quality, so
+# a UUID/email/JWT pivot ranks above an opaque_token, which ranks above a bare
+# integer. The bucket is derived from the ObservedValue `kind` plus a light
+# preview shape-check (the `identifier` kind covers UUIDs, emails-in-claims, and
+# bare integers alike, so kind alone is not enough).
+_SHAPE_RANK_SPECIFIC = 0  # UUID / email / JWT — globally unique, high-value lead
+_SHAPE_RANK_OPAQUE = 1  # opaque_token / secret / token — high-entropy blob
+_SHAPE_RANK_INTEGER = 2  # bare integer — low specificity (sequential id risk)
+_SHAPE_RANK_OTHER = 3  # everything else (hostnames, urls, free-form identifiers)
+
+_UUID_RE = re.compile(
+    r"\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z"
+)
+_EMAIL_RE = re.compile(r"\A[^@\s]+@[^@\s]+\.[^@\s]+\Z")
+_JWT_RE = re.compile(r"\Aey[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*\Z")
+_INT_RE = re.compile(r"\A-?\d+\Z")
+
+
+def _shape_rank(kind: str, value: str | None, value_preview: str | None) -> int:
+    """Rank a pivot value by shape specificity (issue #53; lower = sorts first).
+
+    UUID / email / JWT shapes are the highest-value leads (globally unique, so a
+    successful swap is unambiguous). `opaque_token` / `secret` / `token` are
+    high-entropy but coarse. A bare integer is the weakest (sequential-id noise).
+    Everything else (hostnames, URLs, free-form identifiers) sorts last.
+
+    For secret-shaped kinds the raw value is absent (ADR-0015); we classify from
+    the kind alone (always the opaque bucket) and never inspect a raw secret.
+    """
+
+    if kind in ("email",):
+        return _SHAPE_RANK_SPECIFIC
+    if kind in ("secret", "token", "opaque_token"):
+        # JWTs are detected as `secret` upstream; the preview ("eyJ…") is safe to
+        # peek at to lift a JWT above a generic opaque blob.
+        if value_preview is not None and value_preview.startswith("ey"):
+            return _SHAPE_RANK_SPECIFIC
+        return _SHAPE_RANK_OPAQUE
+    # Non-secret kinds carry the raw value; inspect its concrete shape.
+    probe = value if value is not None else value_preview
+    if probe is not None:
+        if _UUID_RE.match(probe) or _EMAIL_RE.match(probe) or _JWT_RE.match(probe):
+            return _SHAPE_RANK_SPECIFIC
+        if _INT_RE.match(probe):
+            return _SHAPE_RANK_INTEGER
+    return _SHAPE_RANK_OTHER
+
+
+def run_c3(
+    client: Neo4jClient,
+    engagement_id: EngagementId,
+    *,
+    include_same_endpoint: bool = False,
+    min_confidence: float = 0.0,
+    now: datetime | None = None,
+) -> list[C3Result]:
+    """C3 — leak-to-input pivots (issue #53). Independent of `reached`.
+
+    A pivot is an `ObservedValue` that is BOTH `YIELDED_VALUE` from some
+    observation (it surfaced in a *response* — the output side) AND `SENT_VALUE`
+    from some observation (it was sent as a request *parameter* — the input side).
+    The actionable lead: a concrete value the app handed out and that an endpoint
+    consumes as input. Only **promoted** values are `ObservedValue` nodes, so junk
+    is already excluded (ADR-0009).
+
+    Cypher does traversal only: for the engagement's active `ObservedValue`s it
+    fetches each value's output endpoints and input `(endpoint, parameter_name)`
+    pairs (with host identity), plus the value's shape fields and confidence.
+    Python then applies the security-relevant predicates:
+
+    - The **target (input)** endpoint must pass `is_in_scope` (ADR-0020); the
+      **source (output)** endpoint need NOT (a value leaked from an out-of-scope
+      SSO host is still a valid lead).
+    - **Cross-endpoint by default** (source ≠ target). `include_same_endpoint`
+      also surfaces same-endpoint reuse (e.g. a pagination token echoed back).
+    - Temporality ignored; `status='active'` throughout; engagement-scoped
+      (ADR-0017); effective confidence decayed (ADR-0005) with opt-in
+      `min_confidence`.
+
+    One row per `(value, target_endpoint, parameter_name)` input, naming all
+    distinct source endpoints. Secret-shaped values surface `value_hash` +
+    `value_preview` only (ADR-0015) — never a raw secret. Ranked by value-shape
+    specificity (UUID/email/JWT > opaque_token > bare integer) then descending
+    confidence. `now` injectable for tests.
+    """
+
+    run_at = now or datetime.now(UTC)
+    scope = _load_scope_rules(client, engagement_id)
+
+    frag = for_engagement(engagement_id, var="v")
+    cypher = f"""
+        MATCH (v:ObservedValue)
+        {frag.and_("v.status = 'active'")}
+        MATCH (out:RequestObservation)-[:YIELDED_VALUE]->(v)
+        MATCH (out)-[:HIT]->(oe:Endpoint)
+        WHERE oe.status = 'active'
+        MATCH (inp:RequestObservation)-[s:SENT_VALUE]->(v)
+        MATCH (inp)-[:HIT]->(ie:Endpoint)-[:ON_HOST]->(ih:Host)
+        WHERE ie.status = 'active'
+        WITH v, ie, ih, s.parameter_name AS parameter_name,
+             collect(DISTINCT {{
+                 endpoint_id: oe.id, method: oe.method, path_template: oe.path_template
+             }}) AS source_endpoints
+        RETURN v.value_hash AS value_hash,
+               v.kind AS kind,
+               v.value AS value,
+               v.value_preview AS value_preview,
+               v.confidence AS confidence,
+               v.last_seen AS last_seen,
+               ie.id AS target_endpoint_id,
+               ie.method AS target_method,
+               ie.path_template AS target_path_template,
+               ih.scheme AS scheme,
+               ih.canonical_hostname AS canonical_hostname,
+               ih.port AS port,
+               ih.is_ip_literal AS is_ip_literal,
+               parameter_name AS parameter_name,
+               source_endpoints AS source_endpoints
+    """
+
+    rows = client.execute_read(cypher, **frag.parameters)
+
+    results: list[C3Result] = []
+    for row in rows:
+        target = _EndpointView(
+            method=str(row["target_method"]),
+            host=_HostView(
+                scheme=row["scheme"],
+                canonical_hostname=str(row["canonical_hostname"]),
+                port=row["port"],
+                is_ip_literal=bool(row["is_ip_literal"]),
+            ),
+            path_template=str(row["target_path_template"]),
+        )
+        # The TARGET (input) endpoint must be in scope; the source need not be.
+        if not is_in_scope(target, scope):
+            continue
+
+        target_id = str(row["target_endpoint_id"])
+
+        # Cross-endpoint by default: drop the target from the source list, and
+        # decide same-endpoint inclusion on whether any source is the target.
+        sources = list(row["source_endpoints"])
+        cross_sources = [
+            src for src in sources if str(src["endpoint_id"]) != target_id
+        ]
+        is_same_endpoint = len(cross_sources) < len(sources)
+
+        if cross_sources:
+            kept_sources = cross_sources
+            same_flag = False
+        elif include_same_endpoint and is_same_endpoint:
+            # Only same-endpoint reuse exists for this (value, target) — surface
+            # it only behind the flag.
+            kept_sources = sources
+            same_flag = True
+        else:
+            continue
+
+        stored = float(row["confidence"]) if row["confidence"] is not None else 1.0
+        last_seen = _to_aware(row["last_seen"], fallback=run_at)
+        eff = effective_confidence(stored, last_seen, now=run_at)
+        if eff < min_confidence:
+            continue
+
+        source_labels = tuple(
+            sorted(
+                f"{src['method']} {src['path_template']}" for src in kept_sources
+            )
+        )
+
+        kind = str(row["kind"])
+        value = row["value"]
+        preview = row["value_preview"]
+        # Surface a human-readable preview WITHOUT ever exposing a raw secret
+        # (ADR-0015). Secret-shaped kinds carry value=None and an 8-char preview
+        # (or None for short secrets) — surface that. Non-secret kinds carry the
+        # raw value (safe to surface) and no preview — surface the value.
+        surfaced_preview: str | None
+        if preview is not None:
+            surfaced_preview = str(preview)
+        elif value is not None:
+            surfaced_preview = str(value)
+        else:
+            surfaced_preview = None
+        results.append(
+            C3Result(
+                engagement_id=engagement_id,
+                generated_at=run_at,
+                value_hash=str(row["value_hash"]),
+                kind=kind,
+                value_preview=surfaced_preview,
+                source_endpoints=source_labels,
+                target_endpoint_id=target_id,
+                target_method=target.method,
+                target_host=_host_label(target.host),
+                target_path_template=target.path_template,
+                parameter_name=(
+                    str(row["parameter_name"])
+                    if row["parameter_name"] is not None
+                    else None
+                ),
+                same_endpoint=same_flag,
+                shape_rank=_shape_rank(
+                    kind,
+                    str(value) if value is not None else None,
+                    str(preview) if preview is not None else None,
+                ),
+                effective_confidence=eff,
+            )
+        )
+
+    results.sort(
+        key=lambda r: (
+            r.shape_rank,
+            -r.effective_confidence,
+            r.target_host,
+            r.target_path_template,
+            r.target_method,
+            r.parameter_name or "",
+            r.value_hash,
+        )
+    )
+    log.info(
+        "coverage.c3.complete",
+        engagement_id=engagement_id,
+        pivots=len(results),
+        include_same_endpoint=include_same_endpoint,
         min_confidence=min_confidence,
     )
     return results

@@ -14,7 +14,7 @@ import pytest
 from typer.testing import CliRunner
 
 import doo.coverage.cli as cli_mod
-from doo.coverage.models import C1Result, C2bResult, C2Result, PrincipalEvidence
+from doo.coverage.models import C1Result, C2bResult, C2Result, C3Result, PrincipalEvidence
 
 _ROWS = [
     C1Result(
@@ -215,3 +215,88 @@ def test_c2b_empty_table_message(monkeypatch: pytest.MonkeyPatch) -> None:
     result = _invoke_c2b("--engagement", "eng-1")
     assert result.exit_code == 0, result.output
     assert "no content-differential authz divergence" in result.output
+
+
+# --- C3 rendering ---------------------------------------------------------
+
+_C3_ROWS = [
+    C3Result(
+        engagement_id="eng-1",  # type: ignore[arg-type]
+        generated_at=datetime(2026, 6, 1, tzinfo=UTC),
+        value_hash="deadbeefcafef00d",
+        kind="identifier",
+        value_preview="11111111",
+        source_endpoints=("GET /widgets",),
+        target_endpoint_id="ep-detail",
+        target_method="GET",
+        target_host="shop.example.com",
+        target_path_template="/widget-detail",
+        parameter_name="widget_id",
+        same_endpoint=False,
+        shape_rank=0,
+        effective_confidence=0.875,
+    )
+]
+
+
+def _invoke_c3(*args: str):  # type: ignore[no-untyped-def]
+    from doo.cli import app
+
+    return CliRunner().invoke(app, ["coverage", "c3", *args])
+
+
+def test_c3_table_rendering(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli_mod, "_build_client", lambda: _StubClient())
+    captured: dict[str, object] = {}
+
+    def _fake_run_c3(*a, **k):  # type: ignore[no-untyped-def]
+        captured.update(k)
+        return list(_C3_ROWS)
+
+    monkeypatch.setattr(cli_mod, "run_c3", _fake_run_c3)
+    result = _invoke_c3("--engagement", "eng-1")
+    assert result.exit_code == 0, result.output
+    assert "leak-to-input pivots" in result.output
+    assert "/widget-detail" in result.output
+    assert "widget_id" in result.output
+    assert "GET /widgets" in result.output
+    assert "11111111" in result.output
+    assert "0.875" in result.output
+    # Cross-endpoint only by default.
+    assert captured["include_same_endpoint"] is False
+
+
+def test_c3_include_same_endpoint_flag_passed_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli_mod, "_build_client", lambda: _StubClient())
+    captured: dict[str, object] = {}
+
+    def _fake_run_c3(*a, **k):  # type: ignore[no-untyped-def]
+        captured.update(k)
+        return []
+
+    monkeypatch.setattr(cli_mod, "run_c3", _fake_run_c3)
+    result = _invoke_c3("--engagement", "eng-1", "--include-same-endpoint")
+    assert result.exit_code == 0, result.output
+    assert captured["include_same_endpoint"] is True
+
+
+def test_c3_json_round_trips(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli_mod, "_build_client", lambda: _StubClient())
+    monkeypatch.setattr(cli_mod, "run_c3", lambda *a, **k: list(_C3_ROWS))
+    result = _invoke_c3("--engagement", "eng-1", "--json")
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert isinstance(payload, list) and len(payload) == 1
+    restored = C3Result.model_validate(payload[0])
+    assert restored == _C3_ROWS[0]
+    assert restored.query_id == "C3"
+
+
+def test_c3_empty_table_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli_mod, "_build_client", lambda: _StubClient())
+    monkeypatch.setattr(cli_mod, "run_c3", lambda *a, **k: [])
+    result = _invoke_c3("--engagement", "eng-1")
+    assert result.exit_code == 0, result.output
+    assert "no leak-to-input pivots" in result.output

@@ -121,6 +121,50 @@ class C2bResult(CoverageResult):
     effective_confidence: float
 
 
+class C3Result(CoverageResult):
+    """One leak-to-input pivot: a value leaked in a response AND sent as input (issue #53).
+
+    An `ObservedValue` that is BOTH `YIELDED_VALUE` from some observation (it
+    appeared in a *response*, the output side) AND `SENT_VALUE` from some
+    observation (it was sent as a request *parameter*, the input side). The
+    actionable "what to test next" lead: a concrete value the app handed out and
+    that some endpoint consumes as a parameter.
+
+    The **target** (input) endpoint must pass `is_in_scope`; the **source**
+    (output) endpoint need not (ADR-0020 — a value leaked from an out-of-scope SSO
+    host is still a valid lead). Cross-endpoint by default (source ≠ target);
+    same-endpoint reuse is opt-in.
+
+    `value_preview` is the human-readable handle. For secret-shaped kinds
+    (`kind ∈ {secret, token, opaque_token}`, ADR-0015) it is the stored 8-char
+    preview (or None for short secrets) — the raw secret is NEVER carried. For
+    non-secret kinds it is the (safe) raw value, which the upstream extractor keeps
+    on the node. `value_hash` is always present (the `ObservedValue` identity).
+    `source_endpoints` lists every distinct output
+    endpoint that yielded the value (identity-tuple strings `method host path`);
+    the row names exactly one `(target_*, parameter_name)` input.
+
+    `shape_rank` is the value-shape specificity bucket (lower sorts first):
+    UUID/email/JWT-shaped > opaque_token > bare integer (issue #53 ranking). Rows
+    sort by `(shape_rank, -effective_confidence, …)`.
+    """
+
+    query_id: str = Field(default="C3", frozen=True)
+
+    value_hash: str
+    kind: str
+    value_preview: str | None = None
+    source_endpoints: tuple[str, ...]
+    target_endpoint_id: str
+    target_method: str
+    target_host: str
+    target_path_template: str
+    parameter_name: str | None = None
+    same_endpoint: bool = False
+    shape_rank: int
+    effective_confidence: float
+
+
 class C1Result(CoverageResult):
     """One in-scope `Endpoint` with no `HIT` edge of any kind (a dead endpoint).
 
