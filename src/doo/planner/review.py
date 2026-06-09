@@ -300,7 +300,7 @@ def fetch_target_evidence(
         WITH coalesce(e, p, b) AS target
         RETURN target.confidence AS confidence,
                target.last_seen AS last_seen,
-               COUNT { (target)-[:DERIVED_FROM]->() } AS derived_from_count
+               COUNT {{ (target)-[:DERIVED_FROM]->() }} AS derived_from_count
         """,
         key_hash=key_hash,
         **frag.parameters,

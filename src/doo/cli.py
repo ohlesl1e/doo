@@ -17,9 +17,9 @@ from doo.cli_worker import register_worker
 from doo.coverage.cli import coverage_app
 from doo.engagement.cli_keepalive import register_keepalive
 from doo.ingestion.cli_ingest import register_ingest
-from doo.planner.cli import planner_app
 from doo.observability.ids import new_span_id, new_trace_id
 from doo.observability.logging import bind_correlation, configure_logging, get_logger
+from doo.planner.cli import planner_app
 from doo.setup import EngagementMismatchError, ScopeChangeRequiresConfirmation
 from doo.setup.loader import GraphState, JsonFileLedger, load_engagement_from_yaml
 

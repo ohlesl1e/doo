@@ -30,13 +30,13 @@ from doo.infra.neo4j_driver import Neo4jClient
 from doo.ontology.graph_state import Neo4jGraphState
 from doo.ontology.schema import apply_schema
 from doo.planner.commit import fetch_testcase
+from doo.planner.models import PayloadSpec, PlannerProposal
 from doo.planner.review import (
     InMemoryReviewLedger,
     ReviewError,
     fetch_target_evidence,
     review_testcase,
 )
-from doo.planner.models import PayloadSpec, PlannerProposal
 from doo.planner.service import propose, review_queue
 from doo.planner.validator import DiscardedProposal, validate
 from doo.setup.loader import PlannedMutation

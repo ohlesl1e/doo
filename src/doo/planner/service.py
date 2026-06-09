@@ -309,7 +309,7 @@ def _target_derived_from_count(
         OPTIONAL MATCH (t)-[:TARGETS_PARAMETER]->(p:Parameter)
         OPTIONAL MATCH (t)-[:TARGETS_BOUNDARY]->(b:TrustBoundary)
         WITH coalesce(e, p, b) AS target
-        RETURN COUNT { (target)-[:DERIVED_FROM]->() } AS derived_from_count
+        RETURN COUNT {{ (target)-[:DERIVED_FROM]->() }} AS derived_from_count
         """,
         key_hash=key_hash,
         **frag.parameters,
