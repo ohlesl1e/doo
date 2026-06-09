@@ -28,6 +28,8 @@ from doo.ids import (
 )
 
 # Test-class controlled vocabulary. Expand as planner classes are added.
+# `forced_browsing` is the slice-3 deterministic C1 class: a benign GET against a
+# discovered-but-never-hit in-scope Endpoint (ADR-0036). No reasoning, no LLM.
 TestClass = Literal[
     "idor",
     "ssrf",
@@ -38,6 +40,7 @@ TestClass = Literal[
     "open-redirect",
     "rate-limit",
     "boundary-violation",
+    "forced_browsing",
 ]
 
 # PayloadClass per ADR-0003: low-cardinality controlled vocabulary the ROE
