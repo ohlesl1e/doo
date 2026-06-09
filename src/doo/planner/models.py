@@ -1,0 +1,260 @@
+"""Planner I/O and review-lifecycle Pydantic models (ADRs 0036/0037/0040).
+
+The planner's contracts are **typed and bounded** (ADR-0037): a deterministic
+generator emits a `Candidate`; a `PlannerProposal` (deterministic for C1, LLM for
+later generators) names a closed-enum `test_class`, a target reference, an
+`AuthContext` reference, a closed-enum `payload_class`, a resolvable `payload_spec`
+(never bytes), and an `expected_yield` priority hunch *separate* from `confidence`
+(validity). The Validator resolves a proposal into a content-addressed `TestCase`.
+
+The review lifecycle (ADR-0040) adds the `review_status` axis (orthogonal to
+`status` and `dispatch_status`), a rejection `disposition`, and a provenanced
+append-only audit-ledger event. Tester identity is recorded only on the ledger
+event and as denormalised fields on the node — never as a graph node (ADR-0012).
+
+Pydantic v2, `extra="forbid"` so a stray field is a loud error and the JSON form
+round-trips exactly (mirrors `coverage.models`).
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from doo.events.slice4 import PayloadClass, TestClass
+from doo.ids import (
+    AuthContextId,
+    EngagementId,
+    ParameterId,
+    Sha256Hex,
+    TestCaseKeyHash,
+    TrustBoundaryId,
+)
+
+# ---------------------------------------------------------------------------
+# Candidate (generator output, ADR-0036).
+# ---------------------------------------------------------------------------
+
+# The deterministic generator that produced a candidate. Each value doubles as
+# the `source` provenance tag on a committed deterministic TestCase
+# (`deterministic-c1`, ADR-0036). LLM-proposing generators (slice-3 tracer 2,
+# slice 4) commit `source = "llm-planner"` instead.
+GeneratorId = Literal["c1"]
+GENERATOR_IDS: tuple[GeneratorId, ...] = ("c1",)
+
+# How a generator turns a selected target into a proposal (ADR-0036).
+ProposalMode = Literal["deterministic", "llm"]
+
+
+class Candidate(BaseModel):
+    """One deterministically-selected target plus its naming reason (ADR-0036).
+
+    A generator reads the shared coverage library (or other deterministic signal)
+    and emits one `Candidate` per selected target. Each candidate carries the
+    `generator` that produced it and a `reason` string (the gap evidence) so every
+    downstream proposal traces back to *why* it was proposed — the provenance story
+    that matters for disclosure.
+
+    The target reference is the same three-way handle a `PlannerProposal` carries;
+    for C1 it is always an `endpoint_id` (a route-level dead-endpoint probe).
+    `criticality` is the generator/gap-class weight the prioritiser multiplies in
+    (ADR-0036: tenant > capability > C2b > C2 > C1); C1 is the lowest tier.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    engagement_id: EngagementId
+    generator: GeneratorId
+    reason: str = Field(min_length=1)
+    criticality: float = Field(gt=0.0)
+    # Effective (decayed) confidence of the target inference (ADR-0005), carried
+    # so the prioritiser can discount a test against a shaky target.
+    target_confidence: float = Field(ge=0.0, le=1.0)
+
+    # Target handle: exactly one is set (the ADR-0007 three-way XOR). For C1 it is
+    # always `target_endpoint_id`.
+    target_endpoint_id: str | None = None
+    target_parameter_id: ParameterId | None = None
+    target_trust_boundary_id: TrustBoundaryId | None = None
+
+    @model_validator(mode="after")
+    def _target_is_xor(self) -> Candidate:
+        present = [
+            self.target_endpoint_id is not None,
+            self.target_parameter_id is not None,
+            self.target_trust_boundary_id is not None,
+        ]
+        if sum(present) != 1:
+            raise ValueError(
+                "Candidate target is exactly one of target_endpoint_id / "
+                "target_parameter_id / target_trust_boundary_id (ADR-0007 XOR)"
+            )
+        return self
+
+
+# ---------------------------------------------------------------------------
+# PlannerProposal (the typed output, ADR-0037).
+# ---------------------------------------------------------------------------
+
+# payload_spec is NEVER bytes (ADR-0037). The Validator resolves it to concrete
+# bytes -> payload_hash. Slice 3 needs only `none` (authz replays / forced
+# browsing -> sentinel `sha256("")`); `observed_value` (C3) and `configured`
+# (sink_params) land in later tracers. The kind is a closed discriminator.
+PayloadSpecKind = Literal["none", "observed_value", "configured"]
+
+
+class PayloadSpec(BaseModel):
+    """A resolvable, propose-time-known payload reference (ADR-0037) — never bytes.
+
+    `none` carries no reference (forced browsing / authz replays -> sentinel
+    `sha256("")`). `observed_value` carries the `value_hash` of an already-observed
+    `ObservedValue` (C3). `configured` carries an engagement-config key (the
+    tester-configured callback URL for `sink_params`). Only `none` is exercised in
+    the S1 tracer; the other resolvers land with their generators.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: PayloadSpecKind = "none"
+    value_hash: Sha256Hex | None = None
+    config_key: str | None = None
+
+    @model_validator(mode="after")
+    def _reference_matches_kind(self) -> PayloadSpec:
+        if self.kind == "none" and (self.value_hash or self.config_key):
+            raise ValueError("payload_spec kind 'none' carries no reference")
+        if self.kind == "observed_value" and self.value_hash is None:
+            raise ValueError("payload_spec kind 'observed_value' requires value_hash")
+        if self.kind == "configured" and self.config_key is None:
+            raise ValueError("payload_spec kind 'configured' requires config_key")
+        return self
+
+
+class PlannerProposal(BaseModel):
+    """A typed test proposal (ADR-0037): enums + references, never request bytes.
+
+    For C1 this is produced deterministically (no LLM): `test_class =
+    forced_browsing`, `payload_class = no-payload`, `payload_spec = none`,
+    `auth_context_id` = the anonymous singleton (a benign GET as nobody). The
+    target is the ADR-0007 three-way XOR, echoed from the `Candidate`.
+
+    `expected_yield` is the priority hunch — *distinct* from the validator-set
+    `confidence` (validity). `confidence_method` records how `expected_yield` was
+    derived (`heuristic` for deterministic generators, `llm-self-reported` for the
+    LLM). `justification` cites the candidate gap; `expected_outcome` says what
+    would confirm the lead (for the slice-4 Interpreter).
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    engagement_id: EngagementId
+    generator: GeneratorId
+    mode: ProposalMode
+
+    test_class: TestClass
+    payload_class: PayloadClass
+    payload_spec: PayloadSpec = Field(default_factory=PayloadSpec)
+    auth_context_id: AuthContextId
+
+    # Target XOR (echoed from the candidate; the validator re-checks it).
+    target_endpoint_id: str | None = None
+    target_parameter_id: ParameterId | None = None
+    target_trust_boundary_id: TrustBoundaryId | None = None
+
+    expected_yield: float = Field(ge=0.0, le=1.0)
+    confidence_method: Literal["heuristic", "llm-self-reported"] = "heuristic"
+    justification: str = Field(min_length=1)
+    expected_outcome: str = Field(min_length=1)
+
+
+# ---------------------------------------------------------------------------
+# Review lifecycle (ADR-0040).
+# ---------------------------------------------------------------------------
+
+ReviewStatus = Literal["proposed", "approved", "rejected"]
+REVIEW_STATUSES: tuple[ReviewStatus, ...] = ("proposed", "approved", "rejected")
+
+ReviewDecision = Literal["approve", "reject"]
+
+# Rejection durability (ADR-0040). `defer` is the default safe choice (do not
+# permanently blind yourself); `permanent` is a deliberate human "never again".
+Disposition = Literal["permanent", "defer"]
+DISPOSITIONS: tuple[Disposition, ...] = ("permanent", "defer")
+
+
+class ReviewLedgerEvent(BaseModel):
+    """One provenanced append-only review-decision event (ADR-0040).
+
+    Keyed by `(engagement_id, key_hash)`; the full history (including
+    approve-then-rescind) is the ordered ledger. Tester identity lives here, never
+    in the target graph (ADR-0012). `disposition` is meaningful only for a
+    `reject` (`None` for `approve`). `prior_status -> new_status` records the
+    transition. `evidence_*` snapshot the target's state at decision time so the
+    re-surface predicate can later detect a material change (ADR-0040).
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    engagement_id: EngagementId
+    key_hash: TestCaseKeyHash
+    actor: str = Field(min_length=1)
+    timestamp: datetime
+    decision: ReviewDecision
+    reason: str | None = None
+    disposition: Disposition | None = None
+    prior_status: ReviewStatus
+    new_status: ReviewStatus
+    # Evidence snapshot at decision time (ADR-0040 re-surface predicate).
+    evidence_confidence: float = Field(ge=0.0, le=1.0)
+    evidence_derived_from_count: int = Field(ge=0, default=0)
+
+    @model_validator(mode="after")
+    def _disposition_only_on_reject(self) -> ReviewLedgerEvent:
+        if self.decision == "reject" and self.disposition is None:
+            raise ValueError("a reject decision requires a disposition")
+        if self.decision == "approve" and self.disposition is not None:
+            raise ValueError("an approve decision carries no disposition")
+        return self
+
+
+# ---------------------------------------------------------------------------
+# Review queue (prioritiser output, ADR-0036).
+# ---------------------------------------------------------------------------
+
+
+class ProposedTestCaseView(BaseModel):
+    """A committed `proposed` `TestCase` projected for review (ADR-0040 surface).
+
+    The read model the prioritiser orders and the CLI renders: the node's identity
+    and target, the justification / gap / expected-outcome the reviewer needs, plus
+    `priority_score` (the deterministic ordering key) and the re-surface flag for a
+    previously-`defer`-rejected test whose evidence materially changed.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    engagement_id: EngagementId
+    key_hash: TestCaseKeyHash
+    test_class: TestClass
+    generator: GeneratorId
+    source: str
+    target_endpoint_id: str | None = None
+    target_parameter_id: ParameterId | None = None
+    target_trust_boundary_id: TrustBoundaryId | None = None
+    method: str | None = None
+    host: str | None = None
+    path_template: str | None = None
+    payload_class: PayloadClass
+    expected_yield: float
+    confidence: float
+    effective_target_confidence: float
+    criticality: float
+    justification: str
+    expected_outcome: str
+    priority_score: float
+    review_status: ReviewStatus = "proposed"
+    # Re-surface annotation for a previously-`defer`-rejected test (ADR-0040).
+    resurfaced: bool = False
+    resurfaced_reason: str | None = None
