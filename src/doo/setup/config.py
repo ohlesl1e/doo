@@ -365,6 +365,25 @@ class AuthConfig(BaseModel):
     _coerce_names = field_validator("session_cookie_names", mode="before")(_list_to_tuple)
 
 
+class LLMConfig(BaseModel):
+    """LLM provider routing for the slice-3 planner (ADR-0037, S2a).
+
+    The planner is the highest-leverage reasoning task, so it codes against one
+    gateway client and the concrete provider is *config, not code*. `provider`
+    routes through the org-standard LiteLLM gateway by default; a per-engagement
+    `local` override keeps structural/claims data on-network for internal
+    engagements under org data-policy (opt-in — bug-bounty external defaults to the
+    API). `model` is the gateway model id (default Claude Opus 4.8). Tokens / API
+    keys are never declared here — the gateway resolves credentials at call time,
+    the same env-reference discipline as ADR-0012.
+    """
+
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    provider: Literal["gateway", "local"] = "gateway"
+    model: str = "claude-opus-4-8"
+
+
 class EngagementConfig(BaseModel):
     """The whole YAML file, validated."""
 
@@ -374,6 +393,7 @@ class EngagementConfig(BaseModel):
     scope: ScopeRules
     kill_switch: KillSwitchConfig = Field(default_factory=KillSwitchConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)
+    llm: LLMConfig = Field(default_factory=LLMConfig)
     principals: tuple[DeclaredPrincipal, ...] = ()
 
     _coerce_principals = field_validator("principals", mode="before")(_list_to_tuple)

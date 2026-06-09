@@ -1,0 +1,314 @@
+"""The LLM proposer for the slice-3 planner (ADR-0037, S2a).
+
+The *only* non-deterministic step in the planner. Given a deterministically
+assembled `ContextPack`, the LLM proposes one authz test for the candidate gap by
+**selecting handles and classifying** — it never writes an HTTP request (hard
+rule). Structured output is a **forced tool call** whose schema mirrors
+`LLMProposalDraft`, so parsing is deterministic (no free-form JSON scraping).
+
+The model is reached through one `LLMCaller` seam:
+- `LiteLLMCaller` routes to the configured provider via the org LiteLLM gateway
+  (default Claude Opus 4.8); `litellm` is imported lazily so this module — and the
+  whole test suite — imports without the dependency.
+- `FakeLLMCaller` returns a canned draft for tests; the deterministic
+  resolve/validate path is what the tests actually exercise.
+
+`resolve_draft` is the deterministic bridge back: it maps the draft's pack handles
+to concrete node ids, **rejects any handle the LLM invented** (ADR-0037 "kills
+hallucinated targets"), and builds the concrete-id `PlannerProposal`. `payload_class`
+is fixed here (`auth-token-swap`, `payload_spec = none`) — the replay carries no
+bytes (ADR-0041), so it is not the LLM's to choose.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from typing import Any, Protocol, runtime_checkable
+
+from doo.observability.logging import get_logger
+from doo.planner.models import (
+    ContextPack,
+    LLMProposalDraft,
+    PayloadSpec,
+    PlannerProposal,
+)
+
+log = get_logger(__name__)
+
+# Prompt/algorithm version stamped on every proposal's provenance (ADR-0005); bump
+# when the prompt or tool schema changes so stale proposals are identifiable.
+PROMPT_VERSION = "planner-c2/1"
+
+SYSTEM_PROMPT = (
+    "You are a black-box web application security tester proposing ONE "
+    "authorization test for a specific, already-identified coverage gap. You are "
+    "given a structured context pack describing one endpoint, the holdable target "
+    "references, and the candidate auth contexts.\n\n"
+    "Rules:\n"
+    "- You do NOT write HTTP requests or payloads. You select a target and an auth "
+    "context by their HANDLES (e.g. 'T1', 'A2') and classify the test.\n"
+    "- Only use handles that appear in the pack. Never invent a handle or id.\n"
+    "- The test is an authorization replay: the request to the endpoint is replayed "
+    "under a different (attacker) auth context while the resource the request "
+    "identifies is held constant. Put the references that must be HELD verbatim "
+    "(the victim's object/owner id) in `hold`, as handles.\n"
+    "- Choose `auth_context_ref` = the attacker side (the principal that did NOT "
+    "reach the endpoint; marked is_attacker_candidate).\n"
+    "- Respond by calling the `propose_test` tool exactly once."
+)
+
+# Forced-tool-use schema — mirrors LLMProposalDraft. tool_choice pins this tool so
+# the model must return structured arguments.
+PROPOSE_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "propose_test",
+        "description": "Propose one authorization test for the candidate gap.",
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "test_class": {
+                    "type": "string",
+                    "enum": ["idor", "bola", "auth-bypass", "privilege-escalation"],
+                    "description": "The authorization vulnerability class.",
+                },
+                "target_ref": {
+                    "type": "string",
+                    "description": "Handle of the target (a pack target, e.g. 'T1').",
+                },
+                "auth_context_ref": {
+                    "type": "string",
+                    "description": "Handle of the attacker auth context (e.g. 'A2').",
+                },
+                "hold": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Handles of references held verbatim (victim's ids).",
+                },
+                "justification": {
+                    "type": "string",
+                    "description": "Why this test, citing the candidate gap.",
+                },
+                "expected_outcome": {
+                    "type": "string",
+                    "description": "What response would confirm the vulnerability.",
+                },
+                "expected_yield": {
+                    "type": "number",
+                    "description": "0..1 hunch this reveals a real issue (priority).",
+                },
+            },
+            "required": [
+                "test_class",
+                "target_ref",
+                "auth_context_ref",
+                "justification",
+                "expected_outcome",
+                "expected_yield",
+            ],
+        },
+    },
+}
+
+
+def build_user_prompt(pack: ContextPack) -> str:
+    """The per-candidate user message: the id-free pack + the concrete ask."""
+
+    payload = json.dumps(pack.to_llm_payload(), indent=2, sort_keys=True)
+    return (
+        f"Context pack:\n{payload}\n\n"
+        "This endpoint returned 2xx for the principal that reached it, but not for "
+        "the other principal. Propose a test that checks whether the attacker auth "
+        "context can reach the other principal's resource. Identify which "
+        "reference(s) hold the victim's object identity (`hold`) and which auth "
+        "context is the attacker (`auth_context_ref`). Call `propose_test`."
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class LLMCallResult:
+    """One LLM proposal call: the parsed draft plus the raw I/O for the audit trail.
+
+    `request` and `response` are persisted verbatim to object storage (ADR-0037
+    replayability); they are plain dicts so they serialise without provider types.
+    """
+
+    draft: LLMProposalDraft
+    request: dict[str, Any]
+    response: dict[str, Any]
+
+
+@runtime_checkable
+class LLMCaller(Protocol):
+    """The single LLM seam. Deterministic code owns everything around it."""
+
+    def propose(self, pack: ContextPack) -> LLMCallResult: ...
+
+
+class FakeLLMCaller:
+    """A canned caller for tests — returns a fixed draft, records the request.
+
+    The deterministic resolve/validate/commit path is what the tests assert on; the
+    fake lets them run without a model or `litellm`.
+    """
+
+    def __init__(self, draft: LLMProposalDraft) -> None:
+        self._draft = draft
+
+    def propose(self, pack: ContextPack) -> LLMCallResult:
+        request = {
+            "system": SYSTEM_PROMPT,
+            "user": build_user_prompt(pack),
+            "tool": PROPOSE_TOOL,
+            "tool_choice": "propose_test",
+        }
+        response = {"tool_use": {"name": "propose_test", "input": self._draft.model_dump()}}
+        return LLMCallResult(draft=self._draft, request=request, response=response)
+
+
+class LiteLLMCaller:
+    """The real caller — forced tool-use via the org LiteLLM gateway (ADR-0037).
+
+    `litellm` is imported lazily so the module imports without the dependency; only
+    constructing/using this caller requires it. The provider/model come from the
+    engagement `LLMConfig`.
+    """
+
+    def __init__(self, model: str, *, temperature: float = 0.0) -> None:
+        self._model = model
+        self._temperature = temperature
+
+    def propose(self, pack: ContextPack) -> LLMCallResult:
+        import litellm  # type: ignore[import-not-found]  # lazy production-only dep
+
+        system = SYSTEM_PROMPT
+        user = build_user_prompt(pack)
+        request: dict[str, Any] = {
+            "model": self._model,
+            "temperature": self._temperature,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "tools": [PROPOSE_TOOL],
+            "tool_choice": {"type": "function", "function": {"name": "propose_test"}},
+        }
+        completion = litellm.completion(**request)
+        response = completion.model_dump() if hasattr(completion, "model_dump") else dict(completion)
+        draft = _parse_tool_call(response)
+        return LLMCallResult(draft=draft, request=request, response=response)
+
+
+def _parse_tool_call(response: dict[str, Any]) -> LLMProposalDraft:
+    """Extract the forced `propose_test` tool arguments into a typed draft.
+
+    Raises `LLMProposalError` if the response has no parsable tool call — the
+    service treats that as a failed proposal (logged), not a silent drop.
+    """
+
+    try:
+        message = response["choices"][0]["message"]
+        tool_calls = message.get("tool_calls") or []
+        if not tool_calls:
+            raise KeyError("tool_calls")
+        args = tool_calls[0]["function"]["arguments"]
+        data = json.loads(args) if isinstance(args, str) else args
+    except (KeyError, IndexError, json.JSONDecodeError, TypeError) as exc:
+        raise LLMProposalError(f"no parsable propose_test tool call: {exc}") from exc
+    return LLMProposalDraft.model_validate(data)
+
+
+class LLMProposalError(Exception):
+    """The LLM response could not be parsed into a valid draft."""
+
+
+@dataclass(frozen=True, slots=True)
+class DraftRejected:
+    """A draft whose handles do not resolve against the pack (ADR-0037).
+
+    `code` is a stable discriminator (`unknown_target`, `unknown_auth`,
+    `unknown_hold`); the proposal is discarded and logged, never committed.
+    """
+
+    code: str
+    reason: str
+
+
+def resolve_draft(
+    pack: ContextPack, draft: LLMProposalDraft
+) -> PlannerProposal | DraftRejected:
+    """Resolve a draft's pack handles to a concrete-id `PlannerProposal` (ADR-0037).
+
+    Rejects any handle absent from the pack (hallucination guard) before building
+    the proposal. `payload_class`/`payload_spec` are fixed for an authz replay
+    (`auth-token-swap` / `none`); `hold` handles resolve to human-readable target
+    labels (method + path / param) for the audit and review surfaces.
+    """
+
+    targets = {t.handle: t for t in pack.targets}
+    auths = {a.handle: a for a in pack.auth_contexts}
+
+    target = targets.get(draft.target_ref)
+    if target is None:
+        return _reject("unknown_target", pack, draft, f"target_ref {draft.target_ref!r}")
+    auth = auths.get(draft.auth_context_ref)
+    if auth is None:
+        return _reject("unknown_auth", pack, draft, f"auth_context_ref {draft.auth_context_ref!r}")
+
+    held: list[str] = []
+    for h in draft.hold:
+        ht = targets.get(h)
+        if ht is None:
+            return _reject("unknown_hold", pack, draft, f"hold handle {h!r}")
+        held.append(_hold_label(ht))
+
+    target_endpoint_id = target.endpoint_id if target.kind == "endpoint" else None
+    target_parameter_id = target.parameter_id if target.kind == "parameter" else None
+
+    return PlannerProposal(
+        engagement_id=pack.engagement_id,
+        generator="c2",
+        mode="llm",
+        test_class=draft.test_class,
+        payload_class="auth-token-swap",
+        payload_spec=PayloadSpec(kind="none"),
+        auth_context_id=auth.auth_context_id,
+        target_endpoint_id=target_endpoint_id,
+        target_parameter_id=target_parameter_id,
+        expected_yield=draft.expected_yield,
+        confidence_method="llm-self-reported",
+        justification=draft.justification,
+        expected_outcome=draft.expected_outcome,
+        hold=tuple(held),
+    )
+
+
+def _hold_label(t: PackTargetLike) -> str:
+    if t.param_name is not None:
+        return f"{t.method} {t.path_template} param {t.param_name}"
+    return f"{t.method} {t.path_template}"
+
+
+def _reject(
+    code: str, pack: ContextPack, draft: LLMProposalDraft, what: str
+) -> DraftRejected:
+    reason = f"{what} is not a handle present in the context pack (hallucinated)"
+    log.warning(
+        "planner.llm.draft_rejected",
+        engagement_id=pack.engagement_id,
+        code=code,
+        reason=reason,
+        target_handles=sorted(pack.target_handles()),
+        auth_handles=sorted(pack.auth_handles()),
+    )
+    return DraftRejected(code=code, reason=reason)
+
+
+# Structural type for `_hold_label` (a PackTarget); avoids importing the concrete
+# class name twice and keeps the helper signature self-documenting.
+class PackTargetLike(Protocol):
+    method: str
+    path_template: str
+    param_name: str | None
