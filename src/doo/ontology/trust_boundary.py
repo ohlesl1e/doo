@@ -149,7 +149,7 @@ def _infer_capability_boundaries(
         by_principal.setdefault(row.principal_id, []).append(row)
 
     out: list[InferredBoundary] = []
-    for principal_id, acs in sorted(by_principal.items()):
+    for _principal_id, acs in sorted(by_principal.items()):
         if len(acs) < 2:
             continue
         # Every unordered pair of this Principal's AuthContexts; draw a boundary
