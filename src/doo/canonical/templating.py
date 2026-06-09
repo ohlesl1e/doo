@@ -176,10 +176,39 @@ class _SlotDecision:
     shape: ShapeKind | None
 
 
+def _word_paths_reconverge(
+    word_paths: dict[str, list[str]], segmented: dict[str, list[str]], index: int
+) -> bool:
+    """True iff every word-valued sibling shares one *identical* downstream suffix.
+
+    Guards Case B (issue #70). Distinct interior words collapse to a parameter only
+    when the entire remaining path after this position is byte-identical across the
+    cohort — strong evidence the words are values of one collection:
+
+    - `/orgs/acme/projects` + `/orgs/globex/projects` -> suffix `("projects",)` for
+      both -> collapse to `{org_id}`.
+    - `/orgs/42/...` + `/workspaces/ws-a/...`, or `/orgs/42` + `/users/87`, or
+      `/orgs/42/posts` + `/users/87/posts` -> suffixes differ -> these are distinct
+      routes; keep the resource-type literal and template each value slot per branch.
+
+    Comparison is **raw** (not shape-normalised): wildcarding id positions would
+    make `/orgs/{id}` and `/users/{id}` look identical and wrongly merge two
+    collections. Under-templating a multi-parameter word-prefixed route is the safe,
+    revisable direction (ADR-0004); destroying route identity is not.
+    """
+
+    suffixes = {
+        tuple(segmented[p][index + 1 :]) for ps in word_paths.values() for p in ps
+    }
+    return len(suffixes) == 1
+
+
 def _decide_slot(
     paths: list[str],
     values_by_path: dict[str, str],
     *,
+    segmented: dict[str, list[str]],
+    index: int,
     preceding: str | None,
     is_leaf: bool,
 ) -> _SlotDecision:
@@ -238,7 +267,18 @@ def _decide_slot(
     # distinct words at a *leaf* are sibling routes (`/products`, `/about`), not a
     # parameter. This is the revisable cold-start case: a single word stays
     # literal (Case C) until a second distinct word overturns the guess (ADR-0004).
-    if not is_leaf and len(word_paths) >= 2 and not id_shaped_paths:
+    #
+    # The words must also *reconverge to the same downstream route* (issue #70):
+    # `/orgs/acme/projects` + `/orgs/globex/projects` share `/projects` and collapse,
+    # but `/orgs/{x}/projects` and `/workspaces/{y}/files` are different routes — the
+    # resource-type literal must NOT be collapsed. Without this gate, distinct
+    # same-length top-level routes lose their literal prefix to a bogus `{id}`.
+    if (
+        not is_leaf
+        and len(word_paths) >= 2
+        and not id_shaped_paths
+        and _word_paths_reconverge(word_paths, segmented, index)
+    ):
         param_paths = [p for ps in word_paths.values() for p in ps] + self_ref_paths
         return _SlotDecision(
             param_paths=param_paths,
@@ -368,7 +408,12 @@ def _descend(
 
     values_by_path = {p: segmented[p][index] for p in paths}
     decision = _decide_slot(
-        paths, values_by_path, preceding=preceding, is_leaf=(index == max_depth - 1)
+        paths,
+        values_by_path,
+        segmented=segmented,
+        index=index,
+        preceding=preceding,
+        is_leaf=(index == max_depth - 1),
     )
 
     # Parameter branch: id-shaped (+ self-reference) values collapse to one token.
