@@ -588,7 +588,7 @@ Working method: pick a small canonical set of queries each consumer needs, then 
 - C1. Endpoints in `Scope`, never hit by any `RequestObservation`.
 - C2. Endpoints hit as `Principal` A but not as `Principal` B.
 - C3. Identifiers seen in `ResponseArtifact`s that also appear as `Parameter` inputs to other Endpoints (leak-to-input pivot).
-- C4. `AuthContext` transitions (capability-tier `TrustBoundary`) never exercised.
+- C4. Capability-tier coverage — the **capability-tier analog of C2** (ADR-0033, slice 3). A capability `TrustBoundary` orders two `AuthContext`s of one Principal (weak → strong); C4 surfaces endpoints the **strong** context reached (2xx) that the **weak** context never reached or was blocked on. A passive observation differential (not "boundaries with no *executed* test" — that degenerate reading is C5's slice-4 shape). Lives in the shared coverage library next to C2 (ADR-0034); consumes the capability boundary node only for tier ordering. Evidence-gated: needs `scope`/`acr`/`amr`/`auth_time` claims to tell tiers apart — absent claims → no boundary inferred → C4 truthfully empty there (tenant coverage is correspondingly broader).
 - C5. `TrustBoundary`s with no `TestCase` targeting them.
 
 **Planner:**
