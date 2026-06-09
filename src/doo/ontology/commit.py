@@ -49,6 +49,8 @@ from doo.ontology.resolve import (
     resolve_host,
 )
 from doo.ontology.templating import RetemplateResult, retemplate_cohort
+from doo.ontology.tenant import infer_tenants
+from doo.ontology.trust_boundary import infer_trust_boundaries
 
 log = get_logger(__name__)
 
@@ -122,6 +124,13 @@ class FlushResult:
     # ADR-0029 amendment: observed identities attached as aliases to non-synthetic
     # Principals (enrichment — e.g. a JWT-keyed Principal's `/me` email).
     observed_identity_aliases: int = 0
+    # ADR-0008 / ADR-0039 (slice-3 S4): Tenant nodes inferred from URL-position
+    # tenant identifiers, plus capability/tenant `TrustBoundary` nodes inferred at
+    # flush. `of_tenant_edges` is the Principal→Tenant edge count.
+    tenants: int = 0
+    of_tenant_edges: int = 0
+    capability_boundaries: int = 0
+    tenant_boundaries: int = 0
 
 
 class CommitOrchestrator:
@@ -362,6 +371,32 @@ class CommitOrchestrator:
             principals_retracted += reconcile.retracted
             identity_aliases += reconcile.aliases
 
+        # --- ADR-0008: infer Tenant nodes from URL-position tenant identifiers,
+        # then ADR-0039: infer capability + tenant `TrustBoundary`s. Runs AFTER
+        # identity reconciliation so boundaries see the settled Principals /
+        # AuthContexts, and tenant inference precedes tenant-boundary inference
+        # (the boundary consumes the Tenant nodes). Idempotent across re-flushes. ---
+        tenants = of_tenant_edges = 0
+        capability_boundaries = tenant_boundaries = 0
+        for engagement_id in sorted(engagements):
+            now = datetime.now(UTC)
+            tenant_result = infer_tenants(
+                self._neo4j,
+                engagement_id=engagement_id,
+                observed_at=now,
+                ingested_at=now,
+            )
+            tenants += len(tenant_result.tenants)
+            of_tenant_edges += tenant_result.of_tenant_edges
+            boundary_result = infer_trust_boundaries(
+                self._neo4j,
+                engagement_id=engagement_id,
+                observed_at=now,
+                ingested_at=now,
+            )
+            capability_boundaries += len(boundary_result.capability)
+            tenant_boundaries += len(boundary_result.tenant)
+
         if cohorts or observed_values:
             log.info(
                 "flush.applied",
@@ -374,6 +409,10 @@ class CommitOrchestrator:
                 observed_identity_upgrades=identity_upgrades,
                 principals_retracted=principals_retracted,
                 observed_identity_aliases=identity_aliases,
+                tenants=tenants,
+                of_tenant_edges=of_tenant_edges,
+                capability_boundaries=capability_boundaries,
+                tenant_boundaries=tenant_boundaries,
             )
         return FlushResult(
             cohorts=cohorts,
@@ -385,6 +424,10 @@ class CommitOrchestrator:
             observed_identity_upgrades=identity_upgrades,
             principals_retracted=principals_retracted,
             observed_identity_aliases=identity_aliases,
+            tenants=tenants,
+            of_tenant_edges=of_tenant_edges,
+            capability_boundaries=capability_boundaries,
+            tenant_boundaries=tenant_boundaries,
         )
 
     def _promotion_events(

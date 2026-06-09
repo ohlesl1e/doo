@@ -44,6 +44,8 @@ from doo.ids import (
     PrincipalId,
     Sha256Hex,
     SourceId,
+    TenantId,
+    TrustBoundaryId,
 )
 
 # Token kinds permitted in an auth_hash, per CONTEXT.md AuthContext identity.
@@ -270,6 +272,38 @@ def observed_value_id(
     """
 
     return ObservedValueId(_hash_tuple(engagement_id, value_hash))
+
+
+def tenant_id(
+    engagement_id: EngagementId, kind: str, normalized_value: str
+) -> TenantId:
+    """Stable `Tenant` node id over `(engagement_id, kind, normalized_value)` (ADR-0008).
+
+    Matches the `Tenant` uniqueness constraint in `ontology/schema.py`, so the same
+    tenant (e.g. `org_id=42`) converges to one node within an engagement.
+    """
+
+    return TenantId(_hash_tuple(engagement_id, kind, normalized_value))
+
+
+def trust_boundary_id(
+    engagement_id: EngagementId,
+    kind: str,
+    between_a_id: str,
+    between_b_id: str,
+) -> TrustBoundaryId:
+    """Stable `TrustBoundary` node id over `(engagement_id, kind, between_a_id, between_b_id)`.
+
+    Matches the `TrustBoundary` uniqueness constraint in `ontology/schema.py`
+    (ADR-0002 / ADR-0008 / ADR-0039). The boundary is an **undirected** pair, so
+    callers must pass the two endpoint node ids in a canonical order
+    (`min`/`max`); `between_a_id` is the lexicographically smaller. This collapses
+    the (a, b) and (b, a) orderings to one node per unordered pair.
+    """
+
+    return TrustBoundaryId(
+        _hash_tuple(engagement_id, kind, between_a_id, between_b_id)
+    )
 
 
 def anonymous_principal_identity_key() -> str:
