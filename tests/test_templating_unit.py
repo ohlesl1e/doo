@@ -99,6 +99,31 @@ def test_interior_word_multiplicity_collapses() -> None:
     assert t["/orgs/globex/projects"] == "/orgs/{org_id}/projects"
 
 
+def test_distinct_same_length_routes_keep_their_literal_prefix() -> None:
+    # Regression for #70: two different routes of equal segment-length must NOT
+    # have their resource-type literal collapsed just because the position holds
+    # >=2 distinct words. They do not reconverge (`/projects` vs `/files`), so the
+    # literal prefix stays and each route templates its own value slot.
+    t = _templates(
+        [
+            "/orgs/42/projects",
+            "/orgs/43/projects",
+            "/workspaces/ws-a/files",
+            "/workspaces/ws-b/files",
+        ]
+    )
+    assert t["/orgs/42/projects"] == "/orgs/{org_id}/projects"
+    assert t["/workspaces/ws-a/files"] == "/workspaces/{workspace_id}/files"
+
+
+def test_distinct_word_routes_with_matching_suffix_still_separate() -> None:
+    # Even when the leaf word matches (`/posts` vs `/posts`), differing
+    # resource-type prefixes are distinct routes and stay literal (#70).
+    t = _templates(["/orgs/1/posts", "/orgs/2/posts", "/users/9/posts", "/users/8/posts"])
+    assert t["/orgs/1/posts"] == "/orgs/{org_id}/posts"
+    assert t["/users/9/posts"] == "/users/{user_id}/posts"
+
+
 def test_leaf_words_stay_distinct_routes() -> None:
     # Distinct words at a *leaf* are sibling routes, not a parameter.
     t = _templates(["/products", "/about"])
