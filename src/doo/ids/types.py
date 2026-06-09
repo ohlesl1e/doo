@@ -45,8 +45,12 @@ AuthContextId = NewType("AuthContextId", str)
 TestCaseKeyHash = NewType("TestCaseKeyHash", str)
 """Content-addressed `TestCase` identity per ADR-0007."""
 
+TenantId = NewType("TenantId", str)
+"""A `Tenant` node id, derived from `(engagement_id, kind, normalized_value)` (ADR-0008)."""
+
 TrustBoundaryId = NewType("TrustBoundaryId", str)
-"""A `TrustBoundary` node id."""
+"""A `TrustBoundary` node id, derived from `(engagement_id, kind, between_a_id, between_b_id)`
+(ADR-0002 / ADR-0008 / ADR-0039)."""
 
 FindingId = NewType("FindingId", str)
 """A `Finding` node id."""
