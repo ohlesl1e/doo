@@ -216,6 +216,9 @@ def validate(
         expected_yield_method=proposal.confidence_method,
         justification=proposal.justification,
         expected_outcome=proposal.expected_outcome,
+        # Replay-fidelity annotation (ADR-0041): code-set on the proposal, carried
+        # through verbatim. NOT an identity input (absent from `key_hash` above).
+        replay_hazards=proposal.replay_hazards,
         llm_audit_key=proposal.llm_audit_key,
     )
 

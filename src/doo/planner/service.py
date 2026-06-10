@@ -47,8 +47,11 @@ _CRITICALITY_BY_SOURCE: dict[str, float] = {
     "llm-planner": 2.0,
 }
 
-# Map a committed node's `source` back to the generator id (for the view). The sole
-# LLM-proposing generator today is C2, so `llm-planner` maps to `c2`.
+# Map a committed node's `source` back to the generator id (for the view). Both the
+# C2 and C2b LLM-proposing generators commit `source = "llm-planner"` (ADR-0036: the
+# proposing *mode*, not the generator, is the provenance distinction), so the source
+# alone cannot tell C2 from C2b on the node — `llm-planner` maps to the C2 family
+# representative `c2` for the view's generator label.
 _GENERATOR_BY_SOURCE: dict[str, GeneratorId] = {
     "deterministic-c1": "c1",
     "llm-planner": "c2",
@@ -228,6 +231,7 @@ def _row_to_view(
         justification=str(row["justification"]),
         expected_outcome=str(row["expected_outcome"]),
         priority_score=score,
+        replay_hazards=tuple(row["replay_hazards"]) if row["replay_hazards"] else (),
         review_status=review_status_override or str(row["review_status"]),  # type: ignore[arg-type]
         resurfaced=resurfaced,
         resurfaced_reason=resurfaced_reason,
@@ -251,6 +255,7 @@ _TESTCASE_PROJECTION = """
            t.confidence AS confidence,
            t.justification AS justification,
            t.expected_outcome AS expected_outcome,
+           t.replay_hazards AS replay_hazards,
            t.review_disposition AS review_disposition,
            e.method AS method,
            e.path_template AS path_template,

@@ -39,10 +39,24 @@ from doo.ids import (
 
 # The deterministic generator that produced a candidate. Each value doubles as
 # the `source` provenance tag on a committed deterministic TestCase
-# (`deterministic-c1`, ADR-0036). LLM-proposing generators (slice-3 tracer 2,
+# (`deterministic-c1`, ADR-0036). LLM-proposing generators (slice-3 tracers,
 # slice 4) commit `source = "llm-planner"` instead.
-GeneratorId = Literal["c1", "c2"]
-GENERATOR_IDS: tuple[GeneratorId, ...] = ("c1", "c2")
+GeneratorId = Literal["c1", "c2", "c2b"]
+GENERATOR_IDS: tuple[GeneratorId, ...] = ("c1", "c2", "c2b")
+
+# A replay-breaking request-field role (ADR-0041). A field bound to the original
+# session whose verbatim replay under a swapped identity would fail for a *non-authz*
+# reason (and thus false-negative a boundary as "enforced"). Detected
+# **deterministically** by name + shape/entropy/short-lived heuristics
+# (`replay_hazards.py`) — never by the LLM. Slice 3 only *flags* these; the actual
+# refresh + the `replay_invalid` dispatch_status land in slice 4.
+ReplayHazardRole = Literal["csrf_token", "nonce", "signature", "timestamp"]
+REPLAY_HAZARD_ROLES: tuple[ReplayHazardRole, ...] = (
+    "csrf_token",
+    "nonce",
+    "signature",
+    "timestamp",
+)
 
 # How a generator turns a selected target into a proposal (ADR-0036).
 ProposalMode = Literal["deterministic", "llm"]
@@ -173,8 +187,19 @@ class PlannerProposal(BaseModel):
     # kept while the attacker AuthContext is swapped in). Resolved from pack handles
     # to stable labels by the resolver; empty for non-replay proposals (e.g. C1).
     # NOT part of the ADR-0007 key_hash — a derivable execution strategy, not
-    # identity. `replay_hazards` lands in the S2b tracer.
+    # identity.
     hold: tuple[str, ...] = ()
+
+    # Replay-fidelity annotation (ADR-0041): the replay-breaking field roles
+    # (`csrf_token` / `nonce` / `signature` / `timestamp`) the deterministic
+    # detector (`replay_hazards.py`) found in the evidencing observation. Set by
+    # CODE after the LLM returns — the model selects handles + classifies, it never
+    # touches this. Like `hold`, a **derivable execution-fidelity** annotation, so it
+    # is **NOT part of the ADR-0007 key_hash** (adding it would needlessly fracture
+    # content-addressed identity). Empty when no hazard was detected. Slice 3 only
+    # *flags* a naive-replay false-negative risk; the refresh + the `replay_invalid`
+    # dispatch_status land in slice 4.
+    replay_hazards: tuple[str, ...] = ()
 
     # Object-storage key of the verbatim LLM request/response that produced this
     # proposal (ADR-0037 replayability). Set only for `mode == "llm"` proposals —
@@ -289,7 +314,7 @@ class ContextPack(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     engagement_id: EngagementId
-    candidate_kind: Literal["C2"]
+    candidate_kind: Literal["C2", "C2b"]
     candidate_reason: str
     endpoint_method: str
     endpoint_path_template: str
@@ -432,6 +457,10 @@ class ProposedTestCaseView(BaseModel):
     justification: str
     expected_outcome: str
     priority_score: float
+    # Replay-fidelity annotation (ADR-0041): the detected replay-breaker roles on the
+    # committed node. Surfaced so the reviewer sees a naive replay would
+    # false-negative; set by code, never by the LLM, and not part of `key_hash`.
+    replay_hazards: tuple[str, ...] = ()
     review_status: ReviewStatus = "proposed"
     # Re-surface annotation for a previously-`defer`-rejected test (ADR-0040).
     resurfaced: bool = False

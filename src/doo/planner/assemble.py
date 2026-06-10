@@ -1,9 +1,17 @@
-"""Deterministic C2 context-pack assembly (ADR-0037, S2a).
+"""Deterministic C2 / C2b context-pack assembly (ADR-0037, S2a/S2b).
 
 The planner's *one* non-deterministic step is the LLM proposal; everything that
-feeds it is deterministic code. This module is the feed: it turns one C2 coverage
-gap (`C2Result` — endpoint reached as principal A but not as B) into the typed,
-id-free `ContextPack` the LLM reasons over.
+feeds it is deterministic code. This module is the feed: it turns one authz
+coverage gap into the typed, id-free `ContextPack` the LLM reasons over.
+
+- `assemble_c2_pack` — a **C2 presence gap** (`C2Result`: endpoint reached as
+  principal A but not as B). Two auth contexts (A reached, B did not); B is the
+  single attacker candidate.
+- `assemble_c2b_pack` — a **C2b content-differential gap** (`C2bResult`: ≥2
+  principals ALL reached the endpoint with a 2xx but their bodies differ — the
+  BOLA/IDOR hotspot). Here *any* reaching principal could be attacker or victim, so
+  **every** reaching principal is a pack auth context marked
+  `is_attacker_candidate=True`, and the LLM picks which one to replay as.
 
 The pack is bounded and secret-free (ADR-0015/0037): targets and auth contexts are
 addressed by pack-local handles (`T1`, `A1`) never raw node ids; response bodies
@@ -12,9 +20,15 @@ the AuthContext tier + claim *names*). `to_llm_payload()` strips the real ids ou
 again before serialisation — they live on the typed objects purely so the resolver
 can map a returned handle back to a concrete id.
 
-`assemble_c2_pack` returns `None` for a gap it cannot turn into a proposable test
-(no resolvable attacker AuthContext for the B side) — the generator records that as
-a skip rather than calling the model with an incomplete pack.
+An assembler returns `None` for a gap it cannot turn into a proposable test (no
+resolvable AuthContext) — the generator records that as a skip rather than calling
+the model with an incomplete pack.
+
+`fetch_reaching_observation_hazards` is the **deterministic** replay-hazard read
+(ADR-0041): it pulls one reaching 2xx observation's stored `value_candidates` and
+runs the `replay_hazards` detector (no LLM). The generator stamps the result onto
+the resolved proposal — replay-breakers are endpoint-level request features, so the
+detector runs once over a reaching observation, not per auth context.
 """
 
 from __future__ import annotations
@@ -23,7 +37,8 @@ import json
 from dataclasses import dataclass
 from datetime import datetime
 
-from doo.coverage.models import C2Result
+from doo.coverage.models import C2bResult, C2Result
+from doo.events.l2 import ValueCandidate
 from doo.ids import AuthContextId, EngagementId
 from doo.infra.neo4j_driver import Neo4jClient
 from doo.observability.logging import get_logger
@@ -33,7 +48,9 @@ from doo.planner.models import (
     PackAuthContext,
     PackExemplar,
     PackTarget,
+    ReplayHazardRole,
 )
+from doo.planner.replay_hazards import hazards_for_value_candidates
 
 log = get_logger(__name__)
 
@@ -232,3 +249,161 @@ def assemble_c2_pack(
         code_version=code_version,
         generated_at=now,
     )
+
+
+def assemble_c2b_pack(
+    client: Neo4jClient,
+    *,
+    gap: C2bResult,
+    code_version: str,
+    now: datetime,
+) -> ContextPack | None:
+    """Build the `ContextPack` for one C2b content-differential gap, or None.
+
+    A C2b gap is an endpoint ≥2 active principals ALL reached with a 2xx but whose
+    response bodies differ (the role-differentiated-200 BOLA/IDOR hotspot). Unlike
+    C2 (one reached, one did not), here there is no privileged "victim vs attacker"
+    split a priori: any reaching principal could be the attacker reading another's
+    differentiated resource. So **every** reaching principal becomes a
+    `PackAuthContext` marked `is_attacker_candidate=True`, and the LLM chooses which
+    to replay as. The endpoint is the single holdable target (`T1`).
+
+    `gap.evidence` already carries every reaching principal (per ADR-0033). Each
+    principal's AuthContext is resolved the same way `assemble_c2_pack` does
+    (`_fetch_principal_auth`). Returns None when fewer than two principals have a
+    resolvable AuthContext (nothing differential left to replay) — the caller treats
+    that as a skipped gap, not a model call.
+    """
+
+    eid = gap.engagement_id
+
+    auth_contexts: list[PackAuthContext] = []
+    exemplar_principal_id: str | None = None
+    # A dedicated handle counter (not the evidence index) so resolved contexts are
+    # always contiguous A1, A2, ... even when a principal's auth fails to resolve.
+    handle_n = 0
+    for ev in gap.evidence:
+        auth = _fetch_principal_auth(client, eid, ev.principal_id)
+        if auth is None:
+            log.warning(
+                "planner.assemble.c2b.principal_auth_unresolved",
+                engagement_id=eid,
+                endpoint_id=gap.endpoint_id,
+                principal_label=ev.label,
+            )
+            continue
+        handle_n += 1
+        auth_contexts.append(
+            PackAuthContext(
+                handle=f"A{handle_n}",
+                principal_label=ev.label,
+                tier=auth.tier,
+                claims_summary=auth.claims_summary,
+                # Any reaching principal is a candidate attacker for the content
+                # differential — there is no a-priori victim/attacker split (ADR-0033).
+                is_attacker_candidate=True,
+                auth_context_id=auth.auth_context_id,
+            )
+        )
+        if exemplar_principal_id is None:
+            exemplar_principal_id = ev.principal_id
+
+    if len(auth_contexts) < 2:
+        log.warning(
+            "planner.assemble.c2b.too_few_auth_contexts",
+            engagement_id=eid,
+            endpoint_id=gap.endpoint_id,
+            resolved=len(auth_contexts),
+        )
+        return None
+
+    target = PackTarget(
+        handle="T1",
+        kind="endpoint",
+        method=gap.method,
+        path_template=gap.path_template,
+        endpoint_id=gap.endpoint_id,
+    )
+    labels = ", ".join(ev.label for ev in gap.evidence)
+    exemplar = (
+        _fetch_exemplar(
+            client, eid, endpoint_id=gap.endpoint_id, principal_id=exemplar_principal_id
+        )
+        if exemplar_principal_id is not None
+        else None
+    )
+
+    return ContextPack(
+        engagement_id=eid,
+        candidate_kind="C2b",
+        candidate_reason=(
+            f"C2b content-differential: {gap.method} {gap.host}{gap.path_template} "
+            f"reached (2xx) by {len(gap.evidence)} principals ({labels}) whose "
+            "response bodies differ — a role-differentiated 200 (BOLA/IDOR hotspot)"
+        ),
+        endpoint_method=gap.method,
+        endpoint_path_template=gap.path_template,
+        targets=(target,),
+        auth_contexts=tuple(auth_contexts),
+        exemplar=exemplar,
+        code_version=code_version,
+        generated_at=now,
+    )
+
+
+def _parse_value_candidates(raw: object) -> tuple[ValueCandidate, ...]:
+    """Parse the node's stored `value_candidates` (a list of JSON strings) to models.
+
+    `resolve.py` persists each `ValueCandidate` as a JSON string in a list property
+    (Neo4j has no struct type). A malformed entry is skipped defensively rather than
+    failing the whole detection.
+    """
+
+    if not isinstance(raw, list):
+        return ()
+    out: list[ValueCandidate] = []
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        try:
+            out.append(ValueCandidate.model_validate_json(item))
+        except ValueError:
+            continue
+    return tuple(out)
+
+
+def fetch_reaching_observation_hazards(
+    client: Neo4jClient,
+    engagement_id: EngagementId,
+    *,
+    endpoint_id: str,
+) -> tuple[ReplayHazardRole, ...]:
+    """Detect replay hazards from one reaching 2xx observation's request fields (ADR-0041).
+
+    Replay-breakers (CSRF tokens / nonces / signatures / timestamps) are
+    endpoint-level request features, so the detector runs once over a reaching 2xx
+    observation rather than per auth context. Picks the most recently-seen reaching
+    2xx observation deterministically and runs the **deterministic** detector over
+    its parsed `value_candidates` — header-borne fields included (a CSRF token is
+    commonly an `X-CSRF-Token` request header). No LLM (CLAUDE.md hard rule). Returns
+    an empty tuple when there is no reaching observation or no detected hazard.
+    """
+
+    frag = for_engagement(engagement_id, var="r")
+    rows = client.execute_read(
+        f"""
+        MATCH (r:RequestObservation)-[:HIT]->(e:Endpoint {{id: $endpoint_id}})
+        {frag.and_("r.status = 'active' AND e.status = 'active'")}
+          AND r.response_status >= 200 AND r.response_status <= 299
+          AND r.value_candidates IS NOT NULL
+        RETURN r.value_candidates AS value_candidates
+        ORDER BY coalesce(r.last_seen, r.ingested_at) DESC, r.observation_id ASC
+        LIMIT 1
+        """,
+        endpoint_id=endpoint_id,
+        **frag.parameters,
+    )
+    if not rows:
+        return ()
+    candidates = _parse_value_candidates(rows[0]["value_candidates"])
+    return hazards_for_value_candidates(candidates)

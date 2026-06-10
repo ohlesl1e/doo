@@ -73,6 +73,11 @@ class ValidatedTestCase:
     expected_yield_method: str
     justification: str
     expected_outcome: str
+    # Replay-fidelity annotation (ADR-0041): the deterministically-detected
+    # replay-breaker roles in the evidencing observation. Set by code, never the LLM,
+    # and **not** part of `key_hash` (a derivable execution-fidelity annotation, like
+    # `hold`). Persisted as a node property for the review surface.
+    replay_hazards: tuple[str, ...] = ()
     # Object-storage key of the proposing LLM call (ADR-0037), or None for a
     # deterministic proposal. Committed onto the node as replay provenance.
     llm_audit_key: str | None = None
@@ -156,6 +161,7 @@ def commit_testcase(
             t.expected_yield_method = $expected_yield_method,
             t.justification = $justification,
             t.expected_outcome = $expected_outcome,
+            t.replay_hazards = $replay_hazards,
             t.source = $source,
             t.source_id = $source_id,
             t.llm_audit_key = $llm_audit_key,
@@ -191,6 +197,7 @@ def commit_testcase(
         expected_yield_method=vtc.expected_yield_method,
         justification=vtc.justification,
         expected_outcome=vtc.expected_outcome,
+        replay_hazards=list(vtc.replay_hazards),
         source=vtc.source,
         source_id=None,
         llm_audit_key=vtc.llm_audit_key,

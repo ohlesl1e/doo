@@ -192,14 +192,18 @@ def _render_queue(rows: list[ProposedTestCaseView]) -> None:
     typer.echo(f"planner review — proposals (prioritised): {len(rows)}")
     typer.echo(
         f"{'SCORE':>6} {'CLASS':<16} {'METHOD':<7} {'TARGET':<40} "
-        f"{'YIELD':>6} {'KEY':<12}"
+        f"{'YIELD':>6} {'HAZARDS':<24} {'KEY':<12}"
     )
     for r in rows:
         target = f"{r.host or '-'}{r.path_template or ''}"
         flag = " *resurfaced" if r.resurfaced else ""
+        # ADR-0041 replay-fidelity: surface the detected replay-breakers so the
+        # reviewer sees a naive replay would false-negative ("-" when none).
+        hazards = ",".join(r.replay_hazards) if r.replay_hazards else "-"
         typer.echo(
             f"{r.priority_score:>6.3f} {r.test_class:<16} {r.method or '-':<7} "
-            f"{target:<40} {r.expected_yield:>6.3f} {r.key_hash[:12]}{flag}"
+            f"{target:<40} {r.expected_yield:>6.3f} {hazards:<24} "
+            f"{r.key_hash[:12]}{flag}"
         )
 
 

@@ -24,11 +24,15 @@ from doo.canonical.identity import (
     auth_context_id,
     compute_anonymous_auth_hash,
 )
-from doo.coverage.queries import _load_principals, run_c1, run_c2
+from doo.coverage.queries import _load_principals, run_c1, run_c2, run_c2b
 from doo.ids import EngagementId
 from doo.infra.neo4j_driver import Neo4jClient
 from doo.observability.logging import get_logger
-from doo.planner.assemble import assemble_c2_pack
+from doo.planner.assemble import (
+    assemble_c2_pack,
+    assemble_c2b_pack,
+    fetch_reaching_observation_hazards,
+)
 from doo.planner.llm import (
     DraftRejected,
     LLMCaller,
@@ -54,6 +58,11 @@ _C1_CRITICALITY = 1.0
 # (ADR-0036: tenant > capability > C2b > C2 > C1). Surfaced here so the prioritiser
 # and the review view agree on the tier (see service `_CRITICALITY_BY_SOURCE`).
 _C2_CRITICALITY = 2.0
+# C2b (content-differential authz, the BOLA/IDOR hotspot) outranks C2 (ADR-0036:
+# tenant > capability > C2b > C2 > C1). Both commit `source = "llm-planner"`, so the
+# review view's criticality is keyed on source today (a single `llm-planner` tier);
+# this constant records the intended C2b tier for when source-keying is refined.
+_C2B_CRITICALITY = 3.0
 
 
 @runtime_checkable
@@ -303,10 +312,111 @@ class C2Generator:
             if isinstance(outcome, DraftRejected):
                 rejected.append(LLMRejected(rejection=outcome, call=call))
                 continue
-            proposed.append(LLMProposed(proposal=outcome, call=call))
+            # ADR-0041: deterministically annotate replay-breakers from a reaching
+            # 2xx observation (code-set, never the LLM). A frozen proposal -> copy.
+            hazards = fetch_reaching_observation_hazards(
+                client, engagement_id, endpoint_id=gap.endpoint_id
+            )
+            proposal = outcome.model_copy(update={"replay_hazards": hazards})
+            proposed.append(LLMProposed(proposal=proposal, call=call))
 
         log.info(
             "planner.generator.c2.complete",
+            engagement_id=engagement_id,
+            candidates=len(gaps),
+            proposed=len(proposed),
+            rejected=len(rejected),
+            skipped=len(skipped),
+        )
+        return LLMRunResult(
+            candidates=len(gaps),
+            proposed=tuple(proposed),
+            rejected=tuple(rejected),
+            skipped=tuple(skipped),
+        )
+
+
+class C2bGenerator:
+    """LLM-proposing generator for content-differential authz gaps (ADR-0037/0033).
+
+    Selection reuses the shared coverage library's `run_c2b` (ADR-0033/0034) — the
+    same gaps `doo coverage c2b` surfaces, so planner and coverage never disagree. A
+    C2b gap is an endpoint ≥2 principals ALL reached with a 2xx but whose response
+    bodies differ (the role-differentiated-200 BOLA/IDOR hotspot). Each gap is
+    deterministically assembled into a bounded, id-free `ContextPack`
+    (`assemble_c2b_pack`) carrying **every** reaching principal as a candidate
+    attacker (any of them could read another's differentiated resource); the LLM
+    proposes ONE authz replay by selecting handles and classifying (`llm.py`); the
+    deterministic resolver maps the handles back to concrete ids and rejects any
+    hallucinated handle. After resolution, the deterministic replay-hazard detector
+    (ADR-0041) annotates the proposal from a reaching observation's request fields —
+    code-set, never the LLM. A gap with fewer than two resolvable AuthContexts is
+    skipped before any model call.
+    """
+
+    generator_id: GeneratorId = "c2b"
+    mode: ProposalMode = "llm"
+
+    def __init__(self, caller: LLMCaller) -> None:
+        self._caller = caller
+
+    def run(
+        self,
+        client: Neo4jClient,
+        engagement_id: EngagementId,
+        *,
+        now: datetime | None = None,
+    ) -> LLMRunResult:
+        run_at = now or datetime.now(UTC)
+        gaps = run_c2b(client, engagement_id, now=run_at)
+
+        proposed: list[LLMProposed] = []
+        rejected: list[LLMRejected] = []
+        skipped: list[LLMSkipped] = []
+
+        for gap in gaps:
+            pack = assemble_c2b_pack(
+                client,
+                gap=gap,
+                code_version=__version__,
+                now=run_at,
+            )
+            if pack is None:
+                skipped.append(
+                    LLMSkipped(
+                        reason=(
+                            f"unproposable C2b gap {gap.method} {gap.host}"
+                            f"{gap.path_template}: fewer than two resolvable AuthContexts"
+                        )
+                    )
+                )
+                continue
+            try:
+                call = self._caller.propose(pack)
+            except LLMProposalError as exc:
+                skipped.append(
+                    LLMSkipped(
+                        reason=(
+                            f"LLM proposal unparseable for endpoint "
+                            f"{gap.endpoint_id}: {exc}"
+                        )
+                    )
+                )
+                continue
+            outcome = resolve_draft(pack, call.draft)
+            if isinstance(outcome, DraftRejected):
+                rejected.append(LLMRejected(rejection=outcome, call=call))
+                continue
+            # ADR-0041: deterministically annotate replay-breakers (code-set, never
+            # the LLM) from a reaching 2xx observation. A frozen proposal -> copy.
+            hazards = fetch_reaching_observation_hazards(
+                client, engagement_id, endpoint_id=gap.endpoint_id
+            )
+            proposal = outcome.model_copy(update={"replay_hazards": hazards})
+            proposed.append(LLMProposed(proposal=proposal, call=call))
+
+        log.info(
+            "planner.generator.c2b.complete",
             engagement_id=engagement_id,
             candidates=len(gaps),
             proposed=len(proposed),
@@ -345,7 +455,7 @@ _REGISTRY: dict[GeneratorId, CandidateGenerator] = {
 
 # LLM-proposing generator ids (ADR-0037). Known to config validation, but built by
 # the service (not the singleton registry) because each holds a runtime `LLMCaller`.
-_LLM_GENERATOR_IDS: tuple[GeneratorId, ...] = ("c2",)
+_LLM_GENERATOR_IDS: tuple[GeneratorId, ...] = ("c2", "c2b")
 
 # Every generator id config may legitimately name (deterministic ∪ LLM).
 _KNOWN_GENERATOR_IDS: frozenset[GeneratorId] = frozenset(_REGISTRY) | frozenset(
@@ -410,5 +520,8 @@ def enabled_llm_generators(
             reason="LLM generator requested but no caller configured",
         )
         return []
-    builders: dict[GeneratorId, LLMProposingGenerator] = {"c2": C2Generator(caller)}
+    builders: dict[GeneratorId, LLMProposingGenerator] = {
+        "c2": C2Generator(caller),
+        "c2b": C2bGenerator(caller),
+    }
     return [builders[gid] for gid in _LLM_GENERATOR_IDS if gid in wanted]
