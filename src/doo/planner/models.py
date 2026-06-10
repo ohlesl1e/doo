@@ -41,8 +41,8 @@ from doo.ids import (
 # the `source` provenance tag on a committed deterministic TestCase
 # (`deterministic-c1`, ADR-0036). LLM-proposing generators (slice-3 tracer 2,
 # slice 4) commit `source = "llm-planner"` instead.
-GeneratorId = Literal["c1"]
-GENERATOR_IDS: tuple[GeneratorId, ...] = ("c1",)
+GeneratorId = Literal["c1", "c2"]
+GENERATOR_IDS: tuple[GeneratorId, ...] = ("c1", "c2")
 
 # How a generator turns a selected target into a proposal (ADR-0036).
 ProposalMode = Literal["deterministic", "llm"]
@@ -167,6 +167,184 @@ class PlannerProposal(BaseModel):
     confidence_method: Literal["heuristic", "llm-self-reported"] = "heuristic"
     justification: str = Field(min_length=1)
     expected_outcome: str = Field(min_length=1)
+
+    # Authz-replay intent (ADR-0041): references held verbatim from the evidence
+    # observation when this test is an authz replay (e.g. principal A's object id,
+    # kept while the attacker AuthContext is swapped in). Resolved from pack handles
+    # to stable labels by the resolver; empty for non-replay proposals (e.g. C1).
+    # NOT part of the ADR-0007 key_hash — a derivable execution strategy, not
+    # identity. `replay_hazards` lands in the S2b tracer.
+    hold: tuple[str, ...] = ()
+
+    # Object-storage key of the verbatim LLM request/response that produced this
+    # proposal (ADR-0037 replayability). Set only for `mode == "llm"` proposals —
+    # the service persists the audit, stamps the key here, and commits it onto the
+    # node as provenance (CLAUDE.md: provenance on every node). `None` for
+    # deterministic generators (no LLM call to replay).
+    llm_audit_key: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Context pack + LLM draft (ADR-0037, S2a) — the typed planner I/O for the LLM.
+# ---------------------------------------------------------------------------
+
+# What the LLM may classify a C2 authz test as — a constrained subset of TestClass
+# (the authz-relevant classes), so the model cannot wander outside authz.
+C2TestClass = Literal["idor", "bola", "auth-bypass", "privilege-escalation"]
+
+
+class PackTarget(BaseModel):
+    """One holdable/targetable node in a context pack, addressed by `handle`.
+
+    The LLM sees the `handle` (`"T1"`) and the descriptive fields; it never sees a
+    Neo4j id. The resolver reads `endpoint_id` / `parameter_id` off this object to
+    build the concrete-id `PlannerProposal`. `to_llm_dict()` is the id-free
+    projection serialised into the prompt.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    handle: str = Field(min_length=1)
+    kind: Literal["endpoint", "parameter"]
+    method: str
+    path_template: str
+    param_name: str | None = None
+    location: str | None = None
+    semantic: str | None = None
+    # Real ids — for the resolver only; excluded from the LLM-facing projection.
+    endpoint_id: str
+    parameter_id: ParameterId | None = None
+
+    def to_llm_dict(self) -> dict[str, object]:
+        """Id-free projection for the prompt (never leaks raw node ids)."""
+
+        d: dict[str, object] = {
+            "handle": self.handle,
+            "kind": self.kind,
+            "method": self.method,
+            "path_template": self.path_template,
+        }
+        if self.param_name is not None:
+            d["param_name"] = self.param_name
+        if self.location is not None:
+            d["location"] = self.location
+        if self.semantic is not None:
+            d["semantic"] = self.semantic
+        return d
+
+
+class PackAuthContext(BaseModel):
+    """One AuthContext the LLM may pick as the attacker side, by `handle`.
+
+    Carries the real `auth_context_id` for the resolver; `to_llm_dict()` excludes
+    it. `is_attacker_candidate` marks the B side (the principal that did *not*
+    reach the endpoint) for a C2 replay.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    handle: str = Field(min_length=1)
+    principal_label: str
+    tier: str | None = None
+    claims_summary: str | None = None
+    is_attacker_candidate: bool = False
+    auth_context_id: AuthContextId
+
+    def to_llm_dict(self) -> dict[str, object]:
+        d: dict[str, object] = {
+            "handle": self.handle,
+            "principal_label": self.principal_label,
+            "is_attacker_candidate": self.is_attacker_candidate,
+        }
+        if self.tier is not None:
+            d["tier"] = self.tier
+        if self.claims_summary is not None:
+            d["claims_summary"] = self.claims_summary
+        return d
+
+
+class PackExemplar(BaseModel):
+    """A real observed request under the A side, the LLM reasons about replaying.
+
+    Carries only safe, non-secret request shape (concrete path + observed
+    non-secret param names→values). Bodies/tokens never appear (ADR-0015/0037).
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    concrete_path: str
+    observed_params: dict[str, str] = Field(default_factory=dict)
+
+
+class ContextPack(BaseModel):
+    """The typed, bounded projection a candidate hands the LLM (ADR-0037).
+
+    Deterministically assembled (`code_version`-stamped); response bodies are out
+    (hashes/metadata only); targets and auth contexts are addressed by pack-local
+    handles, never raw node ids. `to_llm_payload()` is the id-free dict serialised
+    into the prompt; the resolver uses the typed objects directly to resolve
+    handles back to concrete ids and reject any handle the LLM invents.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    engagement_id: EngagementId
+    candidate_kind: Literal["C2"]
+    candidate_reason: str
+    endpoint_method: str
+    endpoint_path_template: str
+    targets: tuple[PackTarget, ...] = Field(min_length=1)
+    auth_contexts: tuple[PackAuthContext, ...] = Field(min_length=1)
+    exemplar: PackExemplar | None = None
+    code_version: str
+    generated_at: datetime
+
+    def to_llm_payload(self) -> dict[str, object]:
+        """The id-free structure serialised into the user prompt."""
+
+        payload: dict[str, object] = {
+            "candidate_kind": self.candidate_kind,
+            "candidate_reason": self.candidate_reason,
+            "endpoint": {
+                "method": self.endpoint_method,
+                "path_template": self.endpoint_path_template,
+            },
+            "targets": [t.to_llm_dict() for t in self.targets],
+            "auth_contexts": [a.to_llm_dict() for a in self.auth_contexts],
+        }
+        if self.exemplar is not None:
+            payload["exemplar"] = {
+                "concrete_path": self.exemplar.concrete_path,
+                "observed_params": self.exemplar.observed_params,
+            }
+        return payload
+
+    def target_handles(self) -> set[str]:
+        return {t.handle for t in self.targets}
+
+    def auth_handles(self) -> set[str]:
+        return {a.handle for a in self.auth_contexts}
+
+
+class LLMProposalDraft(BaseModel):
+    """The LLM's structured output (ADR-0037): handles + enums, never bytes.
+
+    Produced by a forced tool call whose schema mirrors this model, so parsing is
+    deterministic. The resolver maps `target_ref` / `auth_context_ref` / `hold`
+    handles to concrete ids (rejecting any handle absent from the pack) and builds
+    a `PlannerProposal`. `payload_class` is fixed by the resolver
+    (`auth-token-swap`, `payload_spec = none`) — not the LLM's to choose.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    test_class: C2TestClass
+    target_ref: str = Field(min_length=1)
+    auth_context_ref: str = Field(min_length=1)
+    hold: tuple[str, ...] = ()
+    justification: str = Field(min_length=1)
+    expected_outcome: str = Field(min_length=1)
+    expected_yield: float = Field(ge=0.0, le=1.0)
 
 
 # ---------------------------------------------------------------------------

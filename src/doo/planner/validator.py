@@ -37,7 +37,7 @@ from doo.ids import EngagementId, Sha256Hex
 from doo.infra.neo4j_driver import Neo4jClient
 from doo.observability.logging import get_logger
 from doo.ontology.queries import for_engagement
-from doo.planner.commit import ValidatedTestCase, source_for_generator
+from doo.planner.commit import ValidatedTestCase, source_for
 from doo.planner.models import PayloadSpec, PlannerProposal
 from doo.policy.scope import is_in_scope
 
@@ -211,11 +211,12 @@ def validate(
         payload_class=proposal.payload_class,
         payload_hash=payload_hash,
         auth_context_id=proposal.auth_context_id,
-        source=source_for_generator(proposal.generator),
+        source=source_for(proposal.generator, proposal.mode),
         expected_yield=proposal.expected_yield,
         expected_yield_method=proposal.confidence_method,
         justification=proposal.justification,
         expected_outcome=proposal.expected_outcome,
+        llm_audit_key=proposal.llm_audit_key,
     )
 
 

@@ -45,6 +45,22 @@ def har_body_key(engagement_id: EngagementId, body_sha256: Sha256Hex) -> BlobKey
     )
 
 
+def planner_llm_call_key(
+    engagement_id: EngagementId, request_sha256: Sha256Hex
+) -> BlobKey:
+    """Object key for one persisted planner LLM call (ADR-0037 replayability).
+
+    `engagement/{engagement_id}/planner/llm/{request_sha256}.json`. Content-
+    addressed by the sha256 of the canonical request, so an identical proposal call
+    overwrites identical bytes (idempotent), and the key is derivable both at commit
+    time (to stamp the node) and at replay time (from the stored request).
+    """
+
+    return BlobKey(
+        f"engagement/{engagement_id}/planner/llm/{request_sha256}.json"
+    )
+
+
 def sha256_hex(data: bytes) -> Sha256Hex:
     """Lowercase-hex sha256 of `data` (the blob integrity + idempotency input)."""
 
@@ -151,6 +167,25 @@ class BlobClient:
             size_bytes=len(raw),
             encoding=encoding,
         )
+
+    def put_planner_llm_call(
+        self, engagement_id: EngagementId, *, data: bytes
+    ) -> BlobKey:
+        """Store one verbatim planner LLM request/response JSON; return its key.
+
+        Content-addressed by `sha256(data)` under the planner-LLM key layout
+        (ADR-0037): re-persisting the same call overwrites identical bytes, so the
+        key is stable and re-derivable from the request.
+        """
+
+        key = planner_llm_call_key(engagement_id, sha256_hex(data))
+        self._s3.put_object(
+            Bucket=self._bucket,
+            Key=str(key),
+            Body=data,
+            ContentType="application/json",
+        )
+        return key
 
     def get(self, key: BlobKey) -> bytes:
         """Fetch the bytes at `key`."""

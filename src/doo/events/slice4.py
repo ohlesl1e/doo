@@ -32,6 +32,8 @@ from doo.ids import (
 # discovered-but-never-hit in-scope Endpoint (ADR-0036). No reasoning, no LLM.
 TestClass = Literal[
     "idor",
+    "bola",
+    "privilege-escalation",
     "ssrf",
     "auth-bypass",
     "sql-injection",

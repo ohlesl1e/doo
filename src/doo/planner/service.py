@@ -27,8 +27,12 @@ from doo.planner.commit import commit_testcase
 from doo.planner.generators import (
     PlannerConfig,
     enabled_generators,
+    enabled_llm_generators,
 )
-from doo.planner.models import GeneratorId, ProposedTestCaseView
+from doo.planner.llm import DraftRejected as LLMDraftRejected
+from doo.planner.llm import LLMCaller
+from doo.planner.llm_audit import LLMAuditSink
+from doo.planner.models import GeneratorId, PlannerProposal, ProposedTestCaseView
 from doo.planner.prioritize import prioritize, priority_score
 from doo.planner.review import ReviewLedger
 from doo.planner.validator import DiscardedProposal, should_resurface, validate
@@ -36,17 +40,31 @@ from doo.planner.validator import DiscardedProposal, should_resurface, validate
 log = get_logger(__name__)
 
 # Gap/boundary criticality by provenance source (ADR-0036: tenant > capability >
-# C2b > C2 > C1). The S1 spine ships C1 only; later tracers extend this map.
-_CRITICALITY_BY_SOURCE: dict[str, float] = {"deterministic-c1": 1.0}
+# C2b > C2 > C1). C1 is the lowest tier; the C2 LLM generator commits `llm-planner`
+# and outranks it. Later tracers extend this map.
+_CRITICALITY_BY_SOURCE: dict[str, float] = {
+    "deterministic-c1": 1.0,
+    "llm-planner": 2.0,
+}
 
-# Map a committed node's `source` back to the generator id (for the view).
-_GENERATOR_BY_SOURCE: dict[str, GeneratorId] = {"deterministic-c1": "c1"}
+# Map a committed node's `source` back to the generator id (for the view). The sole
+# LLM-proposing generator today is C2, so `llm-planner` maps to `c2`.
+_GENERATOR_BY_SOURCE: dict[str, GeneratorId] = {
+    "deterministic-c1": "c1",
+    "llm-planner": "c2",
+}
 _DEFAULT_GENERATOR: GeneratorId = "c1"
 
 
 @dataclass(frozen=True, slots=True)
 class ProposeResult:
-    """Outcome of a `propose` run: committed (new + idempotent) and discarded counts."""
+    """Outcome of a `propose` run: committed (new + idempotent) and discarded counts.
+
+    `discarded` collects deterministic Validator discards. The LLM path adds two
+    pre-validator outcomes (ADR-0037): `llm_rejected` — drafts whose handles did not
+    resolve (the hallucination guard) — and `llm_skipped` — gaps with no proposable
+    pack or an unparseable response (reasons). Neither commits.
+    """
 
     candidates: int = 0
     committed: int = 0
@@ -54,6 +72,8 @@ class ProposeResult:
     idempotent: int = 0
     discarded: tuple[DiscardedProposal, ...] = field(default_factory=tuple)
     committed_key_hashes: tuple[TestCaseKeyHash, ...] = field(default_factory=tuple)
+    llm_rejected: tuple[LLMDraftRejected, ...] = field(default_factory=tuple)
+    llm_skipped: tuple[str, ...] = field(default_factory=tuple)
 
 
 def propose(
@@ -61,42 +81,75 @@ def propose(
     *,
     engagement_id: EngagementId,
     config: PlannerConfig | None = None,
+    llm_caller: LLMCaller | None = None,
+    llm_audit_sink: LLMAuditSink | None = None,
     now: datetime | None = None,
 ) -> ProposeResult:
     """Run the enabled generators, validate, and commit proposed `TestCase`s.
 
-    Deterministic for the S1 tracer (C1, no LLM). Each generator selects candidates
-    (shared coverage library), proposes per candidate, the Validator resolves /
-    checks each proposal, and survivors commit idempotently at
-    `review_status = proposed`. Discards are collected for the run audit, never
-    committed (ADR-0040). Re-running on an unchanged graph re-commits the same
-    content as a no-op (ADR-0007).
+    Deterministic generators (C1) select candidates, propose per candidate, the
+    Validator resolves / checks each proposal, and survivors commit idempotently at
+    `review_status = proposed`. LLM-proposing generators (C2) additionally need a
+    `llm_caller` (the model seam) and a `llm_audit_sink` (ADR-0037 replayability):
+    each proposal's verbatim call is persisted and the storage key stamped onto the
+    committed node before validation. A C2 generator requested without a caller is
+    skipped (the default stays LLM-free); with a caller but no sink it is a wiring
+    error (the audit is not optional for an LLM contribution).
+
+    Discards / rejections / skips are collected for the run audit, never committed
+    (ADR-0040). Re-running on an unchanged graph re-commits the same content as a
+    no-op (ADR-0007).
     """
 
     cfg = config or PlannerConfig()
     run_at = now or datetime.now(UTC)
     generators = enabled_generators(cfg)
+    llm_generators = enabled_llm_generators(cfg, caller=llm_caller)
+    if llm_generators and llm_audit_sink is None:
+        raise ValueError(
+            "an LLM-proposing generator is enabled but no llm_audit_sink was "
+            "supplied; the proposing call must be persisted for replay (ADR-0037)"
+        )
 
     candidates_n = committed = created = idempotent = 0
     discarded: list[DiscardedProposal] = []
     committed_hashes: list[TestCaseKeyHash] = []
+    llm_rejected: list[LLMDraftRejected] = []
+    llm_skipped: list[str] = []
+
+    def _commit(proposal: PlannerProposal) -> None:
+        nonlocal committed, created, idempotent
+        outcome = validate(client, proposal)
+        if isinstance(outcome, DiscardedProposal):
+            discarded.append(outcome)
+            return
+        commit = commit_testcase(client, outcome, now=run_at)
+        committed += 1
+        committed_hashes.append(commit.key_hash)
+        if commit.created:
+            created += 1
+        else:
+            idempotent += 1
 
     for generator in generators:
         candidates = generator.generate(client, engagement_id, now=run_at)
         candidates_n += len(candidates)
         for candidate in candidates:
-            proposal = generator.propose(candidate)
-            outcome = validate(client, proposal)
-            if isinstance(outcome, DiscardedProposal):
-                discarded.append(outcome)
-                continue
-            commit = commit_testcase(client, outcome, now=run_at)
-            committed += 1
-            committed_hashes.append(commit.key_hash)
-            if commit.created:
-                created += 1
-            else:
-                idempotent += 1
+            _commit(generator.propose(candidate))
+
+    for llm_generator in llm_generators:
+        run = llm_generator.run(client, engagement_id, now=run_at)
+        candidates_n += run.candidates
+        assert llm_audit_sink is not None  # guarded above when llm_generators present
+        for item in run.proposed:
+            audit_key = llm_audit_sink.record(engagement_id, item.call)
+            _commit(item.proposal.model_copy(update={"llm_audit_key": audit_key}))
+        for rej in run.rejected:
+            # Persist even a rejected call so a hallucination is replayable (ADR-0037).
+            llm_audit_sink.record(engagement_id, rej.call)
+            llm_rejected.append(rej.rejection)
+        for skip in run.skipped:
+            llm_skipped.append(skip.reason)
 
     log.info(
         "planner.propose.complete",
@@ -106,6 +159,8 @@ def propose(
         created=created,
         idempotent=idempotent,
         discarded=len(discarded),
+        llm_rejected=len(llm_rejected),
+        llm_skipped=len(llm_skipped),
     )
     return ProposeResult(
         candidates=candidates_n,
@@ -114,6 +169,8 @@ def propose(
         idempotent=idempotent,
         discarded=tuple(discarded),
         committed_key_hashes=tuple(committed_hashes),
+        llm_rejected=tuple(llm_rejected),
+        llm_skipped=tuple(llm_skipped),
     )
 
 
