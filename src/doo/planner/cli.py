@@ -60,16 +60,26 @@ def _build_client() -> Neo4jClient:
 def _build_llm_deps() -> tuple[LLMCaller, LLMAuditSink]:
     """Build the model caller + audit sink for an LLM-proposing planner run (ADR-0037).
 
-    The caller routes through the org LiteLLM gateway (`DOO_PLANNER_MODEL`, default
-    Claude Opus 4.8); the audit sink persists every proposing call to the same
-    object storage the rest of the CLI uses (the standard `DOO_S3_*` env). Built
-    only when an LLM generator (C2) is actually requested.
+    The model is `DOO_PLANNER_MODEL` (default Claude Opus 4.8). Two routing modes,
+    both via litellm:
+    - **Anthropic direct** — `DOO_PLANNER_MODEL=anthropic/claude-sonnet-4-6` with
+      `ANTHROPIC_API_KEY` in the environment.
+    - **Provider URL + key** (LiteLLM/OpenAI-compatible gateway, local proxy) —
+      set `DOO_PLANNER_API_BASE` (+ `DOO_PLANNER_API_KEY`) and an `openai/<name>` id.
+    `DOO_PLANNER_API_BASE` / `DOO_PLANNER_API_KEY` are optional overrides; unset, litellm
+    resolves credentials from its provider env vars. The audit sink persists every
+    proposing call to the same object storage as the rest of the CLI (`DOO_S3_*`).
+    Built only when an LLM generator (C2) is actually requested.
     """
 
     from doo.infra.blobs import BlobClient
 
     model = os.environ.get("DOO_PLANNER_MODEL", "claude-opus-4-8")
-    caller = LiteLLMCaller(model)
+    caller = LiteLLMCaller(
+        model,
+        api_base=os.environ.get("DOO_PLANNER_API_BASE") or None,
+        api_key=os.environ.get("DOO_PLANNER_API_KEY") or None,
+    )
     blobs = BlobClient.from_config(
         endpoint_url=os.environ.get("DOO_S3_ENDPOINT", "http://localhost:9000"),
         access_key=os.environ.get("DOO_S3_ACCESS_KEY", "minioadmin"),

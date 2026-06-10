@@ -38,7 +38,7 @@ log = get_logger(__name__)
 
 # Prompt/algorithm version stamped on every proposal's provenance (ADR-0005); bump
 # when the prompt or tool schema changes so stale proposals are identifiable.
-PROMPT_VERSION = "planner-c2/1"
+PROMPT_VERSION = "planner-c2/2"
 
 SYSTEM_PROMPT = (
     "You are a black-box web application security tester proposing ONE "
@@ -50,11 +50,17 @@ SYSTEM_PROMPT = (
     "context by their HANDLES (e.g. 'T1', 'A2') and classify the test.\n"
     "- Only use handles that appear in the pack. Never invent a handle or id.\n"
     "- The test is an authorization replay: the request to the endpoint is replayed "
-    "under a different (attacker) auth context while the resource the request "
-    "identifies is held constant. Put the references that must be HELD verbatim "
-    "(the victim's object/owner id) in `hold`, as handles.\n"
-    "- Choose `auth_context_ref` = the attacker side (the principal that did NOT "
-    "reach the endpoint; marked is_attacker_candidate).\n"
+    "under a different (attacker) auth context while the resource it identifies is "
+    "held constant.\n"
+    "- `hold` lists the TARGET handle(s) — the 'T...' handles from `targets` — whose "
+    "object identity must stay fixed during the replay (the target whose id encodes "
+    "the victim's resource). `hold` entries are ALWAYS target handles ('T1', 'T2', "
+    "...). A `hold` entry is NEVER an auth-context handle ('A1'/'A2'), NEVER a "
+    "principal label or id, and NEVER free text. The attacker principal belongs in "
+    "`auth_context_ref`, never in `hold`. For a single-target pack, `hold` is "
+    "normally just that one target handle (e.g. ['T1']).\n"
+    "- Choose `auth_context_ref` = the attacker side: the AUTH-CONTEXT handle ('A...') "
+    "of the principal that did NOT reach the endpoint (marked is_attacker_candidate).\n"
     "- Respond by calling the `propose_test` tool exactly once."
 )
 
@@ -76,16 +82,24 @@ PROPOSE_TOOL: dict[str, Any] = {
                 },
                 "target_ref": {
                     "type": "string",
-                    "description": "Handle of the target (a pack target, e.g. 'T1').",
+                    "description": "TARGET handle from `targets` (a 'T...' handle, e.g. 'T1').",
                 },
                 "auth_context_ref": {
                     "type": "string",
-                    "description": "Handle of the attacker auth context (e.g. 'A2').",
+                    "description": (
+                        "AUTH-CONTEXT handle of the attacker (an 'A...' handle, e.g. "
+                        "'A2'; the one marked is_attacker_candidate)."
+                    ),
                 },
                 "hold": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Handles of references held verbatim (victim's ids).",
+                    "description": (
+                        "TARGET handle(s) ('T...') whose object identity is held "
+                        "constant during the replay. Each entry MUST be a target handle "
+                        "from `targets` (e.g. 'T1') — never an auth handle ('A...'), "
+                        "never a principal label/id, never free text."
+                    ),
                 },
                 "justification": {
                     "type": "string",
@@ -169,22 +183,41 @@ class FakeLLMCaller:
 
 
 class LiteLLMCaller:
-    """The real caller — forced tool-use via the org LiteLLM gateway (ADR-0037).
+    """The real caller — forced tool-use via litellm (ADR-0037).
+
+    `litellm` routes by the `model` id: a provider-prefixed id reaches that provider
+    directly (`anthropic/claude-sonnet-4-6` + `ANTHROPIC_API_KEY`), while an
+    OpenAI-compatible gateway / local LiteLLM proxy is reached with an `openai/<name>`
+    id plus `api_base` (the org-standard path). `api_base` / `api_key` are optional
+    overrides; when unset, litellm resolves credentials from its provider env vars.
 
     `litellm` is imported lazily so the module imports without the dependency; only
-    constructing/using this caller requires it. The provider/model come from the
-    engagement `LLMConfig`.
+    constructing/using this caller requires it.
     """
 
-    def __init__(self, model: str, *, temperature: float = 0.0) -> None:
+    def __init__(
+        self,
+        model: str,
+        *,
+        temperature: float = 0.0,
+        api_base: str | None = None,
+        api_key: str | None = None,
+    ) -> None:
         self._model = model
         self._temperature = temperature
+        self._api_base = api_base
+        self._api_key = api_key
 
     def propose(self, pack: ContextPack) -> LLMCallResult:
-        import litellm  # type: ignore[import-not-found]  # lazy production-only dep
+        # lazy production-only dep; ignore covers both "litellm absent" (CI) and
+        # "litellm present" (the unused-ignore that would otherwise fire locally).
+        import litellm  # type: ignore[import-not-found, unused-ignore]
 
         system = SYSTEM_PROMPT
         user = build_user_prompt(pack)
+        # `request` is persisted verbatim to object storage (replay audit), so it
+        # must stay secret-free: `api_base` (a URL) is safe and useful to record,
+        # but `api_key` is passed to litellm out-of-band and NEVER persisted.
         request: dict[str, Any] = {
             "model": self._model,
             "temperature": self._temperature,
@@ -195,7 +228,12 @@ class LiteLLMCaller:
             "tools": [PROPOSE_TOOL],
             "tool_choice": {"type": "function", "function": {"name": "propose_test"}},
         }
-        completion = litellm.completion(**request)
+        if self._api_base is not None:
+            request["api_base"] = self._api_base
+        call_kwargs = dict(request)
+        if self._api_key is not None:
+            call_kwargs["api_key"] = self._api_key  # out-of-band; not in `request`
+        completion = litellm.completion(**call_kwargs)
         response = completion.model_dump() if hasattr(completion, "model_dump") else dict(completion)
         draft = _parse_tool_call(response)
         return LLMCallResult(draft=draft, request=request, response=response)
