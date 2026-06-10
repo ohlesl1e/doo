@@ -29,6 +29,7 @@ import binascii
 import json
 import re
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import UTC, datetime
 from email.parser import BytesParser
 from email.policy import default as default_email_policy
@@ -291,9 +292,16 @@ def _parse_entry(
         )
         # #16 leak-to-input: request-parameter values as `input`-role candidates
         # (query keys + body leaves), hashed via the same canonicalisation.
+        # ADR-0041: replay-hazard-shaped request HEADERS (e.g. `X-CSRF-Token`) are
+        # also surfaced as header-borne `input` candidates so the planner's
+        # deterministic replay-hazard detector can flag a naive-replay false negative.
         input_candidates = tuple(
             _to_value_candidate(o)
-            for o in (*_query_input_candidates(query_params), *body_input_candidates)
+            for o in (
+                *_query_input_candidates(query_params),
+                *body_input_candidates,
+                *_request_header_hazard_candidates(request),
+            )
         )
         value_candidates = (*output_candidates, *input_candidates)
         # ADR-0030: the claim-tagged identities the response asserts about the actor
@@ -928,6 +936,69 @@ def _query_input_candidates(
                     param.name, param.value, extractor=_QUERY_INPUT_EXTRACTOR
                 )
             )
+    return out
+
+
+_HEADER_INPUT_EXTRACTOR = "request-header:hazard_v1"
+
+# Request headers that carry a replay-breaker (ADR-0041). Deliberately a narrow
+# allowlist (lowercased): surfacing *every* request header as a value candidate
+# would flood the graph with transport noise (`Accept`, `User-Agent`, ...), so the
+# extraction layer emits a header-borne `input` candidate ONLY for headers whose
+# name conventionally carries a session-bound replay-breaker. `Authorization` /
+# `Cookie` are deliberately excluded — they are the credential itself (the auth swap
+# replaces them), not a replay-breaker the test must refresh.
+_HAZARD_REQUEST_HEADER_RE = re.compile(
+    r"\A("
+    r"x-?csrf-?token|x-?xsrf-?token|csrf-?token|xsrf-?token"  # CSRF/XSRF token headers
+    r"|x-?nonce|nonce"  # nonces
+    r"|x-?signature|x-?hmac|signature"  # request signatures / MACs
+    r"|x-?timestamp|x-?request-timestamp|x-?amz-date|x-?date"  # request timestamps
+    r")\Z",
+    re.IGNORECASE,
+)
+
+
+def _request_header_hazard_candidates(
+    request: dict[str, object],
+) -> list[CandidateOccurrence]:
+    """`input`-role, header-borne candidates for replay-breaker request headers (ADR-0041).
+
+    Only headers whose name matches the narrow `_HAZARD_REQUEST_HEADER_RE` allowlist
+    are surfaced (CSRF/XSRF tokens, nonces, signatures, request timestamps) — so an
+    `X-CSRF-Token` header lands as a `section="header"`, `role="input"` candidate the
+    planner's deterministic replay-hazard detector can flag. Ordinary headers
+    (`Accept`, `User-Agent`, `Authorization`, `Cookie`) are NOT surfaced (transport
+    noise / the credential itself). Secret-shaping is applied by
+    `extract_input_candidate`; the value is re-homed onto the header section here.
+    """
+
+    out: list[CandidateOccurrence] = []
+    raw = request.get("headers")
+    if not isinstance(raw, list):
+        return out
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        value = item.get("value")
+        if not isinstance(name, str) or not isinstance(value, str) or not value:
+            continue
+        if not _HAZARD_REQUEST_HEADER_RE.match(name.strip()):
+            continue
+        key = name.lower()
+        if key in seen:  # de-dup repeated headers (last-wins is irrelevant for names)
+            continue
+        seen.add(key)
+        occ = extract_input_candidate(
+            name, value, extractor=_HEADER_INPUT_EXTRACTOR
+        )
+        # Re-home the (body-defaulted) input occurrence onto the header section so
+        # the ValueCandidate carries `section="header"` + `header_name` (the detector
+        # reads `header_name` for header-borne fields). `parameter_name` stays set
+        # (the model requires it for input role) and equals the header name.
+        out.append(replace(occ, section="header", header_name=name))
     return out
 
 
