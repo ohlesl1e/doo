@@ -47,8 +47,9 @@ from doo.ontology.resolve import cross_cutting
 _TENANT_SOURCE = "deterministic-tenant"
 
 # `code_version` for the tenant inference algorithm (ADR-0005). Bumped when the
-# detection heuristic changes so stale inferences are identifiable.
-_TENANT_CODE_VERSION = "tenant-inference/1"
+# detection heuristic changes so stale inferences are identifiable. /2 adds the
+# collection-literal signal (issue #61) alongside the placeholder-name signal.
+_TENANT_CODE_VERSION = "tenant-inference/2"
 
 # Tenant-shaped path-segment placeholders, mapped to the `Tenant.kind` they
 # evidence. The segment name (templating's `{<base>_id}` convention, e.g.
