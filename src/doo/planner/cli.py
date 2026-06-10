@@ -4,8 +4,9 @@ Mirrors `doo coverage`: a thin consumer that parses args, builds a Neo4j client 
 the review ledger, calls into the planner service, and renders (table by default,
 `--json` for the typed models). Two commands:
 
-- `doo planner propose` — run the deterministic generators, validate, and commit
-  `proposed` `TestCase`s. For the S1 tracer this is pure C1 (no LLM).
+- `doo planner propose` — run the enabled generators, validate, and commit
+  `proposed` `TestCase`s. Deterministic C1 needs no extra deps; the LLM-proposing
+  C2 generator (default-on) additionally builds a model caller + audit sink.
 - `doo planner review` — show the deterministically-prioritised review queue and
   approve / reject a proposal. **Nothing is dispatched** (slice 3 is review-only).
 
@@ -24,7 +25,9 @@ import typer
 
 from doo.ids import EngagementId, TestCaseKeyHash
 from doo.infra.neo4j_driver import Neo4jClient
-from doo.planner.generators import PlannerConfig
+from doo.planner.generators import PlannerConfig, requested_llm_generator_ids
+from doo.planner.llm import LiteLLMCaller, LLMCaller
+from doo.planner.llm_audit import BlobLLMAuditSink, LLMAuditSink
 from doo.planner.models import ProposedTestCaseView
 from doo.planner.review import (
     JsonFileReviewLedger,
@@ -52,6 +55,28 @@ def _build_client() -> Neo4jClient:
         os.environ.get("DOO_NEO4J_USER", "neo4j"),
         os.environ.get("DOO_NEO4J_PASSWORD", "password"),
     )
+
+
+def _build_llm_deps() -> tuple[LLMCaller, LLMAuditSink]:
+    """Build the model caller + audit sink for an LLM-proposing planner run (ADR-0037).
+
+    The caller routes through the org LiteLLM gateway (`DOO_PLANNER_MODEL`, default
+    Claude Opus 4.8); the audit sink persists every proposing call to the same
+    object storage the rest of the CLI uses (the standard `DOO_S3_*` env). Built
+    only when an LLM generator (C2) is actually requested.
+    """
+
+    from doo.infra.blobs import BlobClient
+
+    model = os.environ.get("DOO_PLANNER_MODEL", "claude-opus-4-8")
+    caller = LiteLLMCaller(model)
+    blobs = BlobClient.from_config(
+        endpoint_url=os.environ.get("DOO_S3_ENDPOINT", "http://localhost:9000"),
+        access_key=os.environ.get("DOO_S3_ACCESS_KEY", "minioadmin"),
+        secret_key=os.environ.get("DOO_S3_SECRET_KEY", "minioadmin"),
+        bucket=os.environ.get("DOO_S3_BUCKET", "doo-blobs"),
+    )
+    return caller, BlobLLMAuditSink(blobs)
 
 
 def _default_ledger() -> JsonFileReviewLedger:
@@ -96,9 +121,22 @@ def propose_cmd(
         if generators
         else PlannerConfig()
     )
+    # Build the model caller + audit sink only when an LLM generator (C2) is in the
+    # requested set; a deterministic-only run stays free of model / object-storage deps.
+    llm_caller: LLMCaller | None = None
+    llm_audit_sink: LLMAuditSink | None = None
+    if requested_llm_generator_ids(config):
+        llm_caller, llm_audit_sink = _build_llm_deps()
+
     client = _build_client()
     try:
-        result = propose(client, engagement_id=EngagementId(engagement), config=config)
+        result = propose(
+            client,
+            engagement_id=EngagementId(engagement),
+            config=config,
+            llm_caller=llm_caller,
+            llm_audit_sink=llm_audit_sink,
+        )
     finally:
         client.close()
 
@@ -113,6 +151,11 @@ def propose_cmd(
                     "discarded": [
                         {"code": d.code, "reason": d.reason} for d in result.discarded
                     ],
+                    "llm_rejected": [
+                        {"code": r.code, "reason": r.reason}
+                        for r in result.llm_rejected
+                    ],
+                    "llm_skipped": list(result.llm_skipped),
                 },
                 indent=2,
             )
@@ -121,10 +164,15 @@ def propose_cmd(
     typer.echo(
         f"planner propose: {result.candidates} candidate(s) -> "
         f"{result.committed} committed ({result.created} new, "
-        f"{result.idempotent} idempotent), {len(result.discarded)} discarded."
+        f"{result.idempotent} idempotent), {len(result.discarded)} discarded, "
+        f"{len(result.llm_rejected)} llm-rejected, {len(result.llm_skipped)} skipped."
     )
     for d in result.discarded:
         typer.echo(f"  discarded [{d.code}]: {d.reason}")
+    for r in result.llm_rejected:
+        typer.echo(f"  llm-rejected [{r.code}]: {r.reason}")
+    for reason in result.llm_skipped:
+        typer.echo(f"  skipped: {reason}")
 
 
 def _render_queue(rows: list[ProposedTestCaseView]) -> None:

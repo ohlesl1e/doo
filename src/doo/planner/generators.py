@@ -13,19 +13,29 @@ setting fully deterministic (ADR-0036). The registry resolves the enabled set.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict
 
+from doo import __version__
 from doo.canonical.identity import (
     auth_context_id,
     compute_anonymous_auth_hash,
 )
-from doo.coverage.queries import run_c1
+from doo.coverage.queries import _load_principals, run_c1, run_c2
 from doo.ids import EngagementId
 from doo.infra.neo4j_driver import Neo4jClient
 from doo.observability.logging import get_logger
+from doo.planner.assemble import assemble_c2_pack
+from doo.planner.llm import (
+    DraftRejected,
+    LLMCaller,
+    LLMCallResult,
+    LLMProposalError,
+    resolve_draft,
+)
 from doo.planner.models import (
     GENERATOR_IDS,
     Candidate,
@@ -40,6 +50,10 @@ log = get_logger(__name__)
 # Gap/boundary criticality tiers (ADR-0036). C1 is the lowest. Higher tiers
 # (C2 < C2b < capability < tenant) land with their generators in later tracers.
 _C1_CRITICALITY = 1.0
+# C2 (presence-differential authz) outranks C1's mechanical dead-endpoint probe
+# (ADR-0036: tenant > capability > C2b > C2 > C1). Surfaced here so the prioritiser
+# and the review view agree on the tier (see service `_CRITICALITY_BY_SOURCE`).
+_C2_CRITICALITY = 2.0
 
 
 @runtime_checkable
@@ -147,6 +161,166 @@ class C1Generator:
         )
 
 
+# ---------------------------------------------------------------------------
+# LLM-proposing generators (ADR-0037). A different shape from the deterministic
+# `CandidateGenerator`: gap selection, pack assembly, the (single) LLM call, and
+# handle resolution are one encapsulated pipeline so the LLM seam stays contained
+# and the service never touches a model. The service validates + commits whatever
+# proposals come back, and persists every call (committed or not).
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class LLMProposed:
+    """One resolved LLM proposal plus the verbatim call that produced it (audit)."""
+
+    proposal: PlannerProposal
+    call: LLMCallResult
+
+
+@dataclass(frozen=True, slots=True)
+class LLMRejected:
+    """A draft whose handles did not resolve (hallucination guard) + its call."""
+
+    rejection: DraftRejected
+    call: LLMCallResult
+
+
+@dataclass(frozen=True, slots=True)
+class LLMSkipped:
+    """A gap that produced no proposal *before* a resolvable draft existed.
+
+    Either the pack was unproposable (no attacker AuthContext) or the model's
+    response was unparseable. No `LLMCallResult` to commit; recorded for the run
+    audit so a skipped gap is visible, never silently dropped.
+    """
+
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class LLMRunResult:
+    """The outcome of one LLM generator pass over its candidate gaps."""
+
+    candidates: int
+    proposed: tuple[LLMProposed, ...]
+    rejected: tuple[LLMRejected, ...]
+    skipped: tuple[LLMSkipped, ...]
+
+
+@runtime_checkable
+class LLMProposingGenerator(Protocol):
+    """An LLM-proposing generator (ADR-0037): gaps -> packs -> proposals.
+
+    Distinct from the deterministic `CandidateGenerator` because the candidate ->
+    proposal step is a model call over an assembled context pack, with rejection /
+    skip outcomes a deterministic `propose(candidate)` does not have. `run` does the
+    whole pass; the service validates and commits the survivors.
+    """
+
+    @property
+    def generator_id(self) -> GeneratorId: ...
+
+    @property
+    def mode(self) -> ProposalMode: ...
+
+    def run(
+        self,
+        client: Neo4jClient,
+        engagement_id: EngagementId,
+        *,
+        now: datetime | None = None,
+    ) -> LLMRunResult: ...
+
+
+class C2Generator:
+    """LLM-proposing generator for presence-differential authz gaps (ADR-0037).
+
+    Selection reuses the shared coverage library's `run_c2` (ADR-0033/0034) — the
+    same gaps `doo coverage c2` surfaces, so planner and coverage never disagree.
+    Each gap is deterministically assembled into a bounded, id-free `ContextPack`
+    (`assemble.py`); the LLM proposes ONE authz replay by selecting handles and
+    classifying (`llm.py`); the deterministic resolver maps the handles back to
+    concrete ids and rejects any hallucinated handle. A gap with no resolvable
+    attacker AuthContext is skipped before any model call.
+    """
+
+    generator_id: GeneratorId = "c2"
+    mode: ProposalMode = "llm"
+
+    def __init__(self, caller: LLMCaller) -> None:
+        self._caller = caller
+
+    def run(
+        self,
+        client: Neo4jClient,
+        engagement_id: EngagementId,
+        *,
+        now: datetime | None = None,
+    ) -> LLMRunResult:
+        run_at = now or datetime.now(UTC)
+        gaps = run_c2(client, engagement_id, now=run_at)
+        principal_ids = {
+            pv.label: pv.principal_id
+            for pv in _load_principals(client, engagement_id)
+        }
+
+        proposed: list[LLMProposed] = []
+        rejected: list[LLMRejected] = []
+        skipped: list[LLMSkipped] = []
+
+        for gap in gaps:
+            pack = assemble_c2_pack(
+                client,
+                gap=gap,
+                principal_ids=principal_ids,
+                code_version=__version__,
+                now=run_at,
+            )
+            if pack is None:
+                skipped.append(
+                    LLMSkipped(
+                        reason=(
+                            f"unproposable C2 gap {gap.method} {gap.host}"
+                            f"{gap.path_template}: no resolvable attacker AuthContext"
+                        )
+                    )
+                )
+                continue
+            try:
+                call = self._caller.propose(pack)
+            except LLMProposalError as exc:
+                skipped.append(
+                    LLMSkipped(
+                        reason=(
+                            f"LLM proposal unparseable for endpoint "
+                            f"{gap.endpoint_id}: {exc}"
+                        )
+                    )
+                )
+                continue
+            outcome = resolve_draft(pack, call.draft)
+            if isinstance(outcome, DraftRejected):
+                rejected.append(LLMRejected(rejection=outcome, call=call))
+                continue
+            proposed.append(LLMProposed(proposal=outcome, call=call))
+
+        log.info(
+            "planner.generator.c2.complete",
+            engagement_id=engagement_id,
+            candidates=len(gaps),
+            proposed=len(proposed),
+            rejected=len(rejected),
+            skipped=len(skipped),
+        )
+        return LLMRunResult(
+            candidates=len(gaps),
+            proposed=tuple(proposed),
+            rejected=tuple(rejected),
+            skipped=tuple(skipped),
+        )
+
+
 class PlannerConfig(BaseModel):
     """Deterministic planner configuration (ADR-0036).
 
@@ -162,27 +336,79 @@ class PlannerConfig(BaseModel):
     llm_ranking: bool = False
 
 
-# The full registry of available generators, keyed by id. New generators (C2/C2b/
-# C3/C4/sink_params) register here in later tracers without touching the spine.
+# The registry of deterministic-proposing generators, keyed by id. New
+# deterministic generators register here; LLM-proposing ones are constructed per
+# run (they hold a model caller) and live in `_LLM_GENERATOR_IDS`.
 _REGISTRY: dict[GeneratorId, CandidateGenerator] = {
     "c1": C1Generator(),
 }
 
+# LLM-proposing generator ids (ADR-0037). Known to config validation, but built by
+# the service (not the singleton registry) because each holds a runtime `LLMCaller`.
+_LLM_GENERATOR_IDS: tuple[GeneratorId, ...] = ("c2",)
 
-def enabled_generators(config: PlannerConfig) -> list[CandidateGenerator]:
-    """Resolve the enabled generators from config (ADR-0036).
+# Every generator id config may legitimately name (deterministic ∪ LLM).
+_KNOWN_GENERATOR_IDS: frozenset[GeneratorId] = frozenset(_REGISTRY) | frozenset(
+    _LLM_GENERATOR_IDS
+)
 
-    An empty `candidate_generators` enables every registered generator (the
-    default); otherwise only the named ids run, in registry order so the candidate
-    set is deterministic. Unknown ids raise — a config typo is loud, not silent.
-    """
+
+def _requested_ids(config: PlannerConfig) -> tuple[GeneratorId, ...]:
+    """The requested generator ids, validated against the known set (loud on typo)."""
 
     requested = config.candidate_generators or GENERATOR_IDS
-    unknown = [gid for gid in requested if gid not in _REGISTRY]
+    unknown = [gid for gid in requested if gid not in _KNOWN_GENERATOR_IDS]
     if unknown:
         raise ValueError(
             f"unknown candidate generator(s) in config: {unknown!r}; "
-            f"known: {sorted(_REGISTRY)}"
+            f"known: {sorted(_KNOWN_GENERATOR_IDS)}"
         )
-    wanted = set(requested)
+    return requested
+
+
+def requested_llm_generator_ids(config: PlannerConfig) -> tuple[GeneratorId, ...]:
+    """The LLM-proposing generator ids this config requests (for CLI dep wiring).
+
+    Empty when the run is purely deterministic — the CLI uses this to decide whether
+    to build a model caller + audit sink at all.
+    """
+
+    return tuple(gid for gid in _requested_ids(config) if gid in _LLM_GENERATOR_IDS)
+
+
+def enabled_generators(config: PlannerConfig) -> list[CandidateGenerator]:
+    """Resolve the enabled *deterministic* generators from config (ADR-0036).
+
+    An empty `candidate_generators` enables every generator (the default);
+    otherwise only the named ids run, in registry order so the candidate set is
+    deterministic. LLM-proposing ids (`c2`) are valid but resolved separately by
+    `enabled_llm_generators` (they need a model caller); unknown ids raise.
+    """
+
+    wanted = set(_requested_ids(config))
     return [gen for gid, gen in _REGISTRY.items() if gid in wanted]
+
+
+def enabled_llm_generators(
+    config: PlannerConfig, *, caller: LLMCaller | None
+) -> list[LLMProposingGenerator]:
+    """Resolve the enabled LLM-proposing generators, constructed with `caller`.
+
+    Returns empty when no LLM generator is requested. When one *is* requested but no
+    `caller` is wired (the default deterministic path), the generator is skipped with
+    a warning rather than an error — so a default `propose` stays LLM-free until the
+    caller (and audit sink) are supplied.
+    """
+
+    wanted = set(_requested_ids(config)) & set(_LLM_GENERATOR_IDS)
+    if not wanted:
+        return []
+    if caller is None:
+        log.warning(
+            "planner.llm_generators.skipped_no_caller",
+            requested=sorted(wanted),
+            reason="LLM generator requested but no caller configured",
+        )
+        return []
+    builders: dict[GeneratorId, LLMProposingGenerator] = {"c2": C2Generator(caller)}
+    return [builders[gid] for gid in _LLM_GENERATOR_IDS if gid in wanted]

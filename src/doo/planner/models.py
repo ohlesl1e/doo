@@ -176,6 +176,13 @@ class PlannerProposal(BaseModel):
     # identity. `replay_hazards` lands in the S2b tracer.
     hold: tuple[str, ...] = ()
 
+    # Object-storage key of the verbatim LLM request/response that produced this
+    # proposal (ADR-0037 replayability). Set only for `mode == "llm"` proposals —
+    # the service persists the audit, stamps the key here, and commits it onto the
+    # node as provenance (CLAUDE.md: provenance on every node). `None` for
+    # deterministic generators (no LLM call to replay).
+    llm_audit_key: str | None = None
+
 
 # ---------------------------------------------------------------------------
 # Context pack + LLM draft (ADR-0037, S2a) — the typed planner I/O for the LLM.

@@ -45,6 +45,11 @@ VALIDATED_CONFIDENCE = 0.99
 # commit `deterministic-<gen>`; LLM-proposing ones commit `llm-planner`.
 _SOURCE_BY_GENERATOR = {"c1": "deterministic-c1"}
 
+# The single provenance tag every LLM-proposing generator commits (ADR-0036): the
+# proposing *mode*, not the generator id, is what distinguishes an LLM contribution
+# from a deterministic one (CLAUDE.md: `source: "llm-<task>"`).
+LLM_PLANNER_SOURCE = "llm-planner"
+
 
 @dataclass(frozen=True, slots=True)
 class ValidatedTestCase:
@@ -68,6 +73,9 @@ class ValidatedTestCase:
     expected_yield_method: str
     justification: str
     expected_outcome: str
+    # Object-storage key of the proposing LLM call (ADR-0037), or None for a
+    # deterministic proposal. Committed onto the node as replay provenance.
+    llm_audit_key: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,6 +158,7 @@ def commit_testcase(
             t.expected_outcome = $expected_outcome,
             t.source = $source,
             t.source_id = $source_id,
+            t.llm_audit_key = $llm_audit_key,
             t.confidence = $confidence,
             t.confidence_method = 'heuristic',
             t.first_seen = $now,
@@ -184,6 +193,7 @@ def commit_testcase(
         expected_outcome=vtc.expected_outcome,
         source=vtc.source,
         source_id=None,
+        llm_audit_key=vtc.llm_audit_key,
         confidence=VALIDATED_CONFIDENCE,
         now=run_at,
         code_version=__version__,
@@ -210,6 +220,19 @@ def source_for_generator(generator: str) -> str:
     """The provenance `source` tag for a deterministic generator (ADR-0036)."""
 
     return _SOURCE_BY_GENERATOR.get(generator, f"deterministic-{generator}")
+
+
+def source_for(generator: str, mode: str) -> str:
+    """The provenance `source` tag for a proposal, keyed on its proposing *mode*.
+
+    An LLM-proposing proposal (`mode == "llm"`) commits `llm-planner` regardless of
+    which generator produced it (ADR-0036 / CLAUDE.md); a deterministic one commits
+    `deterministic-<generator>`.
+    """
+
+    if mode == "llm":
+        return LLM_PLANNER_SOURCE
+    return source_for_generator(generator)
 
 
 @dataclass(frozen=True, slots=True)

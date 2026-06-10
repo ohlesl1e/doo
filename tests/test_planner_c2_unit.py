@@ -10,6 +10,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from doo.ids import AuthContextId, EngagementId
+from doo.planner.assemble import _summarise_claims
 from doo.planner.llm import DraftRejected, FakeLLMCaller, resolve_draft
 from doo.planner.models import (
     ContextPack,
@@ -111,3 +112,14 @@ def test_fake_caller_round_trips_draft_through_pack() -> None:
     assert "ac-admin" not in result.request["user"]
     assert "ep-orders" not in result.request["user"]
     assert "T1" in result.request["user"] and "A2" in result.request["user"]
+
+
+def test_summarise_claims_is_names_only_never_values() -> None:
+    # claim NAMES orient the LLM; values (potential PII/secrets) never appear.
+    summary = _summarise_claims('{"sub": "u-42", "role": "admin", "org_id": "9"}')
+    assert summary == "claims: org_id, role, sub"  # sorted names, no values
+    assert "u-42" not in summary and "admin" not in summary
+    # No claims / unparseable / empty -> no summary.
+    assert _summarise_claims(None) is None
+    assert _summarise_claims("{}") is None
+    assert _summarise_claims("not json") is None
