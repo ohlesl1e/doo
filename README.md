@@ -6,9 +6,13 @@ doo ingests passive testing data (Burp traffic, HAR files, recon output), builds
 
 ## Status
 
-**Slice 1 complete** — the full HAR → graph pipeline. Drop in a HAR file and get an engagement-isolated Neo4j graph of the target: canonicalised hosts, templated endpoints, aggregated parameters, declared/discovered/anonymous principals, request/response bodies in object storage, and promoted values (`ObservedValue`) — with provenance on every node and secrets hashed at the L2 boundary. CI (lint + types + the full testcontainer suite) is in place.
+**Slices 1–3 complete.**
 
-See [**Running doo**](#running-doo) below to run it.
+- **Slice 1 — ingestion + graph.** Drop in a HAR file and get an engagement-isolated Neo4j graph of the target: canonicalised hosts, templated endpoints, aggregated parameters, declared/discovered/anonymous principals, request/response bodies in object storage, and promoted values (`ObservedValue`) — provenance on every node, secrets hashed at the L2 boundary.
+- **Slice 2 — coverage analysis.** Deterministic, read-only queries over the graph (`doo coverage`): C1 dead endpoints, C2/C2b presence- and content-differential authz gaps, C3 leak-to-input pivots, C4 capability-tier gaps. Surfaces gaps at query time; writes nothing back.
+- **Slice 3 — the Planner (the first LLM).** `doo planner propose` turns coverage gaps into typed test **proposals** and `doo planner review` is the deterministically-prioritised human review queue. Deterministic candidate generators select targets (C1–C4, capability/tenant `TrustBoundary`s, and sink-shaped params); for gaps that need reasoning an LLM proposes a structured `TestCase` (enums + handle references, **never request bytes**); a deterministic Validator resolves/scopes/dedups it; survivors commit as content-addressed `TestCase`s at `review_status = proposed`. **Nothing is dispatched** — approved tests wait for slice 4.
+
+CI (lint + types + the full testcontainer suite) is in place. See [**Running doo**](#running-doo) below to run it.
 
 ## Design principles
 
@@ -35,10 +39,10 @@ Full breakdown in [`ARCHITECTURE.md`](ARCHITECTURE.md). Graph schema in [`ONTOLO
 
 Build vertically through one slice before broadening:
 
-1. **Ingestion + graph** — Burp/HAR → Neo4j, queryable.
-2. **Coverage analysis** — deterministic queries over the graph (~60% of the value, ~10% of the risk).
-3. **LLM-assisted hypothesis generation** — human approves before dispatch.
-4. **Bounded agent execution** — only after 1–3 are solid.
+1. ✅ **Ingestion + graph** — Burp/HAR → Neo4j, queryable.
+2. ✅ **Coverage analysis** — deterministic queries over the graph (~60% of the value, ~10% of the risk).
+3. ✅ **LLM-assisted hypothesis generation** — the Planner proposes, a deterministic Validator checks, a human approves; nothing dispatched.
+4. ⬅ **Bounded agent execution** — next; only after 1–3 are solid.
 
 ## Repository layout
 
@@ -121,6 +125,33 @@ MATCH (:RequestObservation)-[:YIELDED_VALUE]->(v:ObservedValue) RETURN v.kind, v
 
 Request/response bodies live in MinIO; the graph holds `BlobRef`s.
 
+### Analyze coverage + plan tests (slices 2–3)
+
+```sh
+# Coverage: deterministic gaps over the graph (read-only).
+.venv/bin/doo coverage c2 --engagement acme-test        # presence-differential authz gaps
+.venv/bin/doo coverage c4 --engagement acme-test        # capability-tier gaps  (also: c1, c2b, c3)
+
+# Planner: turn gaps into proposed TestCases (deterministic C1 needs no LLM; the
+# LLM generators need a model — see "Planner LLM config" below).
+.venv/bin/doo planner propose --engagement acme-test                    # all enabled generators
+.venv/bin/doo planner propose --engagement acme-test -g c1              # one generator (C1 = no LLM)
+.venv/bin/doo planner review  --engagement acme-test                    # prioritised review queue
+.venv/bin/doo planner review  --engagement acme-test --approve <key> --actor you
+```
+
+`propose` selects targets deterministically, has the LLM propose a structured `TestCase` for gaps that need reasoning (the Validator rejects any hallucinated handle / out-of-scope target), and commits survivors at `review_status = proposed`. `review` is the deterministically-prioritised queue; approve/reject is recorded in a provenanced audit ledger. **Nothing is dispatched** — `approved` means "cleared for consideration," not "authorized to send" (slice 4).
+
+**Planner LLM config** (only for the LLM generators; C1 is deterministic). The model is reached through litellm and is **config, not code** — set in `.env`:
+
+```sh
+DOO_PLANNER_MODEL=anthropic/claude-sonnet-4-6   # default: claude-opus-4-8
+# Mode A — Anthropic directly:        ANTHROPIC_API_KEY=sk-ant-...
+# Mode B — a provider URL + key:      DOO_PLANNER_API_BASE=https://gateway/v1 ; DOO_PLANNER_API_KEY=...  (model: openai/<name>)
+```
+
+Per ADR-0037 the exact context pack + LLM request/response are persisted to object storage for every proposal (replayability); `DOO_S3_*` (already set for ingestion) is reused.
+
 ### Command reference
 
 | Command | What it does |
@@ -130,6 +161,9 @@ Request/response bodies live in MinIO; the graph holds `BlobRef`s.
 | `doo engagement keepalive <id>` | Run the external kill-switch lease keeper |
 | `doo ingest har --engagement <id> <har>` | L1: upload the HAR + queue an envelope |
 | `doo worker run [--once] [--batch N]` | L2+L3: drain the streams into the graph |
+| `doo coverage c1\|c2\|c2b\|c3\|c4 --engagement <id>` | Deterministic coverage gaps (read-only; `--json` available) |
+| `doo planner propose --engagement <id> [-g <gen>]` | Select gaps → propose + validate + commit `TestCase`s (no dispatch) |
+| `doo planner review --engagement <id> [--approve\|--reject <key> --actor <who>]` | Prioritised review queue; approve/reject into the audit ledger |
 
 ### Troubleshooting
 
