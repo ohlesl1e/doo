@@ -141,6 +141,95 @@ def build_user_prompt(pack: ContextPack) -> str:
     )
 
 
+C3_SYSTEM_PROMPT = (
+    "You are a black-box web application security tester proposing ONE test for a "
+    "leak-to-input pivot: a value the application returned in one response is "
+    "accepted as input by a different in-scope endpoint. You are given a context "
+    "pack with the target endpoint, the input parameter to test (a target handle), "
+    "the auth context to send as, and the leaked value's shape.\n\n"
+    "Rules:\n"
+    "- You do NOT write requests or payloads. The already-observed value is replayed "
+    "as the input automatically; you SELECT the target parameter handle (e.g. 'T1') "
+    "and the auth-context handle (e.g. 'A1') and CLASSIFY the test.\n"
+    "- Only use handles present in the pack. Never invent one.\n"
+    "- Classify by the value's shape: 'ssrf'/'open-redirect' for URL-shaped values, "
+    "'idor' for identifier-shaped values reused across an ownership boundary, else "
+    "'leak_replay'.\n"
+    "- Respond by calling `propose_test` exactly once."
+)
+
+
+def build_c3_user_prompt(pack: ContextPack) -> str:
+    """The per-candidate user message for a C3 leak-replay (id-free pack + the ask)."""
+
+    payload = json.dumps(pack.to_llm_payload(), indent=2, sort_keys=True)
+    return (
+        f"Context pack:\n{payload}\n\n"
+        "A value this app handed out is accepted as input by the target endpoint. "
+        "Propose a test that sends that already-observed value as the input and "
+        "classify what it would reveal. Pick the target parameter (`target_ref`) and "
+        "the auth context to send as (`auth_context_ref`), and classify "
+        "(`test_class`). Call `propose_test`."
+    )
+
+
+# C3 forced-tool schema — leak-replay classes, no authz `hold` (not a session replay).
+C3_PROPOSE_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "propose_test",
+        "description": "Propose one leak-to-input test for the candidate pivot.",
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "test_class": {
+                    "type": "string",
+                    "enum": ["leak_replay", "ssrf", "idor", "open-redirect"],
+                    "description": "The vulnerability class the leaked value enables.",
+                },
+                "target_ref": {
+                    "type": "string",
+                    "description": "TARGET handle of the input parameter (e.g. 'T1').",
+                },
+                "auth_context_ref": {
+                    "type": "string",
+                    "description": "Handle of the auth context to send the value as (e.g. 'A1').",
+                },
+                "justification": {
+                    "type": "string",
+                    "description": "Why this test, citing the leak-to-input pivot.",
+                },
+                "expected_outcome": {
+                    "type": "string",
+                    "description": "What response would confirm the issue.",
+                },
+                "expected_yield": {
+                    "type": "number",
+                    "description": "0..1 hunch this reveals a real issue (priority).",
+                },
+            },
+            "required": [
+                "test_class",
+                "target_ref",
+                "auth_context_ref",
+                "justification",
+                "expected_outcome",
+                "expected_yield",
+            ],
+        },
+    },
+}
+
+
+def _select_prompt_tool(pack: ContextPack) -> tuple[str, str, dict[str, Any]]:
+    """Pick the (system, user, tool) triple for the pack's candidate kind."""
+
+    if pack.candidate_kind == "C3":
+        return C3_SYSTEM_PROMPT, build_c3_user_prompt(pack), C3_PROPOSE_TOOL
+    return SYSTEM_PROMPT, build_user_prompt(pack), PROPOSE_TOOL
+
+
 @dataclass(frozen=True, slots=True)
 class LLMCallResult:
     """One LLM proposal call: the parsed draft plus the raw I/O for the audit trail.
@@ -172,10 +261,11 @@ class FakeLLMCaller:
         self._draft = draft
 
     def propose(self, pack: ContextPack) -> LLMCallResult:
+        system, user, tool = _select_prompt_tool(pack)
         request = {
-            "system": SYSTEM_PROMPT,
-            "user": build_user_prompt(pack),
-            "tool": PROPOSE_TOOL,
+            "system": system,
+            "user": user,
+            "tool": tool,
             "tool_choice": "propose_test",
         }
         response = {"tool_use": {"name": "propose_test", "input": self._draft.model_dump()}}
@@ -213,8 +303,7 @@ class LiteLLMCaller:
         # "litellm present" (the unused-ignore that would otherwise fire locally).
         import litellm  # type: ignore[import-not-found, unused-ignore]
 
-        system = SYSTEM_PROMPT
-        user = build_user_prompt(pack)
+        system, user, tool = _select_prompt_tool(pack)
         # `request` is persisted verbatim to object storage (replay audit), so it
         # must stay secret-free: `api_base` (a URL) is safe and useful to record,
         # but `api_key` is passed to litellm out-of-band and NEVER persisted.
@@ -225,7 +314,7 @@ class LiteLLMCaller:
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            "tools": [PROPOSE_TOOL],
+            "tools": [tool],
             "tool_choice": {"type": "function", "function": {"name": "propose_test"}},
         }
         if self._api_base is not None:
@@ -320,6 +409,57 @@ def resolve_draft(
         justification=draft.justification,
         expected_outcome=draft.expected_outcome,
         hold=tuple(held),
+    )
+
+
+def resolve_c3_draft(
+    pack: ContextPack, draft: LLMProposalDraft
+) -> PlannerProposal | DraftRejected:
+    """Resolve a C3 leak-replay draft to a concrete-id `PlannerProposal` (ADR-0037).
+
+    Same hallucination guard as `resolve_draft` (reject any handle absent from the
+    pack), but the payload is the **leaked observed value**: `payload_class` is the
+    benign leak-replay probe and `payload_spec = observed_value(value_hash)` — fixed
+    by the deterministic assembler/resolver, never the LLM (the value is known at
+    propose time, ADR-0037). C3 targets a `Parameter` (the input the value is sent
+    to); there is no authz `hold`. `auth_context_ref` is the single identity the
+    leaked value is replayed *as* (assembler-provided), validated like any handle.
+    """
+
+    if pack.observed_value_hash is None:
+        # An assembler invariant: a C3 pack always carries the leaked value's hash.
+        return DraftRejected(
+            code="missing_observed_value",
+            reason="C3 context pack carries no observed_value_hash to resolve the payload",
+        )
+
+    targets = {t.handle: t for t in pack.targets}
+    auths = {a.handle: a for a in pack.auth_contexts}
+
+    target = targets.get(draft.target_ref)
+    if target is None:
+        return _reject("unknown_target", pack, draft, f"target_ref {draft.target_ref!r}")
+    if target.kind != "parameter" or target.parameter_id is None:
+        return _reject(
+            "unknown_target", pack, draft, f"target_ref {draft.target_ref!r} is not a parameter"
+        )
+    auth = auths.get(draft.auth_context_ref)
+    if auth is None:
+        return _reject("unknown_auth", pack, draft, f"auth_context_ref {draft.auth_context_ref!r}")
+
+    return PlannerProposal(
+        engagement_id=pack.engagement_id,
+        generator="c3",
+        mode="llm",
+        test_class=draft.test_class,
+        payload_class="benign-probe",
+        payload_spec=PayloadSpec(kind="observed_value", value_hash=pack.observed_value_hash),
+        auth_context_id=auth.auth_context_id,
+        target_parameter_id=target.parameter_id,
+        expected_yield=draft.expected_yield,
+        confidence_method="llm-self-reported",
+        justification=draft.justification,
+        expected_outcome=draft.expected_outcome,
     )
 
 

@@ -43,6 +43,7 @@ TestClass = Literal[
     "rate-limit",
     "boundary-violation",
     "forced_browsing",
+    "leak_replay",
 ]
 
 # PayloadClass per ADR-0003: low-cardinality controlled vocabulary the ROE
