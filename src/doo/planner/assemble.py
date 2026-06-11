@@ -37,9 +37,9 @@ import json
 from dataclasses import dataclass
 from datetime import datetime
 
-from doo.coverage.models import C2bResult, C2Result
+from doo.coverage.models import C2bResult, C2Result, C3Result
 from doo.events.l2 import ValueCandidate
-from doo.ids import AuthContextId, EngagementId
+from doo.ids import AuthContextId, EngagementId, ParameterId, Sha256Hex
 from doo.infra.neo4j_driver import Neo4jClient
 from doo.observability.logging import get_logger
 from doo.ontology.queries import for_engagement
@@ -115,6 +115,145 @@ def _fetch_principal_auth(
         auth_context_id=AuthContextId(str(row["id"])),
         tier=str(row["tier"]) if row["tier"] is not None else None,
         claims_summary=_summarise_claims(row["bearer_claims"]),
+    )
+
+
+def _fetch_send_as_auth(
+    client: Neo4jClient, engagement_id: EngagementId, endpoint_id: str
+) -> tuple[_AuthView, str] | None:
+    """Resolve one identity that hit the endpoint — the C3 'send-as' auth context.
+
+    C3 is not an authz swap: the leaked value is replayed *as* some identity. We
+    pick, deterministically, one active AuthContext that was `OBSERVED_UNDER` a
+    request that `HIT` the (input) endpoint — the natural identity the input is
+    sent under — preferring a real token over the anonymous singleton, then by id.
+    Returns the `_AuthView` + the principal's display label, or None when none
+    resolves.
+    """
+
+    frag = for_engagement(engagement_id, var="r")
+    rows = client.execute_read(
+        f"""
+        MATCH (r:RequestObservation)-[:HIT]->(e:Endpoint {{id: $endpoint_id}}),
+              (r)-[:OBSERVED_UNDER]->(ac:AuthContext)-[:OF_PRINCIPAL]->(p:Principal)
+        {frag.and_("r.status = 'active' AND e.status = 'active' AND ac.status = 'active' AND p.status = 'active'")}
+        RETURN ac.id AS id, ac.tier AS tier, ac.bearer_claims AS bearer_claims,
+               coalesce(ac.is_anonymous, false) AS ac_anon,
+               p.is_anonymous AS p_anon, p.label AS label, p.identity_key AS identity_key
+        ORDER BY ac_anon ASC, ac.id ASC
+        LIMIT 1
+        """,
+        endpoint_id=endpoint_id,
+        **frag.parameters,
+    )
+    if not rows:
+        return None
+    row = rows[0]
+    if bool(row["p_anon"]):
+        label = "anon"
+    else:
+        label = str(row["label"]) if row["label"] else str(row["identity_key"])
+    view = _AuthView(
+        auth_context_id=AuthContextId(str(row["id"])),
+        tier=str(row["tier"]) if row["tier"] is not None else None,
+        claims_summary=_summarise_claims(row["bearer_claims"]),
+    )
+    return view, label
+
+
+def assemble_c3_pack(
+    client: Neo4jClient,
+    *,
+    gap: C3Result,
+    code_version: str,
+    now: datetime,
+) -> ContextPack | None:
+    """Build the `ContextPack` for one C3 leak-to-input pivot, or None if unproposable.
+
+    The target is the **input Parameter** the leaked value is sent to (`T1`,
+    `kind="parameter"`); scope is enforced on its endpoint by the Validator
+    (ADR-0020). One auth context (`A1`) is the identity to replay the value as. The
+    leaked value's `kind`/`preview`/source endpoints go in `candidate_reason` (never
+    the raw secret, ADR-0015); `observed_value_hash` carries the propose-time-known
+    payload the resolver fixes into `payload_spec = observed_value`. Returns None
+    when the row names no parameter, the `Parameter` node can't be resolved, or no
+    send-as identity resolves.
+    """
+
+    eid = gap.engagement_id
+    if gap.parameter_name is None:
+        return None  # no named input parameter → nothing to target.
+
+    frag = for_engagement(eid, var="p")
+    rows = client.execute_read(
+        f"""
+        MATCH (e:Endpoint {{id: $endpoint_id}})-[:HAS_PARAMETER]->(p:Parameter {{name: $name}})
+        {frag.and_("p.status = 'active' AND e.status = 'active'")}
+        RETURN p.id AS id, p.location AS location
+        ORDER BY p.location
+        LIMIT 1
+        """,
+        endpoint_id=gap.target_endpoint_id,
+        name=gap.parameter_name,
+        **frag.parameters,
+    )
+    if not rows:
+        log.warning(
+            "planner.assemble.c3_parameter_unresolved",
+            engagement_id=eid,
+            endpoint_id=gap.target_endpoint_id,
+            parameter_name=gap.parameter_name,
+        )
+        return None
+    param_id = ParameterId(str(rows[0]["id"]))
+    location = str(rows[0]["location"]) if rows[0]["location"] is not None else None
+
+    send_as = _fetch_send_as_auth(client, eid, gap.target_endpoint_id)
+    if send_as is None:
+        log.warning(
+            "planner.assemble.c3_no_send_as_auth",
+            engagement_id=eid,
+            endpoint_id=gap.target_endpoint_id,
+        )
+        return None
+    auth, principal_label = send_as
+
+    target = PackTarget(
+        handle="T1",
+        kind="parameter",
+        method=gap.target_method,
+        path_template=gap.target_path_template,
+        param_name=gap.parameter_name,
+        location=location,
+        endpoint_id=gap.target_endpoint_id,
+        parameter_id=param_id,
+    )
+    auth_ctx = PackAuthContext(
+        handle="A1",
+        principal_label=principal_label,
+        tier=auth.tier,
+        claims_summary=auth.claims_summary,
+        is_attacker_candidate=False,
+        auth_context_id=auth.auth_context_id,
+    )
+    preview = f" (preview {gap.value_preview!r})" if gap.value_preview is not None else ""
+    reason = (
+        f"C3 leak-to-input: a {gap.kind} value{preview} leaked from "
+        f"{', '.join(gap.source_endpoints)} is accepted as parameter "
+        f"{gap.parameter_name!r} by in-scope {gap.target_method} "
+        f"{gap.target_host}{gap.target_path_template}"
+    )
+    return ContextPack(
+        engagement_id=eid,
+        candidate_kind="C3",
+        candidate_reason=reason,
+        endpoint_method=gap.target_method,
+        endpoint_path_template=gap.target_path_template,
+        targets=(target,),
+        auth_contexts=(auth_ctx,),
+        observed_value_hash=Sha256Hex(gap.value_hash),
+        code_version=code_version,
+        generated_at=now,
     )
 
 

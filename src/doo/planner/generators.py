@@ -24,13 +24,14 @@ from doo.canonical.identity import (
     auth_context_id,
     compute_anonymous_auth_hash,
 )
-from doo.coverage.queries import _load_principals, run_c1, run_c2, run_c2b
+from doo.coverage.queries import _load_principals, run_c1, run_c2, run_c2b, run_c3
 from doo.ids import EngagementId
 from doo.infra.neo4j_driver import Neo4jClient
 from doo.observability.logging import get_logger
 from doo.planner.assemble import (
     assemble_c2_pack,
     assemble_c2b_pack,
+    assemble_c3_pack,
     fetch_reaching_observation_hazards,
 )
 from doo.planner.llm import (
@@ -38,6 +39,7 @@ from doo.planner.llm import (
     LLMCaller,
     LLMCallResult,
     LLMProposalError,
+    resolve_c3_draft,
     resolve_draft,
 )
 from doo.planner.models import (
@@ -63,6 +65,9 @@ _C2_CRITICALITY = 2.0
 # review view's criticality is keyed on source today (a single `llm-planner` tier);
 # this constant records the intended C2b tier for when source-keying is refined.
 _C2B_CRITICALITY = 3.0
+# C3 (leak-to-input) sits beside the authz tiers — a concrete value the app handed
+# out and an endpoint consumes. Recorded for when the review view keys on source.
+_C3_CRITICALITY = 2.0
 
 
 @runtime_checkable
@@ -431,6 +436,90 @@ class C2bGenerator:
         )
 
 
+class C3Generator:
+    """LLM-proposing generator for leak-to-input pivots (ADR-0037, issue #53).
+
+    Selection reuses the shared coverage library's `run_c3` — the same pivots
+    `doo coverage c3` surfaces. A C3 gap is an `ObservedValue` the app yielded in a
+    response and that an in-scope endpoint consumes as a parameter. Each gap is
+    assembled into a bounded `ContextPack` (`assemble_c3_pack`) naming the input
+    Parameter as the target and one identity to send as; the LLM classifies the test
+    and selects handles (`resolve_c3_draft`); the deterministic resolver fixes
+    `payload_spec = observed_value(value_hash)` (the value is known at propose time,
+    ADR-0037) and the Validator resolves it to a real `payload_hash`. No
+    replay-hazard annotation — C3 is a leak-replay, not a session/authz replay. A row
+    with no named parameter (or no resolvable Parameter / send-as identity) is skipped
+    before any model call.
+    """
+
+    generator_id: GeneratorId = "c3"
+    mode: ProposalMode = "llm"
+
+    def __init__(self, caller: LLMCaller) -> None:
+        self._caller = caller
+
+    def run(
+        self,
+        client: Neo4jClient,
+        engagement_id: EngagementId,
+        *,
+        now: datetime | None = None,
+    ) -> LLMRunResult:
+        run_at = now or datetime.now(UTC)
+        gaps = run_c3(client, engagement_id, now=run_at)
+
+        proposed: list[LLMProposed] = []
+        rejected: list[LLMRejected] = []
+        skipped: list[LLMSkipped] = []
+
+        for gap in gaps:
+            pack = assemble_c3_pack(client, gap=gap, code_version=__version__, now=run_at)
+            if pack is None:
+                skipped.append(
+                    LLMSkipped(
+                        reason=(
+                            f"unproposable C3 pivot into {gap.target_method} "
+                            f"{gap.target_host}{gap.target_path_template} "
+                            f"param {gap.parameter_name!r}: no resolvable parameter / "
+                            "send-as identity"
+                        )
+                    )
+                )
+                continue
+            try:
+                call = self._caller.propose(pack)
+            except LLMProposalError as exc:
+                skipped.append(
+                    LLMSkipped(
+                        reason=(
+                            f"LLM proposal unparseable for C3 target "
+                            f"{gap.target_endpoint_id}: {exc}"
+                        )
+                    )
+                )
+                continue
+            outcome = resolve_c3_draft(pack, call.draft)
+            if isinstance(outcome, DraftRejected):
+                rejected.append(LLMRejected(rejection=outcome, call=call))
+                continue
+            proposed.append(LLMProposed(proposal=outcome, call=call))
+
+        log.info(
+            "planner.generator.c3.complete",
+            engagement_id=engagement_id,
+            candidates=len(gaps),
+            proposed=len(proposed),
+            rejected=len(rejected),
+            skipped=len(skipped),
+        )
+        return LLMRunResult(
+            candidates=len(gaps),
+            proposed=tuple(proposed),
+            rejected=tuple(rejected),
+            skipped=tuple(skipped),
+        )
+
+
 class PlannerConfig(BaseModel):
     """Deterministic planner configuration (ADR-0036).
 
@@ -455,7 +544,7 @@ _REGISTRY: dict[GeneratorId, CandidateGenerator] = {
 
 # LLM-proposing generator ids (ADR-0037). Known to config validation, but built by
 # the service (not the singleton registry) because each holds a runtime `LLMCaller`.
-_LLM_GENERATOR_IDS: tuple[GeneratorId, ...] = ("c2", "c2b")
+_LLM_GENERATOR_IDS: tuple[GeneratorId, ...] = ("c2", "c2b", "c3")
 
 # Every generator id config may legitimately name (deterministic ∪ LLM).
 _KNOWN_GENERATOR_IDS: frozenset[GeneratorId] = frozenset(_REGISTRY) | frozenset(
@@ -523,5 +612,6 @@ def enabled_llm_generators(
     builders: dict[GeneratorId, LLMProposingGenerator] = {
         "c2": C2Generator(caller),
         "c2b": C2bGenerator(caller),
+        "c3": C3Generator(caller),
     }
     return [builders[gid] for gid in _LLM_GENERATOR_IDS if gid in wanted]

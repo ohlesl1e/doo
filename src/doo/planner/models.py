@@ -41,8 +41,8 @@ from doo.ids import (
 # the `source` provenance tag on a committed deterministic TestCase
 # (`deterministic-c1`, ADR-0036). LLM-proposing generators (slice-3 tracers,
 # slice 4) commit `source = "llm-planner"` instead.
-GeneratorId = Literal["c1", "c2", "c2b"]
-GENERATOR_IDS: tuple[GeneratorId, ...] = ("c1", "c2", "c2b")
+GeneratorId = Literal["c1", "c2", "c2b", "c3"]
+GENERATOR_IDS: tuple[GeneratorId, ...] = ("c1", "c2", "c2b", "c3")
 
 # A replay-breaking request-field role (ADR-0041). A field bound to the original
 # session whose verbatim replay under a swapped identity would fail for a *non-authz*
@@ -217,6 +217,13 @@ class PlannerProposal(BaseModel):
 # (the authz-relevant classes), so the model cannot wander outside authz.
 C2TestClass = Literal["idor", "bola", "auth-bypass", "privilege-escalation"]
 
+# What the LLM may classify a C3 leak-replay test as — the vuln classes a
+# leaked-then-consumed value enables. `leak_replay` is the generic default; the
+# model specialises to `ssrf`/`open-redirect` for URL-shaped values or `idor` for
+# id-shaped ones. Constrained so the model can't wander outside the leak-to-input
+# frame.
+C3TestClass = Literal["leak_replay", "ssrf", "idor", "open-redirect"]
+
 
 class PackTarget(BaseModel):
     """One holdable/targetable node in a context pack, addressed by `handle`.
@@ -314,13 +321,18 @@ class ContextPack(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     engagement_id: EngagementId
-    candidate_kind: Literal["C2", "C2b"]
+    candidate_kind: Literal["C2", "C2b", "C3"]
     candidate_reason: str
     endpoint_method: str
     endpoint_path_template: str
     targets: tuple[PackTarget, ...] = Field(min_length=1)
     auth_contexts: tuple[PackAuthContext, ...] = Field(min_length=1)
     exemplar: PackExemplar | None = None
+    # C3 only: the leaked `ObservedValue`'s hash — the propose-time-known payload the
+    # resolver fixes into `payload_spec = observed_value(value_hash)`. Resolver-side
+    # id (never serialised into the prompt); the value's shape/preview is conveyed in
+    # `candidate_reason` instead (raw secret never carried, ADR-0015).
+    observed_value_hash: Sha256Hex | None = None
     code_version: str
     generated_at: datetime
 
@@ -363,7 +375,9 @@ class LLMProposalDraft(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    test_class: C2TestClass
+    # Either an authz class (C2/C2b) or a leak-replay class (C3); the per-candidate
+    # tool schema constrains which set the model actually sees.
+    test_class: C2TestClass | C3TestClass
     target_ref: str = Field(min_length=1)
     auth_context_ref: str = Field(min_length=1)
     hold: tuple[str, ...] = ()

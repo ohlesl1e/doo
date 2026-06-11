@@ -108,18 +108,89 @@ def _resolve_endpoint(
     return _EndpointResolution(endpoint_id=endpoint_id, view=view)
 
 
-def _resolve_payload_hash(spec: PayloadSpec) -> Sha256Hex | None:
+def _resolve_parameter(
+    client: Neo4jClient, engagement_id: EngagementId, parameter_id: str
+) -> _EndpointResolution | None:
+    """Resolve a `parameter_id` target to its owning Endpoint + host (scope input).
+
+    A C3 leak-replay targets a `Parameter` (the input the leaked value is sent to);
+    scope is enforced on that Parameter's **owning Endpoint** (the input endpoint,
+    ADR-0020). Returns None when the handle names no active in-engagement
+    `Parameter` (hallucinated / stale). The returned `_EndpointResolution` carries
+    the owning endpoint's view so the same `is_in_scope` check applies.
+    """
+
+    frag = for_engagement(engagement_id, var="p")
+    rows = client.execute_read(
+        f"""
+        MATCH (e:Endpoint)-[:HAS_PARAMETER]->(p:Parameter {{id: $parameter_id}}),
+              (e)-[:ON_HOST]->(h:Host)
+        {frag.and_("p.status = 'active' AND e.status = 'active'")}
+        RETURN e.id AS endpoint_id,
+               e.method AS method,
+               e.path_template AS path_template,
+               h.scheme AS scheme,
+               h.canonical_hostname AS canonical_hostname,
+               h.port AS port,
+               h.is_ip_literal AS is_ip_literal
+        """,
+        parameter_id=parameter_id,
+        **frag.parameters,
+    )
+    if not rows:
+        return None
+    row = rows[0]
+    view = _EndpointView(
+        method=str(row["method"]),
+        host=_HostView(
+            scheme=row["scheme"],
+            canonical_hostname=str(row["canonical_hostname"]),
+            port=row["port"],
+            is_ip_literal=bool(row["is_ip_literal"]),
+        ),
+        path_template=str(row["path_template"]),
+    )
+    return _EndpointResolution(endpoint_id=str(row["endpoint_id"]), view=view)
+
+
+def _resolve_payload_hash(
+    client: Neo4jClient, engagement_id: EngagementId, spec: PayloadSpec
+) -> Sha256Hex | None:
     """Resolve a `payload_spec` to a concrete `payload_hash` (ADR-0037).
 
-    Slice 3 ships the `none` resolver: empty sentinel `sha256("")`. The
-    `observed_value` and `configured` resolvers (C3 / sink_params) land with their
-    generators; until then they return None (the validator discards them as
-    unresolvable rather than committing a placeholder hash, ADR-0007).
+    Two slice-3 resolvers ship:
+    - `none` — empty sentinel `sha256("")` (authz replays / forced browsing).
+    - `observed_value` — the C3 leak-replay payload: verify an active
+      `ObservedValue` with this `value_hash` exists in the engagement, and use its
+      `value_hash` directly as the `payload_hash`. The `ObservedValue` identity IS
+      `sha256(value)` (`canonical/values.py`), so this is exactly the ADR-0007
+      payload hash — and for secret-shaped kinds it resolves by hash alone, never
+      reading the raw secret (ADR-0015).
+
+    The `configured` resolver (sink_params) lands with its generator; until then it
+    returns None and the validator discards the proposal as unresolvable rather than
+    committing a placeholder hash (ADR-0007).
     """
 
     if spec.kind == "none":
         return _EMPTY_PAYLOAD_HASH
-    # observed_value / configured resolvers are not part of the S1 tracer.
+    if spec.kind == "observed_value":
+        if spec.value_hash is None:
+            return None  # guarded by the PayloadSpec model_validator, defensive here.
+        frag = for_engagement(engagement_id, var="v")
+        rows = client.execute_read(
+            f"""
+            MATCH (v:ObservedValue {{value_hash: $value_hash}})
+            {frag.and_("v.status = 'active'")}
+            RETURN v.value_hash AS value_hash
+            """,
+            value_hash=str(spec.value_hash),
+            **frag.parameters,
+        )
+        if not rows:
+            return None
+        return Sha256Hex(str(rows[0]["value_hash"]))
+    # `configured` resolver is not part of slice-3 until the sink_params tracer.
     return None
 
 
@@ -151,7 +222,8 @@ def validate(
             proposal,
         )
 
-    # --- (1) target resolution + (3) scope. S1 ships the endpoint target. ---
+    # --- (1) target resolution + (3) scope. Endpoint (C1/C2/C2b) or Parameter
+    # (C3 leak-replay); scope is enforced on the (owning) endpoint either way. ---
     if proposal.target_endpoint_id is not None:
         resolution = _resolve_endpoint(client, eid, proposal.target_endpoint_id)
         if resolution is None:
@@ -161,27 +233,36 @@ def validate(
                 "active in-engagement Endpoint (hallucinated or stale handle)",
                 proposal,
             )
-        scope = _load_scope_rules(client, eid)
-        if not is_in_scope(resolution.view, scope):
+    elif proposal.target_parameter_id is not None:
+        resolution = _resolve_parameter(client, eid, proposal.target_parameter_id)
+        if resolution is None:
             return _discard(
-                "out_of_scope",
-                f"target endpoint {resolution.view.method} "
-                f"{resolution.view.host.canonical_hostname}"
-                f"{resolution.view.path_template} is out of scope (is_in_scope, "
-                "ADR-0038)",
+                "unresolvable_target",
+                f"target_parameter_id {proposal.target_parameter_id!r} resolves to no "
+                "active in-engagement Parameter (hallucinated or stale handle)",
                 proposal,
             )
     else:
-        # Parameter / boundary targets arrive with later tracers; resolving them
-        # is out of the S1 spine. Discard rather than commit an unresolved target.
+        # Trust-boundary targets land with the S5 boundary-proposal tracer.
         return _discard(
             "unresolvable_target",
-            "parameter / boundary targets are not resolvable in the S1 planner spine",
+            "trust-boundary targets are not resolvable until the S5 boundary tracer",
+            proposal,
+        )
+
+    scope = _load_scope_rules(client, eid)
+    if not is_in_scope(resolution.view, scope):
+        return _discard(
+            "out_of_scope",
+            f"target endpoint {resolution.view.method} "
+            f"{resolution.view.host.canonical_hostname}"
+            f"{resolution.view.path_template} is out of scope (is_in_scope, "
+            "ADR-0038)",
             proposal,
         )
 
     # --- (4) payload resolution (ADR-0037). ---
-    payload_hash = _resolve_payload_hash(proposal.payload_spec)
+    payload_hash = _resolve_payload_hash(client, eid, proposal.payload_spec)
     if payload_hash is None:
         return _discard(
             "payload_unresolvable",
