@@ -153,6 +153,53 @@ def _resolve_parameter(
     return _EndpointResolution(endpoint_id=str(row["endpoint_id"]), view=view)
 
 
+def _resolve_boundary(
+    client: Neo4jClient, engagement_id: EngagementId, trust_boundary_id: str
+) -> _EndpointResolution | None:
+    """Resolve a `TrustBoundary` target to the endpoint of its `DERIVED_FROM` evidence.
+
+    A boundary test is an authz replay of the boundary's evidence (ADR-0039): the
+    concrete endpoint is read from a `DERIVED_FROM` observation's `HIT` endpoint —
+    the boundary itself carries NO endpoint edge (the ADR-0007 XOR is preserved by
+    `TARGETS_BOUNDARY`). Scope is enforced on that evidence endpoint. Returns None
+    when the boundary, or an active evidence endpoint, does not resolve.
+    """
+
+    frag = for_engagement(engagement_id, var="tb")
+    rows = client.execute_read(
+        f"""
+        MATCH (tb:TrustBoundary {{id: $tbid}})-[:DERIVED_FROM]->
+              (r:RequestObservation)-[:HIT]->(e:Endpoint)-[:ON_HOST]->(h:Host)
+        {frag.and_("(tb.status IS NULL OR tb.status = 'active') AND e.status = 'active'")}
+        RETURN e.id AS endpoint_id,
+               e.method AS method,
+               e.path_template AS path_template,
+               h.scheme AS scheme,
+               h.canonical_hostname AS canonical_hostname,
+               h.port AS port,
+               h.is_ip_literal AS is_ip_literal
+        ORDER BY e.id
+        LIMIT 1
+        """,
+        tbid=str(trust_boundary_id),
+        **frag.parameters,
+    )
+    if not rows:
+        return None
+    row = rows[0]
+    view = _EndpointView(
+        method=str(row["method"]),
+        host=_HostView(
+            scheme=row["scheme"],
+            canonical_hostname=str(row["canonical_hostname"]),
+            port=row["port"],
+            is_ip_literal=bool(row["is_ip_literal"]),
+        ),
+        path_template=str(row["path_template"]),
+    )
+    return _EndpointResolution(endpoint_id=str(row["endpoint_id"]), view=view)
+
+
 def _resolve_payload_hash(
     client: Neo4jClient, engagement_id: EngagementId, spec: PayloadSpec
 ) -> Sha256Hex | None:
@@ -242,13 +289,17 @@ def validate(
                 "active in-engagement Parameter (hallucinated or stale handle)",
                 proposal,
             )
-    else:
-        # Trust-boundary targets land with the S5 boundary-proposal tracer.
-        return _discard(
-            "unresolvable_target",
-            "trust-boundary targets are not resolvable until the S5 boundary tracer",
-            proposal,
-        )
+    elif proposal.target_trust_boundary_id is not None:
+        resolution = _resolve_boundary(client, eid, proposal.target_trust_boundary_id)
+        if resolution is None:
+            return _discard(
+                "unresolvable_target",
+                f"target_trust_boundary_id {proposal.target_trust_boundary_id!r} "
+                "resolves to no active boundary with a DERIVED_FROM evidence endpoint",
+                proposal,
+            )
+    else:  # pragma: no cover - the XOR check above guarantees one branch.
+        return _discard("target_xor", "no target set after XOR check", proposal)
 
     scope = _load_scope_rules(client, eid)
     if not is_in_scope(resolution.view, scope):
