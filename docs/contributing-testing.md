@@ -74,3 +74,34 @@ The engagement-start / keepalive-lifecycle / loader-rerun CLI flows the capstone
 also implies are covered by `tests/test_keepalive.py` and `tests/test_loader.py`
 (referenced from the matrix), so the E2E focuses on the integrated graph rather
 than re-driving those CLI subprocesses.
+
+## Planner tests (slice 3)
+
+The planner's one non-deterministic step is the LLM call; **tests never call a real
+model** — they drive the deterministic spine around it.
+
+- **Unit (no docker, no model).** Exercise the deterministic bridge with a
+  `FakeLLMCaller(draft)` (returns a canned `LLMProposalDraft`) or by calling the
+  resolver directly: `tests/test_planner_c2_unit.py`, `test_planner_c3_unit.py`,
+  `test_planner_c2b_unit.py`. Assert (a) a valid draft resolves to the right
+  `PlannerProposal` (target/auth/payload/`test_class`), (b) the **hallucination
+  guard** — a handle absent from the pack → `DraftRejected`, and (c) identity
+  invariants (e.g. `replay_hazards` must NOT change `key_hash`). Pure detectors
+  (`sink_params`, `replay_hazards`, `stronger_capability_side`) get direct
+  table-driven unit tests (positive per role + negative/ambiguous).
+- **Coverage unit** — FakeClient that routes each read by query content (see
+  `test_coverage_c2_unit.py` / `test_coverage_c4_unit.py`) so the Python
+  pairing/direction logic is tested without a graph.
+- **E2E (testcontainers).** Seed a HAR through `_run_pipeline` (from
+  `tests/test_pipeline_e2e.py`) so real graph state exists, then run `propose` with a
+  `FakeLLMCaller` + `InMemoryLLMAuditSink` and assert the committed `TestCase`:
+  `test_planner_c2_e2e.py` (authz replay), `c3` (parameter target + `observed_value`
+  payload), `boundary` (capability/tenant `TARGETS_BOUNDARY`, endpoint from
+  `DERIVED_FROM` evidence), `sink` (sink param + `configured` payload). Reuse the
+  capability/tenant HAR shape from `test_trust_boundary_e2e.py` for boundary fixtures
+  (one principal, two scope-differing tokens → a capability boundary; two tenants
+  sharing an endpoint → a tenant boundary).
+- **Real-model check (manual, not CI).** When an LLM path changes, run it through
+  **both** a weak and a strong gateway model and document the output comparison — see
+  the project memory rule; this is how the prompt steers (`hold`, `test_class`) were
+  found. Not a pytest gate (no model in CI).

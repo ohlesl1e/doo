@@ -30,9 +30,9 @@ Plus cross-cutting observability/audit via OpenTelemetry.
 ## Build order (do not skip ahead)
 
 1. ✅ **shipped** — Ingestion + graph (Burp/HAR → Neo4j).
-2. ✅ **shipped** — Coverage analysis (deterministic queries C1/C2/C2b/C3 — ~60% of value, ~10% of risk).
-3. ⬅ **next** — LLM-assisted hypothesis generation: the Planner (human approves before dispatch). Pulls in `TrustBoundary` inference + C4.
-4. Bounded agent execution: Executor + Interpreter; adds `EXECUTED_AS` / `dispatch_status` + C5 + reporting.
+2. ✅ **shipped** — Coverage analysis (deterministic queries C1/C2/C2b/C3/C4 — ~60% of value, ~10% of risk).
+3. ✅ **shipped** — LLM-assisted hypothesis generation: the Planner (proposes + validates + human-reviews; nothing dispatched). `TrustBoundary` inference + C4 + sink_params landed here.
+4. ⬅ **next** — Bounded agent execution: Executor + Interpreter; adds `EXECUTED_AS` / `dispatch_status` + C5 + reporting.
 
 Build vertically through one slice before broadening. Do not scaffold all five layers in parallel. **Ontology (L3) is not a separate slice** — it was built in slice 1 and each later slice extends it only when a consumer needs a new inference. The canonical slice definitions live in `ARCHITECTURE.md` → "Build order (the slices)".
 
@@ -73,7 +73,7 @@ Build vertically through one slice before broadening. Do not scaffold all five l
 
 1. Read `ARCHITECTURE.md` (esp. "Build order (the slices)" — the canonical roadmap), `ONTOLOGY.md`, `CONTEXT.md` (domain language), and `docs/adr/` (decisions to date — 0001 through 0035).
 2. Check `docs/grill-queue.md` — open design decisions worth grilling, plus deliberate deferrals.
-3. Confirm which slice we're working on. **Slices 1–2 are shipped; slice 3 (the Planner) is next.** If unclear, ask before generating code.
+3. Confirm which slice we're working on. **Slices 1–3 are shipped; slice 4 (bounded agent execution: Executor + Interpreter) is next.** If unclear, ask before generating code.
 
 ## What NOT to do
 
@@ -86,9 +86,9 @@ Build vertically through one slice before broadening. Do not scaffold all five l
 
 ## Outstanding design work
 
-The ontology (`ONTOLOGY.md`) design is complete: all six steps drafted, all three originally-open questions resolved (Asset / TrustBoundary / Payload), 35 ADRs recorded. The one remaining ontology **implementation** is `TrustBoundary` inference — deliberately unbuilt until its consumer (the slice-3 planner) pulls it in.
+The ontology (`ONTOLOGY.md`) design is complete: all six steps drafted, all three originally-open questions resolved (Asset / TrustBoundary / Payload), 35 ADRs recorded. `TrustBoundary` inference (capability + tenant) shipped in slice 3.
 
-**Slices 1–2 are shipped** (G1–G4 all resolved; slice-2 coverage closed by ADR-0033/0034/0035). **Slice 3 (LLM-assisted hypothesis generation / the Planner) is the next design + build target** — its grill targets are listed in `docs/grill-queue.md` → "Grilling order / history". Slice-1 PRD is GitHub issue #2 (tracers #3–#10); slice-2 PRD is #49 (tracers #50–#57).
+**Slices 1–3 are shipped** (slice-2 coverage closed by ADR-0033/0034/0035; slice 3 / the Planner by ADR-0036–0041). **Slice 4 (bounded agent execution — Executor + Interpreter) is the next design + build target.** PRDs: slice-1 #2 (tracers #3–#10), slice-2 #49 (#50–#57), slice-3 #59 (tracers #61–#67).
 
 ## Agent skills
 
