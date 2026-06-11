@@ -28,7 +28,9 @@ from doo.coverage.queries import _load_principals, run_c1, run_c2, run_c2b, run_
 from doo.ids import EngagementId
 from doo.infra.neo4j_driver import Neo4jClient
 from doo.observability.logging import get_logger
+from doo.ontology.queries import for_engagement
 from doo.planner.assemble import (
+    assemble_boundary_pack,
     assemble_c2_pack,
     assemble_c2b_pack,
     assemble_c3_pack,
@@ -520,6 +522,155 @@ class C3Generator:
         )
 
 
+def _load_boundary_ids(
+    client: Neo4jClient, engagement_id: EngagementId, kinds: tuple[str, ...]
+) -> list[tuple[str, str]]:
+    """Active `TrustBoundary` (id, kind) pairs of the given kinds, ordered by id."""
+
+    frag = for_engagement(engagement_id, var="tb")
+    rows = client.execute_read(
+        f"""
+        MATCH (tb:TrustBoundary)
+        {frag.and_("(tb.status IS NULL OR tb.status = 'active') AND tb.kind IN $kinds")}
+        RETURN tb.id AS id, tb.kind AS kind
+        ORDER BY tb.id
+        """,
+        kinds=list(kinds),
+        **frag.parameters,
+    )
+    return [(str(r["id"]), str(r["kind"])) for r in rows]
+
+
+def _run_boundary_generator(
+    client: Neo4jClient,
+    engagement_id: EngagementId,
+    caller: LLMCaller,
+    *,
+    kinds: tuple[str, ...],
+    generator_id: GeneratorId,
+    now: datetime | None,
+) -> LLMRunResult:
+    """Shared driver for the capability/tenant boundary generators (ADR-0039).
+
+    Iterates the engagement's `TrustBoundary` nodes of the given kinds; each becomes
+    a bounded boundary pack (`assemble_boundary_pack` — endpoint from `DERIVED_FROM`
+    evidence, attacker side marked); the LLM proposes one boundary replay; the shared
+    `resolve_draft` maps the handles back, stamping `generator_id`, and produces a
+    `TARGETS_BOUNDARY` proposal. A boundary that can't be assembled (ambiguous tier,
+    missing tenant auth, no evidence endpoint) is skipped before any model call.
+    """
+
+    run_at = now or datetime.now(UTC)
+    boundaries = _load_boundary_ids(client, engagement_id, kinds)
+
+    proposed: list[LLMProposed] = []
+    rejected: list[LLMRejected] = []
+    skipped: list[LLMSkipped] = []
+
+    for boundary_id, boundary_kind in boundaries:
+        pack = assemble_boundary_pack(
+            client,
+            engagement_id=engagement_id,
+            boundary_id=boundary_id,
+            boundary_kind=boundary_kind,
+            code_version=__version__,
+            now=run_at,
+        )
+        if pack is None:
+            skipped.append(
+                LLMSkipped(
+                    reason=(
+                        f"unproposable {generator_id} boundary {boundary_id} "
+                        f"({boundary_kind}): no resolvable sides / evidence endpoint"
+                    )
+                )
+            )
+            continue
+        try:
+            call = caller.propose(pack)
+        except LLMProposalError as exc:
+            skipped.append(
+                LLMSkipped(reason=f"LLM proposal unparseable for boundary {boundary_id}: {exc}")
+            )
+            continue
+        outcome = resolve_draft(pack, call.draft, generator=generator_id)
+        if isinstance(outcome, DraftRejected):
+            rejected.append(LLMRejected(rejection=outcome, call=call))
+            continue
+        proposed.append(LLMProposed(proposal=outcome, call=call))
+
+    log.info(
+        "planner.generator.boundary.complete",
+        engagement_id=engagement_id,
+        generator=generator_id,
+        candidates=len(boundaries),
+        proposed=len(proposed),
+        rejected=len(rejected),
+        skipped=len(skipped),
+    )
+    return LLMRunResult(
+        candidates=len(boundaries),
+        proposed=tuple(proposed),
+        rejected=tuple(rejected),
+        skipped=tuple(skipped),
+    )
+
+
+class C4Generator:
+    """LLM-proposing generator for **capability** `TrustBoundary`s (ADR-0039).
+
+    Consumes the capability boundaries S4 inferred (scope/mfa/freshness — the same
+    tier deltas C4 surfaces) and proposes a privilege-escalation replay: the
+    evidenced request (reached by the stronger token) replayed under the weaker
+    token, `TARGETS_BOUNDARY`.
+    """
+
+    generator_id: GeneratorId = "c4"
+    mode: ProposalMode = "llm"
+
+    def __init__(self, caller: LLMCaller) -> None:
+        self._caller = caller
+
+    def run(
+        self,
+        client: Neo4jClient,
+        engagement_id: EngagementId,
+        *,
+        now: datetime | None = None,
+    ) -> LLMRunResult:
+        return _run_boundary_generator(
+            client, engagement_id, self._caller,
+            kinds=("scope", "mfa", "freshness"), generator_id="c4", now=now,
+        )
+
+
+class TenantBoundaryGenerator:
+    """LLM-proposing generator for **tenant** `TrustBoundary`s (ADR-0039).
+
+    Consumes tenant boundaries (Tenant pairs sharing an endpoint) and proposes a
+    cross-tenant replay: hold tenant-A's resource ref, swap tenant-B's auth,
+    `TARGETS_BOUNDARY`.
+    """
+
+    generator_id: GeneratorId = "tenant"
+    mode: ProposalMode = "llm"
+
+    def __init__(self, caller: LLMCaller) -> None:
+        self._caller = caller
+
+    def run(
+        self,
+        client: Neo4jClient,
+        engagement_id: EngagementId,
+        *,
+        now: datetime | None = None,
+    ) -> LLMRunResult:
+        return _run_boundary_generator(
+            client, engagement_id, self._caller,
+            kinds=("tenant",), generator_id="tenant", now=now,
+        )
+
+
 class PlannerConfig(BaseModel):
     """Deterministic planner configuration (ADR-0036).
 
@@ -544,7 +695,7 @@ _REGISTRY: dict[GeneratorId, CandidateGenerator] = {
 
 # LLM-proposing generator ids (ADR-0037). Known to config validation, but built by
 # the service (not the singleton registry) because each holds a runtime `LLMCaller`.
-_LLM_GENERATOR_IDS: tuple[GeneratorId, ...] = ("c2", "c2b", "c3")
+_LLM_GENERATOR_IDS: tuple[GeneratorId, ...] = ("c2", "c2b", "c3", "c4", "tenant")
 
 # Every generator id config may legitimately name (deterministic ∪ LLM).
 _KNOWN_GENERATOR_IDS: frozenset[GeneratorId] = frozenset(_REGISTRY) | frozenset(
@@ -613,5 +764,7 @@ def enabled_llm_generators(
         "c2": C2Generator(caller),
         "c2b": C2bGenerator(caller),
         "c3": C3Generator(caller),
+        "c4": C4Generator(caller),
+        "tenant": TenantBoundaryGenerator(caller),
     }
     return [builders[gid] for gid in _LLM_GENERATOR_IDS if gid in wanted]

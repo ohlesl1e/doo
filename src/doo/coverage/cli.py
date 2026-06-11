@@ -17,8 +17,8 @@ import os
 
 import typer
 
-from doo.coverage.models import C1Result, C2bResult, C2Result, C3Result
-from doo.coverage.queries import run_c1, run_c2, run_c2b, run_c3
+from doo.coverage.models import C1Result, C2bResult, C2Result, C3Result, C4Result
+from doo.coverage.queries import run_c1, run_c2, run_c2b, run_c3, run_c4
 from doo.ids import EngagementId
 from doo.infra.neo4j_driver import Neo4jClient
 
@@ -308,3 +308,63 @@ def c3(
         typer.echo(_json.dumps([r.model_dump(mode="json") for r in rows], indent=2))
     else:
         _render_c3_table(rows)
+
+
+def _render_c4_table(rows: list[C4Result]) -> None:
+    if not rows:
+        typer.echo(
+            "C4: no capability-tier gaps "
+            "(no principal holds two tokens with a capability-claim delta where the "
+            "stronger reached an endpoint the weaker did not)."
+        )
+        return
+    typer.echo(f"C4 — capability-tier authz gaps (strong reached, weak did not): {len(rows)}")
+    typer.echo(
+        f"{'PRINCIPAL':<26} {'KIND':<10} {'METHOD':<7} {'PATH':<34} "
+        f"{'STRONG(stat)':<12} {'CONF':>6}"
+    )
+    for r in rows:
+        typer.echo(
+            f"{r.principal_label[:26]:<26} {r.capability_kind:<10} {r.method:<7} "
+            f"{r.path_template[:34]:<34} {str(r.evidence_strong.status):<12} "
+            f"{r.effective_confidence:>6.3f}"
+        )
+
+
+@coverage_app.command("c4")
+def c4(
+    engagement: str = typer.Option(
+        ..., "--engagement", "-e", help="Engagement id to analyze."
+    ),
+    min_confidence: float = typer.Option(
+        0.0,
+        "--min-confidence",
+        help="Drop rows below this effective (decayed) confidence. Default 0 = "
+        "surface everything (low-confidence leads are never silently hidden).",
+    ),
+    as_json: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit the typed result models as JSON (round-trippable) instead of a table.",
+    ),
+) -> None:
+    """C4: endpoints a principal's stronger token reached that its weaker token did not."""
+
+    from doo.observability.ids import new_span_id, new_trace_id
+    from doo.observability.logging import bind_correlation, configure_logging
+
+    configure_logging()
+    bind_correlation(trace_id=new_trace_id(), span_id=new_span_id())
+
+    client = _build_client()
+    try:
+        rows = run_c4(client, EngagementId(engagement), min_confidence=min_confidence)
+    finally:
+        client.close()
+
+    if as_json:
+        import json as _json
+
+        typer.echo(_json.dumps([r.model_dump(mode="json") for r in rows], indent=2))
+    else:
+        _render_c4_table(rows)

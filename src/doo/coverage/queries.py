@@ -31,10 +31,22 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from doo.canonical.trust_boundary import (
+    capability_kind_for_delta,
+    differing_capability_claims,
+    stronger_capability_side,
+)
 from doo.canonical.value_objects import Scheme
 from doo.coverage.decay import effective_confidence
-from doo.coverage.models import C1Result, C2bResult, C2Result, C3Result, PrincipalEvidence
-from doo.coverage.reached import ReachedEvidence, reached_map
+from doo.coverage.models import (
+    C1Result,
+    C2bResult,
+    C2Result,
+    C3Result,
+    C4Result,
+    PrincipalEvidence,
+)
+from doo.coverage.reached import ReachedEvidence, reached_by_auth_map, reached_map
 from doo.ids import EngagementId
 from doo.infra.neo4j_driver import Neo4jClient
 from doo.observability.logging import get_logger
@@ -879,6 +891,171 @@ def run_c3(
         engagement_id=engagement_id,
         pivots=len(results),
         include_same_endpoint=include_same_endpoint,
+        min_confidence=min_confidence,
+    )
+    return results
+
+
+# ---------------------------------------------------------------------------
+# C4 — capability-tier authz coverage (ADR-0033 / ADR-0039).
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _AuthCtxView:
+    """One non-anonymous AuthContext with its decoded claims + owning principal."""
+
+    auth_context_id: str
+    principal_id: str
+    principal_label: str
+    claims: dict[str, object]
+
+
+def _load_auth_contexts_with_claims(
+    client: Neo4jClient, engagement_id: EngagementId
+) -> list[_AuthCtxView]:
+    """Read each active non-anonymous AuthContext with its decoded `bearer_claims`.
+
+    `bearer_claims` is stored as a JSON string (ADR-0025); parsed in Python. Used by
+    C4 to find capability-differing token pairs of the same Principal.
+    """
+
+    rows = client.execute_read(
+        """
+        MATCH (ac:AuthContext {engagement_id: $eid})-[:OF_PRINCIPAL]->
+              (p:Principal {engagement_id: $eid})
+        WHERE (ac.is_anonymous IS NULL OR ac.is_anonymous = false)
+          AND (ac.status IS NULL OR ac.status = 'active')
+          AND (p.status IS NULL OR p.status = 'active')
+        RETURN ac.id AS acid, ac.bearer_claims AS claims, p.id AS pid,
+               p.is_anonymous AS p_anon, p.label AS label, p.identity_key AS ikey
+        ORDER BY ac.id
+        """,
+        eid=engagement_id,
+    )
+    out: list[_AuthCtxView] = []
+    for row in rows:
+        raw = row["claims"]
+        claims: dict[str, object] = {}
+        if raw:
+            parsed = json.loads(str(raw))
+            if isinstance(parsed, dict):
+                claims = parsed
+        label = (
+            "anon"
+            if row["p_anon"]
+            else (str(row["label"]) if row["label"] else str(row["ikey"]))
+        )
+        out.append(
+            _AuthCtxView(str(row["acid"]), str(row["pid"]), label, claims)
+        )
+    return out
+
+
+def _claims_summary(claims: dict[str, object]) -> str | None:
+    """A secret-free one-liner of claim NAMES (never values, ADR-0015)."""
+
+    if not claims:
+        return None
+    return "claims: " + ", ".join(sorted(str(k) for k in claims))
+
+
+def run_c4(
+    client: Neo4jClient,
+    engagement_id: EngagementId,
+    *,
+    min_confidence: float = 0.0,
+    now: datetime | None = None,
+) -> list[C4Result]:
+    """C4 — capability-tier authz gaps (ADR-0033/0039): strong reached, weak did not.
+
+    For each `Principal` holding ≥2 non-anonymous AuthContexts that differ on a
+    capability claim (`scope`/`mfa`/`freshness`) with a CLEAR strong/weak ordering,
+    emit the in-scope endpoints the **stronger** token reached (2xx) that the
+    **weaker** token never reached. Reach is at AuthContext granularity
+    (`reached_by_auth_map`), deliberately asymmetric (a 401/403/no-request on the
+    weak side counts as not reached). Pairs with no distinguishing claim, or an
+    ambiguous tier ordering (disjoint scopes, etc.), are dropped — C4 never invents
+    a capability tier it cannot observe (ADR-0039 evidence-gating).
+
+    Engagement-scoped (ADR-0017), `status='active'` throughout, in-scope via
+    `is_in_scope` (ADR-0020), effective confidence decayed (ADR-0005) with opt-in
+    `min_confidence`. No `dispatch_status` filter (slice 4). `now` injectable.
+    """
+
+    run_at = now or datetime.now(UTC)
+    scope = _load_scope_rules(client, engagement_id)
+    endpoints = _load_in_scope_endpoints(
+        client, engagement_id, scope, run_at=run_at, query="c4"
+    )
+    reached = reached_by_auth_map(client, engagement_id)
+    auths = _load_auth_contexts_with_claims(client, engagement_id)
+
+    by_principal: dict[str, list[_AuthCtxView]] = {}
+    for a in auths:
+        by_principal.setdefault(a.principal_id, []).append(a)
+
+    results: list[C4Result] = []
+    for acs in by_principal.values():
+        for i in range(len(acs)):
+            for j in range(i + 1, len(acs)):
+                a, b = acs[i], acs[j]
+                kind = capability_kind_for_delta(
+                    differing_capability_claims(a.claims, b.claims)
+                )
+                if kind is None:
+                    continue
+                side = stronger_capability_side(a.claims, b.claims, kind)
+                if side is None:
+                    continue  # ambiguous tier ordering — not a C4 differential.
+                strong, weak = (a, b) if side == "a" else (b, a)
+                for endpoint_id, ep in endpoints.items():
+                    ev_s = reached.get((endpoint_id, strong.auth_context_id))
+                    if ev_s is None:
+                        continue  # strong must have genuine 2xx access.
+                    if (endpoint_id, weak.auth_context_id) in reached:
+                        continue  # weak reached it too — not a tier differential.
+                    eff = ep["effective_confidence"]
+                    if eff < min_confidence:
+                        continue
+                    results.append(
+                        C4Result(
+                            engagement_id=engagement_id,
+                            generated_at=run_at,
+                            endpoint_id=endpoint_id,
+                            method=str(ep["method"]),
+                            host=str(ep["host"]),
+                            path_template=str(ep["path_template"]),
+                            principal_label=strong.principal_label,
+                            capability_kind=kind,
+                            strong_auth_context_id=strong.auth_context_id,
+                            weak_auth_context_id=weak.auth_context_id,
+                            strong_claims_summary=_claims_summary(strong.claims),
+                            weak_claims_summary=_claims_summary(weak.claims),
+                            evidence_strong=PrincipalEvidence(
+                                principal_id=strong.auth_context_id,
+                                label=strong.principal_label,
+                                status=ev_s.status,
+                                response_size_bytes=ev_s.response_size_bytes,
+                                response_body_sha256=ev_s.response_body_sha256,
+                            ),
+                            effective_confidence=eff,
+                        )
+                    )
+
+    results.sort(
+        key=lambda r: (
+            r.principal_label,
+            r.capability_kind,
+            r.host,
+            r.path_template,
+            r.method,
+        )
+    )
+    log.info(
+        "coverage.c4.complete",
+        engagement_id=engagement_id,
+        gaps=len(results),
         min_confidence=min_confidence,
     )
     return results

@@ -29,25 +29,29 @@ from doo.coverage.models import (
     C2bResult,
     C2Result,
     C3Result,
+    C4Result,
     CoverageResult,
     PrincipalEvidence,
 )
-from doo.coverage.queries import run_c1, run_c2, run_c2b, run_c3
-from doo.coverage.reached import reached, reached_map
+from doo.coverage.queries import run_c1, run_c2, run_c2b, run_c3, run_c4
+from doo.coverage.reached import reached, reached_by_auth_map, reached_map
 
 __all__ = [
     "C1Result",
     "C2Result",
     "C2bResult",
     "C3Result",
+    "C4Result",
     "CoverageResult",
     "PrincipalEvidence",
     "coverage_app",
     "effective_confidence",
     "reached",
+    "reached_by_auth_map",
     "reached_map",
     "run_c1",
     "run_c2",
     "run_c2b",
     "run_c3",
+    "run_c4",
 ]

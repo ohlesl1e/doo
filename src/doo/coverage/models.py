@@ -165,6 +165,38 @@ class C3Result(CoverageResult):
     effective_confidence: float
 
 
+class C4Result(CoverageResult):
+    """One capability-tier authz gap: a strong AuthContext reached, the weak did not.
+
+    The capability analog of C2 (ADR-0033/0039): within a single `Principal` that
+    holds two AuthContexts differing on a capability claim (`scope`/`mfa`/`freshness`),
+    an endpoint the **stronger** token reached (2xx) that the **weaker** token never
+    reached (or was blocked on). Surfaced only where the claim delta gives a clear
+    tier ordering — disjoint/ambiguous tiers are dropped (no synthesized capability,
+    ADR-0039 evidence-gating).
+
+    The row names the endpoint `(method, host, path_template)` + `endpoint_id`, the
+    Principal label, the `capability_kind` that distinguishes the tiers, and the
+    strong / weak AuthContext ids + claim summaries. `evidence_strong` is the strong
+    token's real 2xx evidence; the weak side is null (it did not reach).
+    """
+
+    query_id: str = Field(default="C4", frozen=True)
+
+    endpoint_id: str
+    method: str
+    host: str
+    path_template: str
+    principal_label: str
+    capability_kind: str
+    strong_auth_context_id: str
+    weak_auth_context_id: str
+    strong_claims_summary: str | None = None
+    weak_claims_summary: str | None = None
+    evidence_strong: PrincipalEvidence
+    effective_confidence: float
+
+
 class C1Result(CoverageResult):
     """One in-scope `Endpoint` with no `HIT` edge of any kind (a dead endpoint).
 

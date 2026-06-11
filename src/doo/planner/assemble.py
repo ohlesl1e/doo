@@ -36,10 +36,18 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any, cast
 
+from doo.canonical.trust_boundary import CapabilityKind, stronger_capability_side
 from doo.coverage.models import C2bResult, C2Result, C3Result
 from doo.events.l2 import ValueCandidate
-from doo.ids import AuthContextId, EngagementId, ParameterId, Sha256Hex
+from doo.ids import (
+    AuthContextId,
+    EngagementId,
+    ParameterId,
+    Sha256Hex,
+    TrustBoundaryId,
+)
 from doo.infra.neo4j_driver import Neo4jClient
 from doo.observability.logging import get_logger
 from doo.ontology.queries import for_engagement
@@ -64,7 +72,7 @@ class _AuthView:
     claims_summary: str | None
 
 
-def _summarise_claims(bearer_claims_json: str | None) -> str | None:
+def _summarise_claims(bearer_claims_json: object) -> str | None:
     """A secret-free one-liner of an AuthContext's bearer claims (names only).
 
     The token's *claim names* (e.g. `sub, role, org_id`) orient the LLM without
@@ -74,7 +82,7 @@ def _summarise_claims(bearer_claims_json: str | None) -> str | None:
     if not bearer_claims_json:
         return None
     try:
-        claims = json.loads(bearer_claims_json)
+        claims = json.loads(str(bearer_claims_json))
     except (json.JSONDecodeError, TypeError):
         return None
     if not isinstance(claims, dict) or not claims:
@@ -509,6 +517,207 @@ def _parse_value_candidates(raw: object) -> tuple[ValueCandidate, ...]:
         except ValueError:
             continue
     return tuple(out)
+
+
+def _boundary_evidence_endpoint(
+    client: Neo4jClient, engagement_id: EngagementId, boundary_id: str
+) -> tuple[str, str, str] | None:
+    """The (endpoint_id, method, path_template) of a boundary's DERIVED_FROM evidence."""
+
+    frag = for_engagement(engagement_id, var="tb")
+    rows = client.execute_read(
+        f"""
+        MATCH (tb:TrustBoundary {{id: $tbid}})-[:DERIVED_FROM]->
+              (r:RequestObservation)-[:HIT]->(e:Endpoint)
+        {frag.and_("(tb.status IS NULL OR tb.status = 'active') AND e.status = 'active'")}
+        RETURN e.id AS id, e.method AS method, e.path_template AS path_template
+        ORDER BY e.id
+        LIMIT 1
+        """,
+        tbid=boundary_id,
+        **frag.parameters,
+    )
+    if not rows:
+        return None
+    r = rows[0]
+    return str(r["id"]), str(r["method"]), str(r["path_template"])
+
+
+def _parse_claims(raw: object) -> dict[str, object]:
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(str(raw))
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _capability_auth_contexts(
+    client: Neo4jClient, engagement_id: EngagementId, boundary_id: str, cap_kind: str
+) -> tuple[PackAuthContext, PackAuthContext] | None:
+    """The (victim=stronger, attacker=weaker) auth contexts of a capability boundary."""
+
+    if cap_kind not in ("scope", "mfa", "freshness"):
+        return None
+    frag = for_engagement(engagement_id, var="tb")
+    rows = client.execute_read(
+        f"""
+        MATCH (tb:TrustBoundary {{id: $tbid}})-[:BETWEEN]->(ac:AuthContext)
+        {frag.and_("(ac.status IS NULL OR ac.status = 'active')")}
+        RETURN ac.id AS id, ac.bearer_claims AS claims, ac.tier AS tier
+        ORDER BY ac.id
+        """,
+        tbid=boundary_id,
+        **frag.parameters,
+    )
+    if len(rows) != 2:
+        return None
+    claims = [_parse_claims(r["claims"]) for r in rows]
+    direction = stronger_capability_side(claims[0], claims[1], cast("CapabilityKind", cap_kind))
+    if direction is None:
+        return None
+    strong_i, weak_i = (0, 1) if direction == "a" else (1, 0)
+
+    def _ctx(i: int, *, attacker: bool, label: str) -> PackAuthContext:
+        return PackAuthContext(
+            handle="A2" if attacker else "A1",
+            principal_label=label,
+            tier=str(rows[i]["tier"]) if rows[i]["tier"] is not None else None,
+            claims_summary=_summarise_claims(rows[i]["claims"]),
+            is_attacker_candidate=attacker,
+            auth_context_id=AuthContextId(str(rows[i]["id"])),
+        )
+
+    return (
+        _ctx(strong_i, attacker=False, label=f"{cap_kind}-stronger-tier"),
+        _ctx(weak_i, attacker=True, label=f"{cap_kind}-weaker-tier"),
+    )
+
+
+def _tenant_auth_contexts(
+    client: Neo4jClient, engagement_id: EngagementId, boundary_id: str
+) -> tuple[PackAuthContext, PackAuthContext] | None:
+    """The (victim=tenant-A, attacker=tenant-B) auth contexts of a tenant boundary."""
+
+    frag = for_engagement(engagement_id, var="tb")
+    tenants = client.execute_read(
+        f"""
+        MATCH (tb:TrustBoundary {{id: $tbid}})-[:BETWEEN]->(t:Tenant)
+        {frag.and_("(t.status IS NULL OR t.status = 'active')")}
+        RETURN t.id AS id, t.normalized_value AS value
+        ORDER BY t.id
+        """,
+        tbid=boundary_id,
+        **frag.parameters,
+    )
+    if len(tenants) != 2:
+        return None
+
+    def _auth_for_tenant(tenant_id: str) -> dict[str, object] | None:
+        afrag = for_engagement(engagement_id, var="ac")
+        rows = client.execute_read(
+            f"""
+            MATCH (t:Tenant {{id: $tid}})<-[:OF_TENANT]-(:Principal)<-[:OF_PRINCIPAL]-(ac:AuthContext)
+            {afrag.and_("(ac.status IS NULL OR ac.status = 'active')")}
+            RETURN ac.id AS id, ac.tier AS tier, ac.bearer_claims AS claims
+            ORDER BY coalesce(ac.is_anonymous, false) ASC, ac.id ASC
+            LIMIT 1
+            """,
+            tid=tenant_id,
+            **afrag.parameters,
+        )
+        return rows[0] if rows else None
+
+    a, b = _auth_for_tenant(str(tenants[0]["id"])), _auth_for_tenant(str(tenants[1]["id"]))
+    if a is None or b is None:
+        return None
+
+    def _ctx(row: dict[str, object], tval: object, *, attacker: bool) -> PackAuthContext:
+        return PackAuthContext(
+            handle="A2" if attacker else "A1",
+            principal_label=f"tenant:{tval}",
+            tier=str(row["tier"]) if row["tier"] is not None else None,
+            claims_summary=_summarise_claims(row["claims"]),
+            is_attacker_candidate=attacker,
+            auth_context_id=AuthContextId(str(row["id"])),
+        )
+
+    return (
+        _ctx(a, tenants[0]["value"], attacker=False),
+        _ctx(b, tenants[1]["value"], attacker=True),
+    )
+
+
+def assemble_boundary_pack(
+    client: Neo4jClient,
+    *,
+    engagement_id: EngagementId,
+    boundary_id: str,
+    boundary_kind: str,
+    code_version: str,
+    now: datetime,
+) -> ContextPack | None:
+    """Build the `ContextPack` for one capability/tenant `TrustBoundary`, or None.
+
+    The boundary is the target (`T1`, `kind="boundary"`); its concrete endpoint is
+    read from `DERIVED_FROM` evidence (ADR-0039 — no endpoint edge on the boundary).
+    The two `BETWEEN` sides become the auth contexts with the attacker side marked:
+    - **capability** (`boundary_kind ∈ {scope,mfa,freshness}`): two AuthContexts of one
+      Principal, the **weaker** tier the attacker; None when the ordering is ambiguous.
+    - **tenant** (`boundary_kind = "tenant"`): two Tenants, one AuthContext per tenant
+      (via `OF_TENANT`/`OF_PRINCIPAL`), the second the attacker; None when either has
+      no resolvable AuthContext.
+    """
+
+    evidence = _boundary_evidence_endpoint(client, engagement_id, boundary_id)
+    if evidence is None:
+        return None
+    endpoint_id, method, path_template = evidence
+
+    if boundary_kind == "tenant":
+        sides = _tenant_auth_contexts(client, engagement_id, boundary_id)
+        candidate_kind = "tenant"
+        reason = (
+            f"Tenant boundary: replay {method} {path_template} (held as tenant A's "
+            f"resource) under tenant B's auth to test cross-tenant access"
+        )
+    else:
+        sides = _capability_auth_contexts(client, engagement_id, boundary_id, boundary_kind)
+        candidate_kind = "capability"
+        reason = (
+            f"Capability boundary ({boundary_kind}): replay {method} {path_template} "
+            f"(reached by the stronger tier) under the weaker token to test privilege "
+            f"escalation"
+        )
+    if sides is None:
+        log.warning(
+            "planner.assemble.boundary_unproposable",
+            engagement_id=engagement_id,
+            boundary_id=boundary_id,
+            boundary_kind=boundary_kind,
+        )
+        return None
+
+    target = PackTarget(
+        handle="T1",
+        kind="boundary",
+        method=method,
+        path_template=path_template,
+        endpoint_id=endpoint_id,
+        trust_boundary_id=TrustBoundaryId(boundary_id),
+    )
+    return ContextPack(
+        engagement_id=engagement_id,
+        candidate_kind=cast("Any", candidate_kind),
+        candidate_reason=reason,
+        endpoint_method=method,
+        endpoint_path_template=path_template,
+        targets=(target,),
+        auth_contexts=sides,
+        code_version=code_version,
+        generated_at=now,
+    )
 
 
 def fetch_reaching_observation_hazards(

@@ -107,3 +107,68 @@ def capability_kind_for_delta(differing_claims: frozenset[str]) -> CapabilityKin
         if claim_name in differing_claims:
             return kind
     return None
+
+
+def _scope_set(claims: Mapping[str, object]) -> frozenset[str]:
+    """The set of scopes a claims map carries (space-delimited or list), or empty."""
+
+    norm = _claim_value(claims, "scope")
+    if isinstance(norm, tuple):
+        return frozenset(norm)
+    return frozenset()
+
+
+def stronger_capability_side(
+    claims_a: Mapping[str, object],
+    claims_b: Mapping[str, object],
+    kind: CapabilityKind,
+) -> Literal["a", "b"] | None:
+    """Which side is the STRONGER capability tier on `kind` — `"a"`, `"b"`, or None.
+
+    The direction C4 turns on (the *strong* AuthContext reached an endpoint the
+    *weak* one did not). Evidence-gated like the rest of capability inference: an
+    ordering that cannot be observed cleanly returns None (C4 does not invent a tier).
+
+    - `scope`: the side whose scope set is a strict SUPERSET is stronger; disjoint
+      or equal sets are ambiguous (None).
+    - `mfa`: higher `acr` wins; failing a clear `acr` order, a strict-superset `amr`
+      (more auth methods) wins; otherwise None.
+    - `freshness`: the larger (more recent) `auth_time` is stronger; equal or
+      unparseable is None.
+    """
+
+    if kind == "scope":
+        a, b = _scope_set(claims_a), _scope_set(claims_b)
+        if a > b:
+            return "a"
+        if b > a:
+            return "b"
+        return None
+    if kind == "mfa":
+        acr_a, acr_b = claims_a.get("acr"), claims_b.get("acr")
+        if acr_a is not None and acr_b is not None and acr_a != acr_b:
+            try:
+                return "a" if float(str(acr_a)) > float(str(acr_b)) else "b"
+            except ValueError:
+                return "a" if str(acr_a) > str(acr_b) else "b"
+        amr_a = _claim_value(claims_a, "amr")
+        amr_b = _claim_value(claims_b, "amr")
+        sa = frozenset(amr_a) if isinstance(amr_a, tuple) else frozenset()
+        sb = frozenset(amr_b) if isinstance(amr_b, tuple) else frozenset()
+        if sa > sb:
+            return "a"
+        if sb > sa:
+            return "b"
+        return None
+    if kind == "freshness":
+        try:
+            fa = float(str(claims_a.get("auth_time")))
+            fb = float(str(claims_b.get("auth_time")))
+        except (TypeError, ValueError):
+            return None
+        if fa > fb:
+            return "a"
+        if fb > fa:
+            return "b"
+        return None
+    return None
