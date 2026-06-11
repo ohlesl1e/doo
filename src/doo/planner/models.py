@@ -41,8 +41,8 @@ from doo.ids import (
 # the `source` provenance tag on a committed deterministic TestCase
 # (`deterministic-c1`, ADR-0036). LLM-proposing generators (slice-3 tracers,
 # slice 4) commit `source = "llm-planner"` instead.
-GeneratorId = Literal["c1", "c2", "c2b", "c3", "c4", "tenant"]
-GENERATOR_IDS: tuple[GeneratorId, ...] = ("c1", "c2", "c2b", "c3", "c4", "tenant")
+GeneratorId = Literal["c1", "c2", "c2b", "c3", "c4", "tenant", "sink"]
+GENERATOR_IDS: tuple[GeneratorId, ...] = ("c1", "c2", "c2b", "c3", "c4", "tenant", "sink")
 
 # A replay-breaking request-field role (ADR-0041). A field bound to the original
 # session whose verbatim replay under a swapped identity would fail for a *non-authz*
@@ -230,6 +230,16 @@ C3TestClass = Literal["leak_replay", "ssrf", "idor", "open-redirect"]
 # object/ownership) when the evidence supports it.
 BoundaryTestClass = Literal["boundary-violation", "privilege-escalation", "idor", "bola"]
 
+# Sink-parameter roles (ADR-0036, S6) — a request parameter that consumes a
+# caller-controlled address. Deterministically detected (`sink_params.py`), never
+# LLM. Ordered by detection precedence (redirect > url > file).
+SinkRole = Literal["redirect_target", "url_sink", "file_path"]
+SINK_ROLES: tuple[SinkRole, ...] = ("redirect_target", "url_sink", "file_path")
+
+# What the LLM may classify a sink-parameter test as — the dangerous-sink classes
+# (`lfi` maps to the `path-traversal` TestClass). Constrained to the sink frame.
+SinkTestClass = Literal["ssrf", "open-redirect", "path-traversal"]
+
 
 class PackTarget(BaseModel):
     """One holdable/targetable node in a context pack, addressed by `handle`.
@@ -331,7 +341,7 @@ class ContextPack(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     engagement_id: EngagementId
-    candidate_kind: Literal["C2", "C2b", "C3", "capability", "tenant"]
+    candidate_kind: Literal["C2", "C2b", "C3", "capability", "tenant", "sink"]
     candidate_reason: str
     endpoint_method: str
     endpoint_path_template: str
@@ -387,7 +397,7 @@ class LLMProposalDraft(BaseModel):
 
     # Either an authz class (C2/C2b) or a leak-replay class (C3); the per-candidate
     # tool schema constrains which set the model actually sees.
-    test_class: C2TestClass | C3TestClass | BoundaryTestClass
+    test_class: C2TestClass | C3TestClass | BoundaryTestClass | SinkTestClass
     target_ref: str = Field(min_length=1)
     auth_context_ref: str = Field(min_length=1)
     hold: tuple[str, ...] = ()

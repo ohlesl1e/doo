@@ -237,7 +237,16 @@ def _resolve_payload_hash(
         if not rows:
             return None
         return Sha256Hex(str(rows[0]["value_hash"]))
-    # `configured` resolver is not part of slice-3 until the sink_params tracer.
+    if spec.kind == "configured":
+        if spec.config_key is None:
+            return None  # guarded by the PayloadSpec model_validator, defensive here.
+        # The `sink_params` payload is a SINGLE canonical probe known at propose time
+        # (ADR-0037) — the tester-configured callback/marker for this key. Slice 3
+        # dispatches nothing, so the resolver returns a deterministic content address
+        # for the probe (stable per key); the slice-4 dispatcher substitutes the real
+        # configured callback (ADR-0012) at execution under its OPA check (ADR-0038).
+        canonical = f"configured-probe:{spec.config_key}"
+        return Sha256Hex(hashlib.sha256(canonical.encode("utf-8")).hexdigest())
     return None
 
 

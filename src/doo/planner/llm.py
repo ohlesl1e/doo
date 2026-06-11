@@ -320,11 +320,85 @@ BOUNDARY_PROPOSE_TOOL: dict[str, Any] = {
 }
 
 
+SINK_SYSTEM_PROMPT = (
+    "You are a black-box web application security tester proposing ONE test for a "
+    "SINK parameter — a request parameter that consumes a caller-controlled address "
+    "(a URL, redirect target, or file path). You are given a context pack with the "
+    "sink parameter as the target handle and the endpoint it belongs to.\n\n"
+    "Rules:\n"
+    "- You do NOT write requests or payloads. A single configured probe (the "
+    "tester's callback URL / canonical marker) is sent as the parameter "
+    "automatically; you SELECT the target parameter handle (e.g. 'T1') and the "
+    "auth-context handle (e.g. 'A1') and CLASSIFY.\n"
+    "- Only use handles present in the pack. Never invent one.\n"
+    "- Classify by the sink role: `ssrf` for a server-side URL fetch, "
+    "`open-redirect` for a redirect target, `path-traversal` for a file/path sink.\n"
+    "- `expected_outcome`: a callback hit (SSRF) / a 3xx to the probe (open-redirect) "
+    "/ unintended file contents (path-traversal) confirms the sink.\n"
+    "- Respond by calling `propose_test` exactly once."
+)
+
+
+def build_sink_user_prompt(pack: ContextPack) -> str:
+    """The per-candidate user message for a sink-parameter test."""
+
+    payload = json.dumps(pack.to_llm_payload(), indent=2, sort_keys=True)
+    return (
+        f"Context pack:\n{payload}\n\n"
+        "This endpoint takes a parameter that consumes a caller-controlled address. "
+        "Propose a test that sends the configured probe as that parameter and "
+        "classify what it would reveal. Pick `target_ref` (the sink parameter) and "
+        "`auth_context_ref`, and classify (`test_class`). Call `propose_test`."
+    )
+
+
+# Sink forced-tool schema — the dangerous-sink classes; no authz `hold`.
+SINK_PROPOSE_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "propose_test",
+        "description": "Propose one sink-parameter test.",
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "test_class": {
+                    "type": "string",
+                    "enum": ["ssrf", "open-redirect", "path-traversal"],
+                    "description": "The sink vulnerability class.",
+                },
+                "target_ref": {
+                    "type": "string",
+                    "description": "TARGET handle of the sink parameter (e.g. 'T1').",
+                },
+                "auth_context_ref": {
+                    "type": "string",
+                    "description": "Handle of the auth context to send as (e.g. 'A1').",
+                },
+                "justification": {"type": "string", "description": "Why this test, citing the sink."},
+                "expected_outcome": {"type": "string", "description": "What would confirm the sink."},
+                "expected_yield": {"type": "number", "description": "0..1 priority hunch."},
+            },
+            "required": [
+                "test_class",
+                "target_ref",
+                "auth_context_ref",
+                "justification",
+                "expected_outcome",
+                "expected_yield",
+            ],
+        },
+    },
+}
+
+
 def _select_prompt_tool(pack: ContextPack) -> tuple[str, str, dict[str, Any]]:
     """Pick the (system, user, tool) triple for the pack's candidate kind."""
 
     if pack.candidate_kind == "C3":
         return C3_SYSTEM_PROMPT, build_c3_user_prompt(pack), C3_PROPOSE_TOOL
+    if pack.candidate_kind == "sink":
+        return SINK_SYSTEM_PROMPT, build_sink_user_prompt(pack), SINK_PROPOSE_TOOL
     if pack.candidate_kind in ("capability", "tenant"):
         return (
             BOUNDARY_SYSTEM_PROMPT,
@@ -564,6 +638,47 @@ def resolve_c3_draft(
         test_class=draft.test_class,
         payload_class="benign-probe",
         payload_spec=PayloadSpec(kind="observed_value", value_hash=pack.observed_value_hash),
+        auth_context_id=auth.auth_context_id,
+        target_parameter_id=target.parameter_id,
+        expected_yield=draft.expected_yield,
+        confidence_method="llm-self-reported",
+        justification=draft.justification,
+        expected_outcome=draft.expected_outcome,
+    )
+
+
+def resolve_sink_draft(
+    pack: ContextPack, draft: LLMProposalDraft, *, config_key: str
+) -> PlannerProposal | DraftRejected:
+    """Resolve a sink-parameter draft to a configured-payload proposal (ADR-0037).
+
+    Same hallucination guard as `resolve_c3_draft`; the target is the sink
+    `Parameter` and the payload is the single **configured** canonical probe
+    (`payload_class = ssrf-callback`, `payload_spec = configured(config_key)`) — fixed
+    by code, not the LLM (the slice-4 dispatcher resolves the real callback under OPA).
+    """
+
+    targets = {t.handle: t for t in pack.targets}
+    auths = {a.handle: a for a in pack.auth_contexts}
+
+    target = targets.get(draft.target_ref)
+    if target is None:
+        return _reject("unknown_target", pack, draft, f"target_ref {draft.target_ref!r}")
+    if target.kind != "parameter" or target.parameter_id is None:
+        return _reject(
+            "unknown_target", pack, draft, f"target_ref {draft.target_ref!r} is not a parameter"
+        )
+    auth = auths.get(draft.auth_context_ref)
+    if auth is None:
+        return _reject("unknown_auth", pack, draft, f"auth_context_ref {draft.auth_context_ref!r}")
+
+    return PlannerProposal(
+        engagement_id=pack.engagement_id,
+        generator="sink",
+        mode="llm",
+        test_class=draft.test_class,
+        payload_class="ssrf-callback",
+        payload_spec=PayloadSpec(kind="configured", config_key=config_key),
         auth_context_id=auth.auth_context_id,
         target_parameter_id=target.parameter_id,
         expected_yield=draft.expected_yield,

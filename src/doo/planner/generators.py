@@ -34,6 +34,7 @@ from doo.planner.assemble import (
     assemble_c2_pack,
     assemble_c2b_pack,
     assemble_c3_pack,
+    assemble_sink_pack,
     fetch_reaching_observation_hazards,
 )
 from doo.planner.llm import (
@@ -43,6 +44,7 @@ from doo.planner.llm import (
     LLMProposalError,
     resolve_c3_draft,
     resolve_draft,
+    resolve_sink_draft,
 )
 from doo.planner.models import (
     GENERATOR_IDS,
@@ -52,6 +54,7 @@ from doo.planner.models import (
     PlannerProposal,
     ProposalMode,
 )
+from doo.planner.sink_params import sink_role_for_parameter
 
 log = get_logger(__name__)
 
@@ -671,6 +674,110 @@ class TenantBoundaryGenerator:
         )
 
 
+# The engagement-config key the sink probe resolves to (ADR-0037/0012). A single
+# canonical callback/marker; the slice-4 dispatcher substitutes the real value.
+_SINK_CONFIG_KEY = "sink_callback"
+
+
+def _load_sink_parameters(
+    client: Neo4jClient, engagement_id: EngagementId
+) -> list[tuple[str, str]]:
+    """Active (parameter_id, sink_role) pairs whose name/shape flags a sink (S6)."""
+
+    frag = for_engagement(engagement_id, var="p")
+    rows = client.execute_read(
+        f"""
+        MATCH (e:Endpoint)-[:HAS_PARAMETER]->(p:Parameter)
+        {frag.and_("p.status = 'active' AND e.status = 'active'")}
+        RETURN p.id AS id, p.name AS name
+        ORDER BY p.id
+        """,
+        **frag.parameters,
+    )
+    out: list[tuple[str, str]] = []
+    for r in rows:
+        role = sink_role_for_parameter(str(r["name"]))
+        if role is not None:
+            out.append((str(r["id"]), role))
+    return out
+
+
+class SinkGenerator:
+    """LLM-proposing generator for sink-shaped parameters (ADR-0036, S6).
+
+    Deterministically detects `url_sink`/`redirect_target`/`file_path` parameters
+    (`sink_params.py`) — dangerous surface no coverage query encodes — and proposes
+    an SSRF / open-redirect / path-traversal test against each. The payload is the
+    single **configured** canonical probe (`payload_spec = configured`), resolved by
+    the Validator; the LLM only classifies + selects the sink-parameter handle.
+    """
+
+    generator_id: GeneratorId = "sink"
+    mode: ProposalMode = "llm"
+
+    def __init__(self, caller: LLMCaller) -> None:
+        self._caller = caller
+
+    def run(
+        self,
+        client: Neo4jClient,
+        engagement_id: EngagementId,
+        *,
+        now: datetime | None = None,
+    ) -> LLMRunResult:
+        run_at = now or datetime.now(UTC)
+        sinks = _load_sink_parameters(client, engagement_id)
+
+        proposed: list[LLMProposed] = []
+        rejected: list[LLMRejected] = []
+        skipped: list[LLMSkipped] = []
+
+        for parameter_id, sink_role in sinks:
+            pack = assemble_sink_pack(
+                client,
+                engagement_id=engagement_id,
+                parameter_id=parameter_id,
+                sink_role=sink_role,
+                code_version=__version__,
+                now=run_at,
+            )
+            if pack is None:
+                skipped.append(
+                    LLMSkipped(
+                        reason=f"unproposable sink parameter {parameter_id} ({sink_role}): "
+                        "no resolvable endpoint / send-as identity"
+                    )
+                )
+                continue
+            try:
+                call = self._caller.propose(pack)
+            except LLMProposalError as exc:
+                skipped.append(
+                    LLMSkipped(reason=f"LLM proposal unparseable for sink {parameter_id}: {exc}")
+                )
+                continue
+            outcome = resolve_sink_draft(pack, call.draft, config_key=_SINK_CONFIG_KEY)
+            if isinstance(outcome, DraftRejected):
+                rejected.append(LLMRejected(rejection=outcome, call=call))
+                continue
+            proposed.append(LLMProposed(proposal=outcome, call=call))
+
+        log.info(
+            "planner.generator.sink.complete",
+            engagement_id=engagement_id,
+            candidates=len(sinks),
+            proposed=len(proposed),
+            rejected=len(rejected),
+            skipped=len(skipped),
+        )
+        return LLMRunResult(
+            candidates=len(sinks),
+            proposed=tuple(proposed),
+            rejected=tuple(rejected),
+            skipped=tuple(skipped),
+        )
+
+
 class PlannerConfig(BaseModel):
     """Deterministic planner configuration (ADR-0036).
 
@@ -695,7 +802,7 @@ _REGISTRY: dict[GeneratorId, CandidateGenerator] = {
 
 # LLM-proposing generator ids (ADR-0037). Known to config validation, but built by
 # the service (not the singleton registry) because each holds a runtime `LLMCaller`.
-_LLM_GENERATOR_IDS: tuple[GeneratorId, ...] = ("c2", "c2b", "c3", "c4", "tenant")
+_LLM_GENERATOR_IDS: tuple[GeneratorId, ...] = ("c2", "c2b", "c3", "c4", "tenant", "sink")
 
 # Every generator id config may legitimately name (deterministic ∪ LLM).
 _KNOWN_GENERATOR_IDS: frozenset[GeneratorId] = frozenset(_REGISTRY) | frozenset(
@@ -766,5 +873,6 @@ def enabled_llm_generators(
         "c3": C3Generator(caller),
         "c4": C4Generator(caller),
         "tenant": TenantBoundaryGenerator(caller),
+        "sink": SinkGenerator(caller),
     }
     return [builders[gid] for gid in _LLM_GENERATOR_IDS if gid in wanted]

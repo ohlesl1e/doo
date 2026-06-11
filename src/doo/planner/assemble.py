@@ -265,6 +265,81 @@ def assemble_c3_pack(
     )
 
 
+def assemble_sink_pack(
+    client: Neo4jClient,
+    *,
+    engagement_id: EngagementId,
+    parameter_id: str,
+    sink_role: str,
+    code_version: str,
+    now: datetime,
+) -> ContextPack | None:
+    """Build the `ContextPack` for one sink `Parameter` (S6), or None if unproposable.
+
+    The sink parameter is the target (`T1`, `kind="parameter"`, carrying its detected
+    `sink_role` as `semantic`); scope is enforced on its endpoint by the Validator.
+    One send-as identity (`A1`) is resolved from a request that hit the endpoint.
+    Returns None when the parameter / endpoint or a send-as identity does not resolve.
+    """
+
+    frag = for_engagement(engagement_id, var="p")
+    rows = client.execute_read(
+        f"""
+        MATCH (e:Endpoint)-[:HAS_PARAMETER]->(p:Parameter {{id: $pid}}),
+              (e)-[:ON_HOST]->(:Host)
+        {frag.and_("p.status = 'active' AND e.status = 'active'")}
+        RETURN e.id AS eid, e.method AS method, e.path_template AS path,
+               p.name AS name, p.location AS loc
+        LIMIT 1
+        """,
+        pid=parameter_id,
+        **frag.parameters,
+    )
+    if not rows:
+        return None
+    r = rows[0]
+    send_as = _fetch_send_as_auth(client, engagement_id, str(r["eid"]))
+    if send_as is None:
+        return None
+    auth, principal_label = send_as
+
+    target = PackTarget(
+        handle="T1",
+        kind="parameter",
+        method=str(r["method"]),
+        path_template=str(r["path"]),
+        param_name=str(r["name"]),
+        location=str(r["loc"]) if r["loc"] is not None else None,
+        semantic=sink_role,
+        endpoint_id=str(r["eid"]),
+        parameter_id=ParameterId(parameter_id),
+    )
+    auth_ctx = PackAuthContext(
+        handle="A1",
+        principal_label=principal_label,
+        tier=auth.tier,
+        claims_summary=auth.claims_summary,
+        is_attacker_candidate=False,
+        auth_context_id=auth.auth_context_id,
+    )
+    reason = (
+        f"Sink parameter: {r['method']} {r['path']} consumes a caller-controlled "
+        f"{sink_role} via parameter {str(r['name'])!r} — test for the corresponding "
+        f"sink vulnerability (SSRF / open-redirect / path-traversal)"
+    )
+    return ContextPack(
+        engagement_id=engagement_id,
+        candidate_kind="sink",
+        candidate_reason=reason,
+        endpoint_method=str(r["method"]),
+        endpoint_path_template=str(r["path"]),
+        targets=(target,),
+        auth_contexts=(auth_ctx,),
+        code_version=code_version,
+        generated_at=now,
+    )
+
+
 def _fetch_exemplar(
     client: Neo4jClient,
     engagement_id: EngagementId,
