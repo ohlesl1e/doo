@@ -29,6 +29,7 @@ from typing import Any, Protocol, runtime_checkable
 from doo.observability.logging import get_logger
 from doo.planner.models import (
     ContextPack,
+    GeneratorId,
     LLMProposalDraft,
     PayloadSpec,
     PlannerProposal,
@@ -237,11 +238,99 @@ C3_PROPOSE_TOOL: dict[str, Any] = {
 }
 
 
+BOUNDARY_SYSTEM_PROMPT = (
+    "You are a black-box web application security tester proposing ONE test for a "
+    "specific TRUST BOUNDARY (a capability tier or a tenant separation) the graph "
+    "inferred. You are given a context pack with the boundary as the target handle, "
+    "the concrete endpoint its evidence was observed on, and the two sides as auth "
+    "contexts (one marked is_attacker_candidate — the weaker tier, or the other "
+    "tenant).\n\n"
+    "Rules:\n"
+    "- You do NOT write requests or payloads. The evidenced request is replayed "
+    "under the attacker side automatically; you SELECT the boundary target handle "
+    "(e.g. 'T1') and the attacker auth-context handle (e.g. 'A2') and classify.\n"
+    "- Only use handles present in the pack. Never invent one.\n"
+    "- `hold` is the boundary target handle ('T...') — the resource held constant "
+    "while the attacker auth is swapped in. Never an auth handle or free text.\n"
+    "- `auth_context_ref` = the attacker side (is_attacker_candidate): the weaker "
+    "capability token, or the other tenant's auth.\n"
+    "- Classify: `privilege-escalation` for a capability tier, `idor`/`bola` for a "
+    "tenant object/ownership crossing, else `boundary-violation`.\n"
+    "- `expected_outcome`: a 2xx under the attacker side confirms the boundary is "
+    "bypassable; a 401/403 means it held. State the single confirming response.\n"
+    "- Respond by calling `propose_test` exactly once."
+)
+
+
+def build_boundary_user_prompt(pack: ContextPack) -> str:
+    """The per-candidate user message for a capability/tenant boundary replay."""
+
+    payload = json.dumps(pack.to_llm_payload(), indent=2, sort_keys=True)
+    return (
+        f"Context pack:\n{payload}\n\n"
+        "Propose a boundary-violation test: replay the evidenced request under the "
+        "attacker side while holding the boundary target, and classify what a 2xx "
+        "would reveal. Pick `target_ref` (the boundary), `auth_context_ref` (the "
+        "attacker), `hold` (the boundary), and `test_class`. Call `propose_test`."
+    )
+
+
+# Boundary forced-tool schema — classes are the boundary set; `hold` is the boundary.
+BOUNDARY_PROPOSE_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "propose_test",
+        "description": "Propose one trust-boundary replay test.",
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "test_class": {
+                    "type": "string",
+                    "enum": ["boundary-violation", "privilege-escalation", "idor", "bola"],
+                    "description": "The boundary-crossing vulnerability class.",
+                },
+                "target_ref": {
+                    "type": "string",
+                    "description": "TARGET handle of the boundary (a 'T...' handle, e.g. 'T1').",
+                },
+                "auth_context_ref": {
+                    "type": "string",
+                    "description": "Attacker AUTH-CONTEXT handle ('A...'; is_attacker_candidate).",
+                },
+                "hold": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "The boundary target handle(s) ('T...') held during replay.",
+                },
+                "justification": {"type": "string", "description": "Why this test, citing the boundary."},
+                "expected_outcome": {"type": "string", "description": "The single response that confirms it."},
+                "expected_yield": {"type": "number", "description": "0..1 priority hunch."},
+            },
+            "required": [
+                "test_class",
+                "target_ref",
+                "auth_context_ref",
+                "justification",
+                "expected_outcome",
+                "expected_yield",
+            ],
+        },
+    },
+}
+
+
 def _select_prompt_tool(pack: ContextPack) -> tuple[str, str, dict[str, Any]]:
     """Pick the (system, user, tool) triple for the pack's candidate kind."""
 
     if pack.candidate_kind == "C3":
         return C3_SYSTEM_PROMPT, build_c3_user_prompt(pack), C3_PROPOSE_TOOL
+    if pack.candidate_kind in ("capability", "tenant"):
+        return (
+            BOUNDARY_SYSTEM_PROMPT,
+            build_boundary_user_prompt(pack),
+            BOUNDARY_PROPOSE_TOOL,
+        )
     return SYSTEM_PROMPT, build_user_prompt(pack), PROPOSE_TOOL
 
 
@@ -379,14 +468,16 @@ class DraftRejected:
 
 
 def resolve_draft(
-    pack: ContextPack, draft: LLMProposalDraft
+    pack: ContextPack, draft: LLMProposalDraft, *, generator: GeneratorId = "c2"
 ) -> PlannerProposal | DraftRejected:
-    """Resolve a draft's pack handles to a concrete-id `PlannerProposal` (ADR-0037).
+    """Resolve an authz-replay draft's pack handles to a `PlannerProposal` (ADR-0037).
 
-    Rejects any handle absent from the pack (hallucination guard) before building
-    the proposal. `payload_class`/`payload_spec` are fixed for an authz replay
-    (`auth-token-swap` / `none`); `hold` handles resolve to human-readable target
-    labels (method + path / param) for the audit and review surfaces.
+    Shared by C2 / C2b (endpoint target) and the capability/tenant **boundary**
+    generators (a `boundary` target → `TARGETS_BOUNDARY`, ADR-0039). Rejects any
+    handle absent from the pack (hallucination guard) before building the proposal.
+    `payload_class`/`payload_spec` are fixed for an authz replay (`auth-token-swap` /
+    `none`); `hold` handles resolve to human-readable labels. `generator` stamps the
+    proposal's provenance (the committed `source` is `llm-planner` for all of them).
     """
 
     targets = {t.handle: t for t in pack.targets}
@@ -408,10 +499,13 @@ def resolve_draft(
 
     target_endpoint_id = target.endpoint_id if target.kind == "endpoint" else None
     target_parameter_id = target.parameter_id if target.kind == "parameter" else None
+    target_trust_boundary_id = (
+        target.trust_boundary_id if target.kind == "boundary" else None
+    )
 
     return PlannerProposal(
         engagement_id=pack.engagement_id,
-        generator="c2",
+        generator=generator,
         mode="llm",
         test_class=draft.test_class,
         payload_class="auth-token-swap",
@@ -419,6 +513,7 @@ def resolve_draft(
         auth_context_id=auth.auth_context_id,
         target_endpoint_id=target_endpoint_id,
         target_parameter_id=target_parameter_id,
+        target_trust_boundary_id=target_trust_boundary_id,
         expected_yield=draft.expected_yield,
         confidence_method="llm-self-reported",
         justification=draft.justification,
