@@ -118,6 +118,61 @@ def reached_map(
     return out
 
 
+def reached_by_auth_map(
+    client: Neo4jClient,
+    engagement_id: EngagementId,
+) -> dict[tuple[str, str], ReachedEvidence]:
+    """Return `{(endpoint_id, auth_context_id): evidence}` for every reached pair.
+
+    The **AuthContext-granularity** sibling of `reached_map` (which groups by
+    Principal). C4 (capability-tier coverage) needs reach per AuthContext, because a
+    single Principal holds several AuthContexts (a strong vs a weak tier) and the
+    differential is *between those tokens*, not between principals.
+
+    Same 2xx traversal and highest-status representative as `reached_map`. The
+    returned `ReachedEvidence.principal_id` field carries the **auth_context_id**
+    here (the key's second element) — the dataclass is reused; C4 reads the id from
+    the key, not the field name.
+    """
+
+    frag = for_engagement(engagement_id, var="r")
+    cypher = f"""
+        MATCH (r:RequestObservation)-[:HIT]->(e:Endpoint),
+              (r)-[:OBSERVED_UNDER]->(ac:AuthContext)
+        {frag.and_("r.status = 'active'")}
+          AND e.status = 'active'
+          AND ac.status = 'active'
+          AND r.response_status >= {_SUCCESS_MIN}
+          AND r.response_status <= {_SUCCESS_MAX}
+        RETURN e.id AS endpoint_id,
+               ac.id AS auth_context_id,
+               r.response_status AS status,
+               r.response_size_bytes AS response_size_bytes,
+               r.response_body_sha256 AS response_body_sha256
+        ORDER BY status DESC, coalesce(response_size_bytes, 0) DESC
+    """
+
+    rows = client.execute_read(cypher, **frag.parameters)
+    out: dict[tuple[str, str], ReachedEvidence] = {}
+    for row in rows:
+        key = (str(row["endpoint_id"]), str(row["auth_context_id"]))
+        if key in out:
+            continue
+        size = row["response_size_bytes"]
+        out[key] = ReachedEvidence(
+            endpoint_id=key[0],
+            principal_id=key[1],
+            status=int(row["status"]),
+            response_size_bytes=int(size) if size is not None else None,
+            response_body_sha256=(
+                str(row["response_body_sha256"])
+                if row["response_body_sha256"] is not None
+                else None
+            ),
+        )
+    return out
+
+
 def reached(
     client: Neo4jClient,
     engagement_id: EngagementId,
