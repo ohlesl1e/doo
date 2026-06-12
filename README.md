@@ -75,10 +75,10 @@ Drop a HAR in, get an engagement-isolated Neo4j graph of the target. There is no
 
 ```sh
 python -m venv .venv
-.venv/bin/pip install -e '.[dev]'
+.venv/bin/pip install -e '.[dev,llm]'
 ```
 
-(Examples call binaries as `.venv/bin/doo`; activate the venv if you prefer bare `doo`.)
+`dev` is the test/lint toolchain; `llm` pulls in `litellm` for `doo planner propose` against a real model. CI installs `.[dev]` only — the planner tests use a fake caller and don't need `litellm`. (Examples call binaries as `.venv/bin/doo`; activate the venv if you prefer bare `doo`.)
 
 ### 1. Start the stack
 
@@ -142,7 +142,7 @@ Request/response bodies live in MinIO; the graph holds `BlobRef`s.
 
 `propose` selects targets deterministically, has the LLM propose a structured `TestCase` for gaps that need reasoning (the Validator rejects any hallucinated handle / out-of-scope target), and commits survivors at `review_status = proposed`. `review` is the deterministically-prioritised queue; approve/reject is recorded in a provenanced audit ledger. **Nothing is dispatched** — `approved` means "cleared for consideration," not "authorized to send" (slice 4).
 
-**Planner LLM config** (only for the LLM generators; C1 is deterministic). The model is reached through litellm and is **config, not code** — set in `.env`:
+**Planner LLM config** (only for the LLM generators; C1 is deterministic). The model is reached through litellm — a lazy dep pulled in by the `llm` extra (see setup above). The model is **config, not code** — set in `.env`:
 
 ```sh
 DOO_PLANNER_MODEL=anthropic/claude-sonnet-4-6   # default: claude-opus-4-8
