@@ -148,27 +148,27 @@ def _worker_progress(
 
 
 @contextlib.contextmanager
-def _finalizing(*, enabled: bool) -> Iterator[Callable[[int, int], None]]:
-    """A `rich` progress bar for the post-drain flush (`orchestrator.flush`).
+def _finalizing(*, enabled: bool) -> Iterator[Callable[[str, int, int], None]]:
+    """A `rich`, phase-aware progress bar for the post-drain flush (`orchestrator.flush`).
 
-    The commit bar tracks *events*; the deferred-inference settle step (ADR-0022 —
-    re-template dirty cohorts, promote values, identity reconciliation,
-    `TrustBoundary` inference) runs once after all commits, so a full commit bar
-    would read as hung. The dominant cost is re-templating the dirty cohorts, which
-    has a known total (`len(dirty)`), so this yields a per-cohort `(completed, total)`
-    callback driving a determinate "finalizing — templating cohorts" bar; the brief
-    promotion/identity/boundary tail runs with the bar full. When disabled (non-TTY /
+    The commit bar tracks *events*; the deferred-inference settle step (ADR-0022)
+    runs once after all commits across several phases, so a full commit bar would
+    read as hung. This yields flush's `on_progress(phase, completed, total)` callback
+    and renders it: the cohort re-templating phase (the dominant cost) fills a
+    **determinate** bar (`templating cohorts 42/118`), while the subsequent
+    promotion / identity / inference passes — single per-engagement steps reported
+    with `total = 0` — show a **pulsing** bar with the phase label, so it's clear
+    which phase is running rather than a frozen full bar. When disabled (non-TTY /
     `--json`) yields a no-op callback — the structured `flush.applied` log covers it.
     """
 
     if not enabled or not sys.stderr.isatty():
-        yield lambda _completed, _total: None
+        yield lambda _phase, _completed, _total: None
         return
 
     from rich.console import Console
     from rich.progress import (
         BarColumn,
-        MofNCompleteColumn,
         Progress,
         SpinnerColumn,
         TextColumn,
@@ -179,7 +179,6 @@ def _finalizing(*, enabled: bool) -> Iterator[Callable[[int, int], None]]:
         SpinnerColumn(),
         TextColumn("[bold]finalizing[/]"),
         BarColumn(),
-        MofNCompleteColumn(),
         TimeElapsedColumn(),
         TextColumn("{task.description}"),
         console=Console(file=sys.stderr),
@@ -189,12 +188,18 @@ def _finalizing(*, enabled: bool) -> Iterator[Callable[[int, int], None]]:
     )
 
     with progress:
-        task = progress.add_task("templating cohorts + inference", total=None)
+        task = progress.add_task("starting…", total=None)
 
-        def on_cohort(completed: int, total: int) -> None:
-            progress.update(task, completed=completed, total=max(total, 1))
+        def on_progress(phase: str, completed: int, total: int) -> None:
+            if total > 0:  # determinate phase (cohort re-templating)
+                progress.update(
+                    task, description=f"{phase} {completed}/{total}",
+                    completed=completed, total=total,
+                )
+            else:  # indeterminate per-engagement phase — pulse with the label
+                progress.update(task, description=f"{phase}…", completed=0, total=None)
 
-        yield on_cohort
+        yield on_progress
 
 
 class _WorkerRuntime:
@@ -346,8 +351,8 @@ def register_worker(app: typer.Typer) -> None:
             # as hung while templating + inference churn over the drained cohorts.
             if drain_counts is not None:
                 extracted, committed = drain_counts
-                with _finalizing(enabled=show_bar) as on_cohort:
-                    flushed = orchestrator.flush(on_cohort=on_cohort)
+                with _finalizing(enabled=show_bar) as on_progress:
+                    flushed = orchestrator.flush(on_progress=on_progress)
                 once_summary = (
                     extracted, committed,
                     flushed.endpoints, flushed.parameters, flushed.cohorts,

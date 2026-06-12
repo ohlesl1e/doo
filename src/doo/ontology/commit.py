@@ -292,7 +292,7 @@ class CommitOrchestrator:
     # --- Deferred endpoint inference (ADR-0022): flush ----------------------
 
     def flush(
-        self, *, on_cohort: Callable[[int, int], None] | None = None
+        self, *, on_progress: Callable[[str, int, int], None] | None = None
     ) -> FlushResult:
         """Re-template dirty cohorts and promote inline value candidates (ADR-0022/0023).
 
@@ -309,18 +309,20 @@ class CommitOrchestrator:
         so flush is crash-safe and idempotent: a fully-templated, fully-promoted
         graph has no dirty cohorts and re-promotes nothing (identity-keyed MERGEs).
 
-        `on_cohort`, when given, is invoked `(completed, total)` once before the
-        cohort loop (to size a progress bar) and after each cohort is re-templated —
-        the per-cohort progress hook the `doo worker run` "finalizing" bar advances
-        on (the cohort re-templating is the dominant cost of a large flush). It must
-        not raise.
+        `on_progress`, when given, is invoked `(phase, completed, total)` at each
+        phase boundary so `doo worker run`'s "finalizing" bar can show what flush is
+        doing: the cohort re-templating phase reports `(completed, total)` per cohort
+        (a determinate bar — the dominant cost); the subsequent promotion, identity
+        reconciliation, and inference passes are single per-engagement steps reported
+        with `total = 0` (an indeterminate phase label). It must not raise.
         """
+
+        _progress = on_progress or (lambda _phase, _completed, _total: None)
 
         dirty = self._find_dirty_cohorts()
         cohorts = endpoints = parameters = retracted = 0
         engagements: set[EngagementId] = set()
-        if on_cohort is not None and dirty:
-            on_cohort(0, len(dirty))
+        _progress("templating cohorts", 0, len(dirty))
         for engagement_id, method, host_node_id in dirty:
             engagements.add(engagement_id)
             now = datetime.now(UTC)
@@ -343,10 +345,10 @@ class CommitOrchestrator:
             endpoints += len(retemplate.endpoint_ids)
             parameters += len(retemplate.parameter_ids)
             retracted += len(retemplate.retracted_endpoint_ids)
-            if on_cohort is not None:
-                on_cohort(cohorts, len(dirty))
+            _progress("templating cohorts", cohorts, len(dirty))
 
         # --- ADR-0023 promotion pass: inline value candidates -> ObservedValue. ---
+        _progress("promoting values", 0, 0)
         observed_values = yielded_value_edges = 0
         for engagement_id in sorted(engagements):
             now = datetime.now(UTC)
@@ -369,6 +371,7 @@ class CommitOrchestrator:
         # --- ADR-0029: upgrade synthetic discovered Principals from observed
         # response identity (headers/self-endpoint bodies), collapsing reissued
         # opaque credentials for one actor. ---
+        _progress("reconciling identities", 0, 0)
         identity_upgrades = principals_retracted = identity_aliases = 0
         for engagement_id in sorted(engagements):
             now = datetime.now(UTC)
@@ -389,6 +392,7 @@ class CommitOrchestrator:
         # identity reconciliation so boundaries see the settled Principals /
         # AuthContexts, and tenant inference precedes tenant-boundary inference
         # (the boundary consumes the Tenant nodes). Idempotent across re-flushes. ---
+        _progress("inferring tenants & boundaries", 0, 0)
         tenants = of_tenant_edges = 0
         capability_boundaries = tenant_boundaries = 0
         for engagement_id in sorted(engagements):
