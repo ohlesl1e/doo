@@ -23,6 +23,7 @@ from __future__ import annotations
 import contextlib
 import os
 import sys
+import time
 from collections import Counter
 from collections.abc import Callable, Iterator
 from typing import Annotated, cast
@@ -147,6 +148,73 @@ def _worker_progress(
         yield on_extracted, on_committed
 
 
+@contextlib.contextmanager
+def _finalizing(*, enabled: bool) -> Iterator[Callable[[str, int, int], None]]:
+    """A `rich`, phase-aware progress bar for the post-drain flush (`orchestrator.flush`).
+
+    The commit bar tracks *events*; the deferred-inference settle step (ADR-0022)
+    runs once after all commits across several phases, so a full commit bar would
+    read as hung. This yields flush's `on_progress(phase, completed, total)` callback
+    and renders it: the cohort re-templating phase (the dominant cost) fills a
+    **determinate** bar (`templating cohorts 42/118`), while the subsequent
+    promotion / identity / inference passes — single per-engagement steps reported
+    with `total = 0` — show a **pulsing** bar with the phase label, so it's clear
+    which phase is running rather than a frozen full bar. When disabled (non-TTY /
+    `--json`) yields a no-op callback — the structured `flush.applied` log covers it.
+    """
+
+    if not enabled or not sys.stderr.isatty():
+        yield lambda _phase, _completed, _total: None
+        return
+
+    from rich.console import Console
+    from rich.progress import (
+        BarColumn,
+        Progress,
+        SpinnerColumn,
+        TextColumn,
+        TimeElapsedColumn,
+    )
+
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[bold]finalizing[/]"),
+        BarColumn(),
+        TimeElapsedColumn(),
+        TextColumn("{task.description}"),
+        console=Console(file=sys.stderr),
+        transient=False,
+        redirect_stdout=True,
+        redirect_stderr=True,
+    )
+
+    with progress:
+        task = progress.add_task("starting…", total=None)
+        last_paint = 0.0
+
+        def on_progress(phase: str, completed: int, total: int) -> None:
+            # A heavy synchronous phase (e.g. value promotion is CPU-bound Python over
+            # thousands of values) holds the GIL, starving rich's background refresh —
+            # so the bar AND the elapsed timer freeze. Force a main-thread repaint,
+            # throttled to ~12/sec, so the display keeps moving through such a phase.
+            nonlocal last_paint
+            now = time.monotonic()
+            paint = (now - last_paint) > 0.08 or (total > 0 and completed >= total)
+            if paint:
+                last_paint = now
+            if total > 0:  # determinate phase (cohort re-templating / value promotion)
+                progress.update(
+                    task, description=f"{phase} {completed}/{total}",
+                    completed=completed, total=total, refresh=paint,
+                )
+            else:  # indeterminate per-engagement phase — pulse with the label
+                progress.update(
+                    task, description=f"{phase}…", completed=0, total=None, refresh=paint,
+                )
+
+        yield on_progress
+
+
 class _WorkerRuntime:
     """Env-configured L2/L3 worker collaborators plus their closeables."""
 
@@ -238,10 +306,12 @@ def register_worker(app: typer.Typer) -> None:
         from doo.ontology.l3_worker import run_l3_worker
 
         runtime = _WorkerRuntime()
+        orchestrator = runtime.l3_deps.orchestrator
         failures: list[ParseFailure] = []
         once_summary: tuple[int, int, int, int, int] | None = None
 
         try:
+            drain_counts: tuple[int, int] | None = None
             with _worker_progress(enabled=show_bar) as (on_extracted, on_committed):
 
                 def _collect(events: list[L2Event]) -> None:
@@ -272,17 +342,9 @@ def register_worker(app: typer.Typer) -> None:
                         on_event=on_committed,
                     )
 
-                orchestrator = runtime.l3_deps.orchestrator
                 if once:
-                    extracted, committed = _drain_once(
+                    drain_counts = _drain_once(
                         run_l2=lambda: _run_l2(500, _collect), run_l3=lambda: _run_l3(500)
-                    )
-                    # Deferred endpoint inference (ADR-0022): re-template the cohorts
-                    # this drain touched (and any left un-HIT by a prior crashed run).
-                    flushed = orchestrator.flush()
-                    once_summary = (
-                        extracted, committed,
-                        flushed.endpoints, flushed.parameters, flushed.cohorts,
                     )
                 else:
                     typer.echo(
@@ -296,6 +358,18 @@ def register_worker(app: typer.Typer) -> None:
                             orchestrator.flush()  # re-template dirty cohorts each pass
                     except KeyboardInterrupt:
                         typer.echo("\nstopped")
+
+            # The progress bar is now closed. Run the deferred-inference settle step
+            # (ADR-0022) under a "finalizing…" spinner so the (full) bar doesn't read
+            # as hung while templating + inference churn over the drained cohorts.
+            if drain_counts is not None:
+                extracted, committed = drain_counts
+                with _finalizing(enabled=show_bar) as on_progress:
+                    flushed = orchestrator.flush(on_progress=on_progress)
+                once_summary = (
+                    extracted, committed,
+                    flushed.endpoints, flushed.parameters, flushed.cohorts,
+                )
         finally:
             runtime.close()
 

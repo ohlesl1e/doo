@@ -83,6 +83,17 @@ def test_worker_progress_disabled_yields_working_noop_callbacks() -> None:
         on_committed()  # no terminal, no error, no output
 
 
+def test_finalizing_disabled_yields_working_noop_callback() -> None:
+    # When disabled (non-TTY / --json) the finalizing bar yields a no-op phase
+    # callback so `flush(on_progress=...)` runs unchanged (the flush.applied log covers it).
+    from doo.cli_worker import _finalizing
+
+    with _finalizing(enabled=False) as on_progress:
+        on_progress("templating cohorts", 0, 5)  # determinate phase
+        on_progress("templating cohorts", 3, 5)
+        on_progress("promoting values", 0, 0)  # indeterminate phase, no error
+
+
 def test_truncate_collapses_whitespace_and_limits_length() -> None:
     assert _truncate("a   b\nc", 100) == "a b c"
     out = _truncate("x" * 300, 50)

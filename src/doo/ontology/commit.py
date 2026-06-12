@@ -23,6 +23,7 @@ No LLM here — deterministic commit only (CLAUDE.md hard rule).
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Protocol
@@ -290,7 +291,9 @@ class CommitOrchestrator:
 
     # --- Deferred endpoint inference (ADR-0022): flush ----------------------
 
-    def flush(self) -> FlushResult:
+    def flush(
+        self, *, on_progress: Callable[[str, int, int], None] | None = None
+    ) -> FlushResult:
         """Re-template dirty cohorts and promote inline value candidates (ADR-0022/0023).
 
         `commit` leaves each `RequestObservation` un-HIT and its extracted values
@@ -305,11 +308,21 @@ class CommitOrchestrator:
         Both steps emit structural `l3-events`. Dirtiness is derived from the graph,
         so flush is crash-safe and idempotent: a fully-templated, fully-promoted
         graph has no dirty cohorts and re-promotes nothing (identity-keyed MERGEs).
+
+        `on_progress`, when given, is invoked `(phase, completed, total)` at each
+        phase boundary so `doo worker run`'s "finalizing" bar can show what flush is
+        doing: the cohort re-templating phase reports `(completed, total)` per cohort
+        (a determinate bar — the dominant cost); the subsequent promotion, identity
+        reconciliation, and inference passes are single per-engagement steps reported
+        with `total = 0` (an indeterminate phase label). It must not raise.
         """
+
+        _progress = on_progress or (lambda _phase, _completed, _total: None)
 
         dirty = self._find_dirty_cohorts()
         cohorts = endpoints = parameters = retracted = 0
         engagements: set[EngagementId] = set()
+        _progress("templating cohorts", 0, len(dirty))
         for engagement_id, method, host_node_id in dirty:
             engagements.add(engagement_id)
             now = datetime.now(UTC)
@@ -332,8 +345,10 @@ class CommitOrchestrator:
             endpoints += len(retemplate.endpoint_ids)
             parameters += len(retemplate.parameter_ids)
             retracted += len(retemplate.retracted_endpoint_ids)
+            _progress("templating cohorts", cohorts, len(dirty))
 
         # --- ADR-0023 promotion pass: inline value candidates -> ObservedValue. ---
+        _progress("promoting values", 0, 0)
         observed_values = yielded_value_edges = 0
         for engagement_id in sorted(engagements):
             now = datetime.now(UTC)
@@ -342,6 +357,7 @@ class CommitOrchestrator:
                 engagement_id=engagement_id,
                 observed_at=now,
                 ingested_at=now,
+                on_value=lambda done, total: _progress("promoting values", done, total),
             )
             trace_id = new_trace_id()
             span_id = new_span_id()
@@ -356,6 +372,7 @@ class CommitOrchestrator:
         # --- ADR-0029: upgrade synthetic discovered Principals from observed
         # response identity (headers/self-endpoint bodies), collapsing reissued
         # opaque credentials for one actor. ---
+        _progress("reconciling identities", 0, 0)
         identity_upgrades = principals_retracted = identity_aliases = 0
         for engagement_id in sorted(engagements):
             now = datetime.now(UTC)
@@ -376,6 +393,7 @@ class CommitOrchestrator:
         # identity reconciliation so boundaries see the settled Principals /
         # AuthContexts, and tenant inference precedes tenant-boundary inference
         # (the boundary consumes the Tenant nodes). Idempotent across re-flushes. ---
+        _progress("inferring tenants & boundaries", 0, 0)
         tenants = of_tenant_edges = 0
         capability_boundaries = tenant_boundaries = 0
         for engagement_id in sorted(engagements):
