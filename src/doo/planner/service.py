@@ -25,6 +25,8 @@ from doo.observability.logging import get_logger
 from doo.ontology.queries import for_engagement
 from doo.planner.commit import commit_testcase
 from doo.planner.generators import (
+    LLMProgressCallback,
+    LLMSkipped,
     PlannerConfig,
     enabled_generators,
     enabled_llm_generators,
@@ -76,7 +78,7 @@ class ProposeResult:
     discarded: tuple[DiscardedProposal, ...] = field(default_factory=tuple)
     committed_key_hashes: tuple[TestCaseKeyHash, ...] = field(default_factory=tuple)
     llm_rejected: tuple[LLMDraftRejected, ...] = field(default_factory=tuple)
-    llm_skipped: tuple[str, ...] = field(default_factory=tuple)
+    llm_skipped: tuple[LLMSkipped, ...] = field(default_factory=tuple)
 
 
 def propose(
@@ -86,6 +88,7 @@ def propose(
     config: PlannerConfig | None = None,
     llm_caller: LLMCaller | None = None,
     llm_audit_sink: LLMAuditSink | None = None,
+    on_llm_progress: LLMProgressCallback | None = None,
     now: datetime | None = None,
 ) -> ProposeResult:
     """Run the enabled generators, validate, and commit proposed `TestCase`s.
@@ -118,7 +121,7 @@ def propose(
     discarded: list[DiscardedProposal] = []
     committed_hashes: list[TestCaseKeyHash] = []
     llm_rejected: list[LLMDraftRejected] = []
-    llm_skipped: list[str] = []
+    llm_skipped: list[LLMSkipped] = []
 
     def _commit(proposal: PlannerProposal) -> None:
         nonlocal committed, created, idempotent
@@ -141,7 +144,9 @@ def propose(
             _commit(generator.propose(candidate))
 
     for llm_generator in llm_generators:
-        run = llm_generator.run(client, engagement_id, now=run_at)
+        run = llm_generator.run(
+            client, engagement_id, now=run_at, on_progress=on_llm_progress
+        )
         candidates_n += run.candidates
         assert llm_audit_sink is not None  # guarded above when llm_generators present
         for item in run.proposed:
@@ -151,8 +156,7 @@ def propose(
             # Persist even a rejected call so a hallucination is replayable (ADR-0037).
             llm_audit_sink.record(engagement_id, rej.call)
             llm_rejected.append(rej.rejection)
-        for skip in run.skipped:
-            llm_skipped.append(skip.reason)
+        llm_skipped.extend(run.skipped)
 
     log.info(
         "planner.propose.complete",

@@ -17,15 +17,23 @@ and the deferred inference has flushed; this command is a read + a planner write
 
 from __future__ import annotations
 
+import contextlib
 import json as _json
 import os
+import sys
+from collections import Counter
+from collections.abc import Iterator
 from pathlib import Path
 
 import typer
 
 from doo.ids import EngagementId, TestCaseKeyHash
 from doo.infra.neo4j_driver import Neo4jClient
-from doo.planner.generators import PlannerConfig, requested_llm_generator_ids
+from doo.planner.generators import (
+    LLMProgressCallback,
+    PlannerConfig,
+    requested_llm_generator_ids,
+)
 from doo.planner.llm import LiteLLMCaller, LLMCaller
 from doo.planner.llm_audit import BlobLLMAuditSink, LLMAuditSink
 from doo.planner.models import ProposedTestCaseView
@@ -67,18 +75,38 @@ def _build_llm_deps() -> tuple[LLMCaller, LLMAuditSink]:
     - **Provider URL + key** (LiteLLM/OpenAI-compatible gateway, local proxy) —
       set `DOO_PLANNER_API_BASE` (+ `DOO_PLANNER_API_KEY`) and an `openai/<name>` id.
     `DOO_PLANNER_API_BASE` / `DOO_PLANNER_API_KEY` are optional overrides; unset, litellm
-    resolves credentials from its provider env vars. The audit sink persists every
-    proposing call to the same object storage as the rest of the CLI (`DOO_S3_*`).
-    Built only when an LLM generator (C2) is actually requested.
+    resolves credentials from its provider env vars. `DOO_PLANNER_TIMEOUT_S` bounds
+    a single proposing attempt (default 60s; `0`/empty disables) and
+    `DOO_PLANNER_NUM_RETRIES` is the litellm per-call retry count (default 0 —
+    re-running `propose` is the retry, idempotent per ADR-0007). Generators call
+    the model once per gap sequentially, so an unbounded stalled call would
+    otherwise hang the whole run; with the bound the run is capped at roughly
+    `gaps × timeout_s × (num_retries + 1)`. The audit sink persists every proposing
+    call to the same object storage as the rest of the CLI (`DOO_S3_*`). Built only
+    when an LLM generator (C2) is actually requested.
     """
 
     from doo.infra.blobs import BlobClient
 
     model = os.environ.get("DOO_PLANNER_MODEL", "claude-opus-4-8")
+    timeout_raw = os.environ.get("DOO_PLANNER_TIMEOUT_S", "60")
+    timeout_s: float | None
+    try:
+        timeout_s = float(timeout_raw) if timeout_raw else None
+    except ValueError:
+        timeout_s = 60.0
+    if timeout_s is not None and timeout_s <= 0:
+        timeout_s = None
+    try:
+        num_retries = max(0, int(os.environ.get("DOO_PLANNER_NUM_RETRIES", "0")))
+    except ValueError:
+        num_retries = 0
     caller = LiteLLMCaller(
         model,
         api_base=os.environ.get("DOO_PLANNER_API_BASE") or None,
         api_key=os.environ.get("DOO_PLANNER_API_KEY") or None,
+        timeout_s=timeout_s,
+        num_retries=num_retries,
     )
     blobs = BlobClient.from_config(
         endpoint_url=os.environ.get("DOO_S3_ENDPOINT", "http://localhost:9000"),
@@ -105,6 +133,79 @@ def _configure() -> None:
 
     configure_logging()
     bind_correlation(trace_id=new_trace_id(), span_id=new_span_id())
+
+
+@contextlib.contextmanager
+def _llm_progress_bar(*, enabled: bool) -> Iterator[LLMProgressCallback | None]:
+    """A `rich` per-generator progress bar for the LLM-proposing loop.
+
+    Yields a callback the driver invokes once per gap (`generator, i, total,
+    outcome`). One bar per generator, sized on the `i == 0` "start" tick so the
+    bar appears before the first (possibly slow) call returns. The description
+    shows running proposed/rejected/skipped counts. Structlog output (the
+    `coverage.*.complete` lines) is redirected above the live bar so it does not
+    corrupt rendering.
+
+    When `enabled` is False (no LLM generators, `--json`, or stderr is not a TTY)
+    yields **None** — the driver then falls back to its
+    `planner.generator.llm.progress` log line, so non-interactive runs keep
+    per-gap observability.
+    """
+
+    if not enabled or not sys.stderr.isatty():
+        yield None
+        return
+
+    from rich.console import Console
+    from rich.progress import (
+        BarColumn,
+        MofNCompleteColumn,
+        Progress,
+        SpinnerColumn,
+        TaskID,
+        TextColumn,
+        TimeElapsedColumn,
+    )
+
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[bold]{task.fields[generator]:>6}[/]"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        TextColumn("{task.description}"),
+        console=Console(file=sys.stderr),
+        transient=False,
+        redirect_stdout=True,
+        redirect_stderr=True,
+    )
+    tasks: dict[str, TaskID] = {}
+    counts: dict[str, Counter[str]] = {}
+
+    def _describe(generator: str) -> str:
+        c = counts[generator]
+        return (
+            f"proposed {c['proposed']} · rejected {c['rejected']} · "
+            f"skipped {c['skipped']}"
+        )
+
+    def on_progress(generator: str, i: int, total: int, outcome: str) -> None:
+        if generator not in tasks:
+            counts[generator] = Counter()
+            tasks[generator] = progress.add_task(
+                _describe(generator), total=max(total, 1), generator=generator
+            )
+        if outcome != "start":
+            counts[generator][outcome] += 1
+        progress.update(
+            tasks[generator],
+            completed=i,
+            total=max(total, 1),
+            description=_describe(generator),
+        )
+
+    with progress:
+        yield on_progress
 
 
 @planner_app.command("propose")
@@ -140,13 +241,17 @@ def propose_cmd(
 
     client = _build_client()
     try:
-        result = propose(
-            client,
-            engagement_id=EngagementId(engagement),
-            config=config,
-            llm_caller=llm_caller,
-            llm_audit_sink=llm_audit_sink,
-        )
+        with _llm_progress_bar(
+            enabled=bool(llm_caller) and not as_json
+        ) as on_progress:
+            result = propose(
+                client,
+                engagement_id=EngagementId(engagement),
+                config=config,
+                llm_caller=llm_caller,
+                llm_audit_sink=llm_audit_sink,
+                on_llm_progress=on_progress,
+            )
     finally:
         client.close()
 
@@ -165,24 +270,39 @@ def propose_cmd(
                         {"code": r.code, "reason": r.reason}
                         for r in result.llm_rejected
                     ],
-                    "llm_skipped": list(result.llm_skipped),
+                    "llm_skipped": [
+                        {"code": s.code, "reason": s.reason}
+                        for s in result.llm_skipped
+                    ],
                 },
                 indent=2,
             )
         )
         return
+    # Group skips by code: per-code count + one sample reason. The full list is
+    # available via --json; on a real engagement N× call_timeout would otherwise
+    # be N table lines.
+    skip_by_code: dict[str, list[str]] = {}
+    for s in result.llm_skipped:
+        skip_by_code.setdefault(s.code, []).append(s.reason)
+    skip_summary = (
+        " (" + ", ".join(f"{c}: {len(rs)}" for c, rs in sorted(skip_by_code.items())) + ")"
+        if skip_by_code
+        else ""
+    )
     typer.echo(
         f"planner propose: {result.candidates} candidate(s) -> "
         f"{result.committed} committed ({result.created} new, "
         f"{result.idempotent} idempotent), {len(result.discarded)} discarded, "
-        f"{len(result.llm_rejected)} llm-rejected, {len(result.llm_skipped)} skipped."
+        f"{len(result.llm_rejected)} llm-rejected, "
+        f"{len(result.llm_skipped)} skipped{skip_summary}."
     )
     for d in result.discarded:
         typer.echo(f"  discarded [{d.code}]: {d.reason}")
     for r in result.llm_rejected:
         typer.echo(f"  llm-rejected [{r.code}]: {r.reason}")
-    for reason in result.llm_skipped:
-        typer.echo(f"  skipped: {reason}")
+    for code, reasons in sorted(skip_by_code.items()):
+        typer.echo(f"  skipped [{code}] e.g.: {reasons[0]} (× {len(reasons)})")
 
 
 def _render_queue(rows: list[ProposedTestCaseView]) -> None:
