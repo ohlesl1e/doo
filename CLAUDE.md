@@ -88,7 +88,7 @@ Build vertically through one slice before broadening. Do not scaffold all five l
 
 The ontology (`ONTOLOGY.md`) design is complete: all six steps drafted, all three originally-open questions resolved (Asset / TrustBoundary / Payload), 47 ADRs recorded. `TrustBoundary` inference (capability + tenant) shipped in slice 3.
 
-**Slices 1–3 are shipped** (slice-2 coverage closed by ADR-0033/0034/0035; slice 3 / the Planner by ADR-0036–0041). **Slice 4 (bounded agent execution — Executor + Interpreter) is grilled (ADR-0042–0047) and is the build target; PRD #85, tracers pending.** PRDs: slice-1 #2 (tracers #3–#10), slice-2 #49 (#50–#57), slice-3 #59 (tracers #61–#67), slice-4 #85.
+**Slices 1–3 are shipped** (slice-2 coverage closed by ADR-0033/0034/0035; slice 3 / the Planner by ADR-0036–0041). **Slice 4 (bounded agent execution — Executor + Interpreter) is grilled (ADR-0042–0047) and is the build target.** PRDs: slice-1 #2 (tracers #3–#10), slice-2 #49 (#50–#57), slice-3 #59 (tracers #61–#67), slice-4 #85 (tracers #86–#93).
 
 ## Agent skills
 
