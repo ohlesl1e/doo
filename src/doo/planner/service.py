@@ -25,6 +25,7 @@ from doo.observability.logging import get_logger
 from doo.ontology.queries import for_engagement
 from doo.planner.commit import commit_testcase
 from doo.planner.generators import (
+    LLMSkipped,
     PlannerConfig,
     enabled_generators,
     enabled_llm_generators,
@@ -76,7 +77,7 @@ class ProposeResult:
     discarded: tuple[DiscardedProposal, ...] = field(default_factory=tuple)
     committed_key_hashes: tuple[TestCaseKeyHash, ...] = field(default_factory=tuple)
     llm_rejected: tuple[LLMDraftRejected, ...] = field(default_factory=tuple)
-    llm_skipped: tuple[str, ...] = field(default_factory=tuple)
+    llm_skipped: tuple[LLMSkipped, ...] = field(default_factory=tuple)
 
 
 def propose(
@@ -118,7 +119,7 @@ def propose(
     discarded: list[DiscardedProposal] = []
     committed_hashes: list[TestCaseKeyHash] = []
     llm_rejected: list[LLMDraftRejected] = []
-    llm_skipped: list[str] = []
+    llm_skipped: list[LLMSkipped] = []
 
     def _commit(proposal: PlannerProposal) -> None:
         nonlocal committed, created, idempotent
@@ -151,8 +152,7 @@ def propose(
             # Persist even a rejected call so a hallucination is replayable (ADR-0037).
             llm_audit_sink.record(engagement_id, rej.call)
             llm_rejected.append(rej.rejection)
-        for skip in run.skipped:
-            llm_skipped.append(skip.reason)
+        llm_skipped.extend(run.skipped)
 
     log.info(
         "planner.propose.complete",

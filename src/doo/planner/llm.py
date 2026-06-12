@@ -459,11 +459,16 @@ class LiteLLMCaller:
     id plus `api_base` (the org-standard path). `api_base` / `api_key` are optional
     overrides; when unset, litellm resolves credentials from its provider env vars.
 
-    `timeout_s` bounds a single proposing call. Generators call this once per gap,
-    sequentially, so without a bound a stalled gateway hangs the whole `propose`
-    run. A timed-out call raises `LLMProposalError`, which each generator already
-    catches and records as an `LLMSkipped` — the run continues. `None` disables
-    the bound (litellm's provider default applies).
+    `timeout_s` bounds a single proposing attempt and `num_retries` is the litellm
+    retry count (default **0** — re-running `propose` is the retry, idempotent per
+    ADR-0007). Generators call this once per gap, sequentially, so an unbounded
+    stalled call would hang the whole run; with these bounds the run is capped at
+    roughly `gaps × timeout_s × (num_retries + 1)`. `None` disables the bound
+    (litellm's provider default applies). Any failure of the underlying call —
+    timeout, auth, rate-limit, transport, 5xx — raises `LLMCallError(code=…)`, which
+    the generator driver records as an `LLMSkipped` and moves on; one bad gap never
+    crashes the run. A response that arrives but lacks a parsable `propose_test`
+    tool call still raises `LLMProposalError` (a different skip code).
 
     `litellm` is imported lazily so the module imports without the dependency; only
     constructing/using this caller requires it.
@@ -477,12 +482,14 @@ class LiteLLMCaller:
         api_base: str | None = None,
         api_key: str | None = None,
         timeout_s: float | None = 60.0,
+        num_retries: int = 0,
     ) -> None:
         self._model = model
         self._temperature = temperature
         self._api_base = api_base
         self._api_key = api_key
         self._timeout_s = timeout_s
+        self._num_retries = num_retries
 
     def propose(self, pack: ContextPack) -> LLMCallResult:
         # lazy production-only dep; ignore covers both "litellm absent" (CI) and
@@ -502,6 +509,7 @@ class LiteLLMCaller:
             ],
             "tools": [tool],
             "tool_choice": {"type": "function", "function": {"name": "propose_test"}},
+            "num_retries": self._num_retries,
         }
         if self._api_base is not None:
             request["api_base"] = self._api_base
@@ -513,10 +521,16 @@ class LiteLLMCaller:
         try:
             completion = litellm.completion(**call_kwargs)
         except litellm.exceptions.Timeout as exc:
-            # Surface as a parse-level failure so the generator records an
-            # `LLMSkipped` and moves on instead of the whole run blocking.
-            raise LLMProposalError(
-                f"LLM call timed out after {self._timeout_s}s"
+            raise LLMCallError(
+                "call_timeout", f"LLM call timed out after {self._timeout_s}s"
+            ) from exc
+        except Exception as exc:
+            # Auth / rate-limit / transport / 5xx / model-not-found / anything else
+            # litellm raises. One bad gap must not crash the run; the per-code skip
+            # count in the CLI summary makes a misconfigured gateway as loud as a
+            # crash (N× call_error).
+            raise LLMCallError(
+                "call_error", f"{type(exc).__name__}: {exc}"
             ) from exc
         response = completion.model_dump() if hasattr(completion, "model_dump") else dict(completion)
         draft = _parse_tool_call(response)
@@ -544,6 +558,20 @@ def _parse_tool_call(response: dict[str, Any]) -> LLMProposalDraft:
 
 class LLMProposalError(Exception):
     """The LLM response could not be parsed into a valid draft."""
+
+
+class LLMCallError(Exception):
+    """The proposing call itself failed before a response could be parsed.
+
+    `code` is the `LLMSkipped` code the generator driver records (`call_timeout`
+    for a bounded stall, `call_error` for everything else — auth, rate-limit,
+    transport, 5xx). Distinct from `LLMProposalError`, which means a response
+    arrived but lacked a parsable `propose_test` tool call.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass(frozen=True, slots=True)

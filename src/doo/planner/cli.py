@@ -68,11 +68,14 @@ def _build_llm_deps() -> tuple[LLMCaller, LLMAuditSink]:
       set `DOO_PLANNER_API_BASE` (+ `DOO_PLANNER_API_KEY`) and an `openai/<name>` id.
     `DOO_PLANNER_API_BASE` / `DOO_PLANNER_API_KEY` are optional overrides; unset, litellm
     resolves credentials from its provider env vars. `DOO_PLANNER_TIMEOUT_S` bounds
-    a single proposing call (default 60s; set to `0` / empty to disable) — generators
-    call the model once per gap sequentially, so an unbounded stalled call would
-    otherwise hang the whole run. The audit sink persists every proposing call to
-    the same object storage as the rest of the CLI (`DOO_S3_*`). Built only when an
-    LLM generator (C2) is actually requested.
+    a single proposing attempt (default 60s; `0`/empty disables) and
+    `DOO_PLANNER_NUM_RETRIES` is the litellm per-call retry count (default 0 —
+    re-running `propose` is the retry, idempotent per ADR-0007). Generators call
+    the model once per gap sequentially, so an unbounded stalled call would
+    otherwise hang the whole run; with the bound the run is capped at roughly
+    `gaps × timeout_s × (num_retries + 1)`. The audit sink persists every proposing
+    call to the same object storage as the rest of the CLI (`DOO_S3_*`). Built only
+    when an LLM generator (C2) is actually requested.
     """
 
     from doo.infra.blobs import BlobClient
@@ -86,11 +89,16 @@ def _build_llm_deps() -> tuple[LLMCaller, LLMAuditSink]:
         timeout_s = 60.0
     if timeout_s is not None and timeout_s <= 0:
         timeout_s = None
+    try:
+        num_retries = max(0, int(os.environ.get("DOO_PLANNER_NUM_RETRIES", "0")))
+    except ValueError:
+        num_retries = 0
     caller = LiteLLMCaller(
         model,
         api_base=os.environ.get("DOO_PLANNER_API_BASE") or None,
         api_key=os.environ.get("DOO_PLANNER_API_KEY") or None,
         timeout_s=timeout_s,
+        num_retries=num_retries,
     )
     blobs = BlobClient.from_config(
         endpoint_url=os.environ.get("DOO_S3_ENDPOINT", "http://localhost:9000"),
@@ -177,24 +185,39 @@ def propose_cmd(
                         {"code": r.code, "reason": r.reason}
                         for r in result.llm_rejected
                     ],
-                    "llm_skipped": list(result.llm_skipped),
+                    "llm_skipped": [
+                        {"code": s.code, "reason": s.reason}
+                        for s in result.llm_skipped
+                    ],
                 },
                 indent=2,
             )
         )
         return
+    # Group skips by code: per-code count + one sample reason. The full list is
+    # available via --json; on a real engagement N× call_timeout would otherwise
+    # be N table lines.
+    skip_by_code: dict[str, list[str]] = {}
+    for s in result.llm_skipped:
+        skip_by_code.setdefault(s.code, []).append(s.reason)
+    skip_summary = (
+        " (" + ", ".join(f"{c}: {len(rs)}" for c, rs in sorted(skip_by_code.items())) + ")"
+        if skip_by_code
+        else ""
+    )
     typer.echo(
         f"planner propose: {result.candidates} candidate(s) -> "
         f"{result.committed} committed ({result.created} new, "
         f"{result.idempotent} idempotent), {len(result.discarded)} discarded, "
-        f"{len(result.llm_rejected)} llm-rejected, {len(result.llm_skipped)} skipped."
+        f"{len(result.llm_rejected)} llm-rejected, "
+        f"{len(result.llm_skipped)} skipped{skip_summary}."
     )
     for d in result.discarded:
         typer.echo(f"  discarded [{d.code}]: {d.reason}")
     for r in result.llm_rejected:
         typer.echo(f"  llm-rejected [{r.code}]: {r.reason}")
-    for reason in result.llm_skipped:
-        typer.echo(f"  skipped: {reason}")
+    for code, reasons in sorted(skip_by_code.items()):
+        typer.echo(f"  skipped [{code}] e.g.: {reasons[0]} (× {len(reasons)})")
 
 
 def _render_queue(rows: list[ProposedTestCaseView]) -> None:
