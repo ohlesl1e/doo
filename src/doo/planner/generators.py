@@ -242,6 +242,13 @@ class LLMRunResult:
     skipped: tuple[LLMSkipped, ...]
 
 
+# Per-gap progress callback: `(generator_id, i, total, outcome)`. The CLI passes
+# one that drives a progress bar; when `None`, the driver falls back to a
+# structured `planner.generator.llm.progress` log line so non-interactive callers
+# (and OTel, ADR-0018) still observe per-gap progress.
+LLMProgressCallback = Callable[[GeneratorId, int, int, str], None]
+
+
 def _run_llm_generator[T](
     caller: LLMCaller,
     engagement_id: EngagementId,
@@ -252,6 +259,7 @@ def _run_llm_generator[T](
     describe: Callable[[T], str],
     resolve: Callable[[ContextPack, LLMProposalDraft], PlannerProposal | DraftRejected],
     finalize: Callable[[PlannerProposal, T], PlannerProposal] | None = None,
+    on_progress: LLMProgressCallback | None = None,
 ) -> LLMRunResult:
     """The shared LLM-proposing generator loop (ADR-0036/0037).
 
@@ -282,7 +290,15 @@ def _run_llm_generator[T](
     skipped: list[LLMSkipped] = []
     total = len(candidates)
 
+    # Surface the candidate count up-front (i=0) so a progress bar can size
+    # itself before the first — possibly slow — LLM call returns.
+    if on_progress is not None:
+        on_progress(generator_id, 0, total, "start")
+
     def _progress(i: int, outcome: str) -> None:
+        if on_progress is not None:
+            on_progress(generator_id, i, total, outcome)
+            return
         log.info(
             "planner.generator.llm.progress",
             generator=generator_id,
@@ -363,6 +379,7 @@ class LLMProposingGenerator(Protocol):
         engagement_id: EngagementId,
         *,
         now: datetime | None = None,
+        on_progress: LLMProgressCallback | None = None,
     ) -> LLMRunResult: ...
 
 
@@ -390,6 +407,7 @@ class C2Generator:
         engagement_id: EngagementId,
         *,
         now: datetime | None = None,
+        on_progress: LLMProgressCallback | None = None,
     ) -> LLMRunResult:
         run_at = now or datetime.now(UTC)
         gaps = run_c2(client, engagement_id, now=run_at)
@@ -402,6 +420,7 @@ class C2Generator:
             engagement_id,
             "c2",
             gaps,
+            on_progress=on_progress,
             assemble=lambda g: assemble_c2_pack(
                 client,
                 gap=g,
@@ -453,6 +472,7 @@ class C2bGenerator:
         engagement_id: EngagementId,
         *,
         now: datetime | None = None,
+        on_progress: LLMProgressCallback | None = None,
     ) -> LLMRunResult:
         run_at = now or datetime.now(UTC)
         gaps = run_c2b(client, engagement_id, now=run_at)
@@ -461,6 +481,7 @@ class C2bGenerator:
             engagement_id,
             "c2b",
             gaps,
+            on_progress=on_progress,
             assemble=lambda g: assemble_c2b_pack(
                 client, gap=g, code_version=__version__, now=run_at
             ),
@@ -506,6 +527,7 @@ class C3Generator:
         engagement_id: EngagementId,
         *,
         now: datetime | None = None,
+        on_progress: LLMProgressCallback | None = None,
     ) -> LLMRunResult:
         run_at = now or datetime.now(UTC)
         gaps = run_c3(client, engagement_id, now=run_at)
@@ -515,6 +537,7 @@ class C3Generator:
             engagement_id,
             "c3",
             gaps,
+            on_progress=on_progress,
             assemble=lambda g: assemble_c3_pack(
                 client, gap=g, code_version=__version__, now=run_at
             ),
@@ -553,6 +576,7 @@ def _run_boundary_generator(
     kinds: tuple[str, ...],
     generator_id: GeneratorId,
     now: datetime | None,
+    on_progress: LLMProgressCallback | None = None,
 ) -> LLMRunResult:
     """Capability/tenant boundary generator pass (ADR-0039) via the shared driver.
 
@@ -571,6 +595,7 @@ def _run_boundary_generator(
         engagement_id,
         generator_id,
         boundaries,
+        on_progress=on_progress,
         assemble=lambda b: assemble_boundary_pack(
             client,
             engagement_id=engagement_id,
@@ -605,10 +630,12 @@ class C4Generator:
         engagement_id: EngagementId,
         *,
         now: datetime | None = None,
+        on_progress: LLMProgressCallback | None = None,
     ) -> LLMRunResult:
         return _run_boundary_generator(
             client, engagement_id, self._caller,
             kinds=("scope", "mfa", "freshness"), generator_id="c4", now=now,
+            on_progress=on_progress,
         )
 
 
@@ -632,10 +659,12 @@ class TenantBoundaryGenerator:
         engagement_id: EngagementId,
         *,
         now: datetime | None = None,
+        on_progress: LLMProgressCallback | None = None,
     ) -> LLMRunResult:
         return _run_boundary_generator(
             client, engagement_id, self._caller,
             kinds=("tenant",), generator_id="tenant", now=now,
+            on_progress=on_progress,
         )
 
 
@@ -689,6 +718,7 @@ class SinkGenerator:
         engagement_id: EngagementId,
         *,
         now: datetime | None = None,
+        on_progress: LLMProgressCallback | None = None,
     ) -> LLMRunResult:
         run_at = now or datetime.now(UTC)
         sinks = _load_sink_parameters(client, engagement_id)
@@ -698,6 +728,7 @@ class SinkGenerator:
             engagement_id,
             "sink",
             sinks,
+            on_progress=on_progress,
             assemble=lambda s: assemble_sink_pack(
                 client,
                 engagement_id=engagement_id,

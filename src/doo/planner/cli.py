@@ -17,15 +17,23 @@ and the deferred inference has flushed; this command is a read + a planner write
 
 from __future__ import annotations
 
+import contextlib
 import json as _json
 import os
+import sys
+from collections import Counter
+from collections.abc import Iterator
 from pathlib import Path
 
 import typer
 
 from doo.ids import EngagementId, TestCaseKeyHash
 from doo.infra.neo4j_driver import Neo4jClient
-from doo.planner.generators import PlannerConfig, requested_llm_generator_ids
+from doo.planner.generators import (
+    LLMProgressCallback,
+    PlannerConfig,
+    requested_llm_generator_ids,
+)
 from doo.planner.llm import LiteLLMCaller, LLMCaller
 from doo.planner.llm_audit import BlobLLMAuditSink, LLMAuditSink
 from doo.planner.models import ProposedTestCaseView
@@ -127,6 +135,79 @@ def _configure() -> None:
     bind_correlation(trace_id=new_trace_id(), span_id=new_span_id())
 
 
+@contextlib.contextmanager
+def _llm_progress_bar(*, enabled: bool) -> Iterator[LLMProgressCallback | None]:
+    """A `rich` per-generator progress bar for the LLM-proposing loop.
+
+    Yields a callback the driver invokes once per gap (`generator, i, total,
+    outcome`). One bar per generator, sized on the `i == 0` "start" tick so the
+    bar appears before the first (possibly slow) call returns. The description
+    shows running proposed/rejected/skipped counts. Structlog output (the
+    `coverage.*.complete` lines) is redirected above the live bar so it does not
+    corrupt rendering.
+
+    When `enabled` is False (no LLM generators, `--json`, or stderr is not a TTY)
+    yields **None** — the driver then falls back to its
+    `planner.generator.llm.progress` log line, so non-interactive runs keep
+    per-gap observability.
+    """
+
+    if not enabled or not sys.stderr.isatty():
+        yield None
+        return
+
+    from rich.console import Console
+    from rich.progress import (
+        BarColumn,
+        MofNCompleteColumn,
+        Progress,
+        SpinnerColumn,
+        TaskID,
+        TextColumn,
+        TimeElapsedColumn,
+    )
+
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[bold]{task.fields[generator]:>6}[/]"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        TextColumn("{task.description}"),
+        console=Console(file=sys.stderr),
+        transient=False,
+        redirect_stdout=True,
+        redirect_stderr=True,
+    )
+    tasks: dict[str, TaskID] = {}
+    counts: dict[str, Counter[str]] = {}
+
+    def _describe(generator: str) -> str:
+        c = counts[generator]
+        return (
+            f"proposed {c['proposed']} · rejected {c['rejected']} · "
+            f"skipped {c['skipped']}"
+        )
+
+    def on_progress(generator: str, i: int, total: int, outcome: str) -> None:
+        if generator not in tasks:
+            counts[generator] = Counter()
+            tasks[generator] = progress.add_task(
+                _describe(generator), total=max(total, 1), generator=generator
+            )
+        if outcome != "start":
+            counts[generator][outcome] += 1
+        progress.update(
+            tasks[generator],
+            completed=i,
+            total=max(total, 1),
+            description=_describe(generator),
+        )
+
+    with progress:
+        yield on_progress
+
+
 @planner_app.command("propose")
 def propose_cmd(
     engagement: str = typer.Option(
@@ -160,13 +241,17 @@ def propose_cmd(
 
     client = _build_client()
     try:
-        result = propose(
-            client,
-            engagement_id=EngagementId(engagement),
-            config=config,
-            llm_caller=llm_caller,
-            llm_audit_sink=llm_audit_sink,
-        )
+        with _llm_progress_bar(
+            enabled=bool(llm_caller) and not as_json
+        ) as on_progress:
+            result = propose(
+                client,
+                engagement_id=EngagementId(engagement),
+                config=config,
+                llm_caller=llm_caller,
+                llm_audit_sink=llm_audit_sink,
+                on_llm_progress=on_progress,
+            )
     finally:
         client.close()
 

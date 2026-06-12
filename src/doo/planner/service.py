@@ -25,6 +25,7 @@ from doo.observability.logging import get_logger
 from doo.ontology.queries import for_engagement
 from doo.planner.commit import commit_testcase
 from doo.planner.generators import (
+    LLMProgressCallback,
     LLMSkipped,
     PlannerConfig,
     enabled_generators,
@@ -87,6 +88,7 @@ def propose(
     config: PlannerConfig | None = None,
     llm_caller: LLMCaller | None = None,
     llm_audit_sink: LLMAuditSink | None = None,
+    on_llm_progress: LLMProgressCallback | None = None,
     now: datetime | None = None,
 ) -> ProposeResult:
     """Run the enabled generators, validate, and commit proposed `TestCase`s.
@@ -142,7 +144,9 @@ def propose(
             _commit(generator.propose(candidate))
 
     for llm_generator in llm_generators:
-        run = llm_generator.run(client, engagement_id, now=run_at)
+        run = llm_generator.run(
+            client, engagement_id, now=run_at, on_progress=on_llm_progress
+        )
         candidates_n += run.candidates
         assert llm_audit_sink is not None  # guarded above when llm_generators present
         for item in run.proposed:
