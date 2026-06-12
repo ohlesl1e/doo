@@ -23,6 +23,7 @@ from __future__ import annotations
 import contextlib
 import os
 import sys
+import time
 from collections import Counter
 from collections.abc import Callable, Iterator
 from typing import Annotated, cast
@@ -189,15 +190,27 @@ def _finalizing(*, enabled: bool) -> Iterator[Callable[[str, int, int], None]]:
 
     with progress:
         task = progress.add_task("starting…", total=None)
+        last_paint = 0.0
 
         def on_progress(phase: str, completed: int, total: int) -> None:
-            if total > 0:  # determinate phase (cohort re-templating)
+            # A heavy synchronous phase (e.g. value promotion is CPU-bound Python over
+            # thousands of values) holds the GIL, starving rich's background refresh —
+            # so the bar AND the elapsed timer freeze. Force a main-thread repaint,
+            # throttled to ~12/sec, so the display keeps moving through such a phase.
+            nonlocal last_paint
+            now = time.monotonic()
+            paint = (now - last_paint) > 0.08 or (total > 0 and completed >= total)
+            if paint:
+                last_paint = now
+            if total > 0:  # determinate phase (cohort re-templating / value promotion)
                 progress.update(
                     task, description=f"{phase} {completed}/{total}",
-                    completed=completed, total=total,
+                    completed=completed, total=total, refresh=paint,
                 )
             else:  # indeterminate per-engagement phase — pulse with the label
-                progress.update(task, description=f"{phase}…", completed=0, total=None)
+                progress.update(
+                    task, description=f"{phase}…", completed=0, total=None, refresh=paint,
+                )
 
         yield on_progress
 

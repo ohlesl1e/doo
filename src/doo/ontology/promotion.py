@@ -40,6 +40,7 @@ re-running over an unchanged graph creates nothing new. No LLM (CLAUDE.md hard r
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -95,6 +96,7 @@ def promote_values(
     engagement_id: EngagementId,
     observed_at: datetime,
     ingested_at: datetime,
+    on_value: Callable[[int, int], None] | None = None,
 ) -> PromotionResult:
     """Promote inline candidates clearing a signal into `ObservedValue`s for one engagement.
 
@@ -113,7 +115,12 @@ def promote_values(
 
     promoted: list[PromotedValue] = []
     edge_count = 0
-    for value_hash, occurrences in sorted(by_hash.items()):
+    items = sorted(by_hash.items())
+    total = len(items)
+    report = on_value or (lambda _done, _total: None)
+    report(0, total)
+    for i, (value_hash, occurrences) in enumerate(items, start=1):
+        report(i, total)
         kinds = [o.kind for o in occurrences]
         roles = [o.role for o in occurrences]
         # Distinct observations carrying this value (any role) — the multiplicity

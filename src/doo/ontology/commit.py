@@ -357,6 +357,7 @@ class CommitOrchestrator:
                 engagement_id=engagement_id,
                 observed_at=now,
                 ingested_at=now,
+                on_value=lambda done, total: _progress("promoting values", done, total),
             )
             trace_id = new_trace_id()
             span_id = new_span_id()
