@@ -88,7 +88,7 @@ def _build_llm_deps() -> tuple[LLMCaller, LLMAuditSink]:
 
     from doo.infra.blobs import BlobClient
 
-    model = os.environ.get("DOO_PLANNER_MODEL", "claude-opus-4-8")
+    model = os.environ.get("DOO_PLANNER_MODEL", "anthropic/claude-opus-4-8")
     timeout_raw = os.environ.get("DOO_PLANNER_TIMEOUT_S", "60")
     timeout_s: float | None
     try:
@@ -101,12 +101,26 @@ def _build_llm_deps() -> tuple[LLMCaller, LLMAuditSink]:
         num_retries = max(0, int(os.environ.get("DOO_PLANNER_NUM_RETRIES", "0")))
     except ValueError:
         num_retries = 0
+    tool_choice_mode = os.environ.get("DOO_PLANNER_TOOL_CHOICE", "force").strip().lower()
+    if tool_choice_mode not in ("force", "auto"):
+        tool_choice_mode = "force"
+    temperature: float | None
+    temperature_raw = os.environ.get("DOO_PLANNER_TEMPERATURE", "0.0").strip()
+    if temperature_raw == "" or temperature_raw.lower() == "none":
+        temperature = None
+    else:
+        try:
+            temperature = float(temperature_raw)
+        except ValueError:
+            temperature = 0.0
     caller = LiteLLMCaller(
         model,
+        temperature=temperature,
         api_base=os.environ.get("DOO_PLANNER_API_BASE") or None,
         api_key=os.environ.get("DOO_PLANNER_API_KEY") or None,
         timeout_s=timeout_s,
         num_retries=num_retries,
+        tool_choice_mode=tool_choice_mode,
     )
     blobs = BlobClient.from_config(
         endpoint_url=os.environ.get("DOO_S3_ENDPOINT", "http://localhost:9000"),
