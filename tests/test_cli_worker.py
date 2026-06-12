@@ -8,6 +8,7 @@ onto the root CLI.
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from uuid import uuid4
 
@@ -17,6 +18,17 @@ from doo.cli import app
 from doo.cli_worker import _drain_once, _report_parse_failures, _truncate
 from doo.events.l2 import ParseFailure
 from doo.ids import EngagementId, L2EventId, ObservationId, SourceId
+
+# Strip ANSI styling so assertions don't depend on rich's colour codes. `--help` is
+# rendered via rich now that it's a dependency; we also widen the terminal (COLUMNS)
+# so option names aren't line-wrapped at CI's default 80 columns.
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _plain_help(args: list[str]) -> str:
+    result = CliRunner().invoke(app, args, env={"COLUMNS": "200"})
+    assert result.exit_code == 0
+    return _ANSI.sub("", result.output)
 
 
 def _parse_failure(kind: str, msg: str, where: str | None = "log") -> ParseFailure:
@@ -54,15 +66,11 @@ def test_drain_once_stops_immediately_when_streams_empty() -> None:
 
 
 def test_worker_run_command_is_registered() -> None:
-    result = CliRunner().invoke(app, ["worker", "--help"])
-    assert result.exit_code == 0
-    assert "run" in result.output
+    assert "run" in _plain_help(["worker", "--help"])
 
 
 def test_worker_run_has_json_flag() -> None:
-    result = CliRunner().invoke(app, ["worker", "run", "--help"])
-    assert result.exit_code == 0
-    assert "--json" in result.output
+    assert "--json" in _plain_help(["worker", "run", "--help"])
 
 
 def test_worker_progress_disabled_yields_working_noop_callbacks() -> None:
