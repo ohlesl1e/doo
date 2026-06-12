@@ -77,3 +77,22 @@ def test_run_l3_worker_acks_the_whole_batch_past_max_messages() -> None:
     # max_messages was 2 — nothing left stranded in the PEL.
     assert len(stream.acked) == 5
     assert processed == 5
+
+
+def test_run_l3_worker_invokes_on_event_per_committed_event() -> None:
+    batch = [(f"0-{i}", _parse_failure_payload(i)) for i in range(5)]
+    stream = _FakeStream(batch)
+    deps = L3WorkerDeps(
+        orchestrator=_FakeOrchestrator(),  # type: ignore[arg-type]
+        streams=stream,  # type: ignore[arg-type]
+    )
+    ticks: list[int] = []
+
+    processed = run_l3_worker(
+        deps, max_messages=2, block_ms=0, on_event=lambda: ticks.append(1)
+    )
+
+    # The progress hook fires exactly once per committed event (the worker
+    # progress bar advances on it).
+    assert processed == 5
+    assert len(ticks) == 5
