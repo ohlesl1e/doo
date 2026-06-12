@@ -147,6 +147,30 @@ def _worker_progress(
         yield on_extracted, on_committed
 
 
+@contextlib.contextmanager
+def _finalizing(*, enabled: bool) -> Iterator[None]:
+    """A `rich` spinner for the post-drain flush (templating + inference).
+
+    The progress bar tracks *commits*; the deferred-inference settle step
+    (ADR-0022 — re-template dirty cohorts, promote values, identity reconciliation,
+    `TrustBoundary` inference) runs once after all commits and has no per-item
+    progress, so a full bar would read as hung. This shows an animated "finalizing…"
+    status during that phase. When disabled (non-TTY / `--json`) yields silently —
+    the structured `flush.applied` log covers it.
+    """
+
+    if not enabled or not sys.stderr.isatty():
+        yield
+        return
+
+    from rich.console import Console
+
+    with Console(file=sys.stderr).status(
+        "[bold]finalizing[/] — templating endpoints + inference…", spinner="dots"
+    ):
+        yield
+
+
 class _WorkerRuntime:
     """Env-configured L2/L3 worker collaborators plus their closeables."""
 
@@ -238,10 +262,12 @@ def register_worker(app: typer.Typer) -> None:
         from doo.ontology.l3_worker import run_l3_worker
 
         runtime = _WorkerRuntime()
+        orchestrator = runtime.l3_deps.orchestrator
         failures: list[ParseFailure] = []
         once_summary: tuple[int, int, int, int, int] | None = None
 
         try:
+            drain_counts: tuple[int, int] | None = None
             with _worker_progress(enabled=show_bar) as (on_extracted, on_committed):
 
                 def _collect(events: list[L2Event]) -> None:
@@ -272,17 +298,9 @@ def register_worker(app: typer.Typer) -> None:
                         on_event=on_committed,
                     )
 
-                orchestrator = runtime.l3_deps.orchestrator
                 if once:
-                    extracted, committed = _drain_once(
+                    drain_counts = _drain_once(
                         run_l2=lambda: _run_l2(500, _collect), run_l3=lambda: _run_l3(500)
-                    )
-                    # Deferred endpoint inference (ADR-0022): re-template the cohorts
-                    # this drain touched (and any left un-HIT by a prior crashed run).
-                    flushed = orchestrator.flush()
-                    once_summary = (
-                        extracted, committed,
-                        flushed.endpoints, flushed.parameters, flushed.cohorts,
                     )
                 else:
                     typer.echo(
@@ -296,6 +314,18 @@ def register_worker(app: typer.Typer) -> None:
                             orchestrator.flush()  # re-template dirty cohorts each pass
                     except KeyboardInterrupt:
                         typer.echo("\nstopped")
+
+            # The progress bar is now closed. Run the deferred-inference settle step
+            # (ADR-0022) under a "finalizing…" spinner so the (full) bar doesn't read
+            # as hung while templating + inference churn over the drained cohorts.
+            if drain_counts is not None:
+                extracted, committed = drain_counts
+                with _finalizing(enabled=show_bar):
+                    flushed = orchestrator.flush()
+                once_summary = (
+                    extracted, committed,
+                    flushed.endpoints, flushed.parameters, flushed.cohorts,
+                )
         finally:
             runtime.close()
 

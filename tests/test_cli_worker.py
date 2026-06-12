@@ -83,6 +83,15 @@ def test_worker_progress_disabled_yields_working_noop_callbacks() -> None:
         on_committed()  # no terminal, no error, no output
 
 
+def test_finalizing_disabled_is_a_silent_noop() -> None:
+    # When disabled (non-TTY / --json) the finalizing spinner yields silently so the
+    # flush runs unchanged (the flush.applied log covers it).
+    from doo.cli_worker import _finalizing
+
+    with _finalizing(enabled=False):
+        pass
+
+
 def test_truncate_collapses_whitespace_and_limits_length() -> None:
     assert _truncate("a   b\nc", 100) == "a b c"
     out = _truncate("x" * 300, 50)
