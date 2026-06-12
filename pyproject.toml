@@ -28,6 +28,7 @@ dependencies = [
     "boto3>=1.34",
     "pyjwt>=2.8",
     "pyyaml>=6.0",
+    "rich>=13",
 ]
 
 [project.optional-dependencies]

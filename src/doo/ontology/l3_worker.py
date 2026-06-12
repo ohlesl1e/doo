@@ -12,6 +12,7 @@ orchestrator emits.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from doo.events.l2 import L2Event
@@ -44,10 +45,14 @@ def run_l3_worker(
     consumer_name: str = "l3-1",
     max_messages: int | None = None,
     block_ms: int = 1000,
+    on_event: Callable[[], None] | None = None,
 ) -> int:
     """Consume `l2-events` and commit until `max_messages` (or forever).
 
-    Returns the number of messages processed.
+    Returns the number of messages processed. `on_event`, when given, is invoked
+    once per committed event (after the ack) — the per-event progress hook the
+    `doo worker run` progress bar advances on (mirrors `run_l2_worker`'s
+    `on_events`). It must not raise.
     """
 
     deps.streams.ensure_group(L2_EVENTS_STREAM, L3_CONSUMER_GROUP)
@@ -62,6 +67,8 @@ def run_l3_worker(
             process_l2_event(deps, event)
             deps.streams.ack(L2_EVENTS_STREAM, L3_CONSUMER_GROUP, message_id)
             processed += 1
+            if on_event is not None:
+                on_event()
         # `max_messages` is checked at the batch boundary (the `while` head), never
         # mid-batch: breaking inside the loop would leave the rest of an already-
         # delivered read batch unacked, stranding it in the consumer PEL.

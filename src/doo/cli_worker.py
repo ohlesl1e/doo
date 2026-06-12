@@ -20,9 +20,11 @@ the credentials, which you must export to match compose.
 
 from __future__ import annotations
 
+import contextlib
 import os
+import sys
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Annotated, cast
 
 import typer
@@ -85,6 +87,64 @@ def _drain_once(*, run_l2: Callable[[], int], run_l3: Callable[[], int]) -> tupl
         total_l3 += n3
         if n2 == 0 and n3 == 0:
             return total_l2, total_l3
+
+
+@contextlib.contextmanager
+def _worker_progress(
+    *, enabled: bool
+) -> Iterator[tuple[Callable[[int], None], Callable[[], None]]]:
+    """A `rich` progress bar for `doo worker run` — extracted (total) vs committed.
+
+    Mirrors `planner/cli.py::_llm_progress_bar`. L2 extraction grows the bar's
+    `total` (`on_extracted(n)`); L3 commit advances `completed` (`on_committed()`),
+    so the bar starts indeterminate and fills as the drain interleaves. Structlog
+    output is redirected above the live bar. When disabled (non-TTY or `--json`)
+    yields no-op callbacks so the raw structured-log path is unchanged.
+    """
+
+    if not enabled or not sys.stderr.isatty():
+        yield (lambda _n: None), (lambda: None)
+        return
+
+    from rich.console import Console
+    from rich.progress import (
+        BarColumn,
+        MofNCompleteColumn,
+        Progress,
+        SpinnerColumn,
+        TextColumn,
+        TimeElapsedColumn,
+    )
+
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[bold]ingest[/]"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        TextColumn("{task.description}"),
+        console=Console(file=sys.stderr),
+        transient=False,
+        redirect_stdout=True,
+        redirect_stderr=True,
+    )
+    state = {"total": 0, "done": 0}
+
+    with progress:
+        task = progress.add_task("extracted 0 · committed 0", total=None)
+
+        def _describe() -> str:
+            return f"extracted {state['total']} · committed {state['done']}"
+
+        def on_extracted(n: int) -> None:
+            state["total"] += n
+            progress.update(task, total=state["total"], description=_describe())
+
+        def on_committed() -> None:
+            state["done"] += 1
+            progress.update(task, completed=state["done"], description=_describe())
+
+        yield on_extracted, on_committed
 
 
 class _WorkerRuntime:
@@ -160,64 +220,95 @@ def register_worker(app: typer.Typer) -> None:
             int,
             typer.Option("--batch", help="Max messages drained per L2/L3 pass."),
         ] = 500,
+        as_json: bool = typer.Option(
+            False,
+            "--json",
+            help="Keep the raw structured (JSON) logs instead of a progress bar "
+            "(for piping / debugging / non-interactive runs).",
+        ),
     ) -> None:
         """Consume `ingest` -> `l2-events` -> `l3-events`, building the graph."""
 
-        configure_logging()
+        # Interactive default: a live progress bar + quiet logs. `--json` (or a
+        # non-TTY stderr) keeps the full per-event structured logs as before.
+        show_bar = sys.stderr.isatty() and not as_json
+        configure_logging(level="WARNING" if show_bar else "INFO")
 
         from doo.ingestion.l2_worker import run_l2_worker
         from doo.ontology.l3_worker import run_l3_worker
 
         runtime = _WorkerRuntime()
         failures: list[ParseFailure] = []
+        once_summary: tuple[int, int, int, int, int] | None = None
 
-        def _collect(events: list[L2Event]) -> None:
-            failures.extend(e for e in events if isinstance(e, ParseFailure))
+        try:
+            with _worker_progress(enabled=show_bar) as (on_extracted, on_committed):
 
-        def _stream(events: list[L2Event]) -> None:
-            for e in events:
-                if isinstance(e, ParseFailure):
-                    where = f" [{e.location_hint}]" if e.location_hint else ""
-                    typer.secho(
-                        f"  parse failure [{e.error_kind}]{where}: {_truncate(e.error_message)}",
-                        fg=typer.colors.YELLOW,
-                        err=True,
+                def _collect(events: list[L2Event]) -> None:
+                    failures.extend(e for e in events if isinstance(e, ParseFailure))
+                    on_extracted(len(events))
+
+                def _stream(events: list[L2Event]) -> None:
+                    on_extracted(len(events))
+                    for e in events:
+                        if isinstance(e, ParseFailure):
+                            where = f" [{e.location_hint}]" if e.location_hint else ""
+                            typer.secho(
+                                f"  parse failure [{e.error_kind}]{where}: "
+                                f"{_truncate(e.error_message)}",
+                                fg=typer.colors.YELLOW,
+                                err=True,
+                            )
+
+                def _run_l2(block_ms: int, on_events: Callable[[list[L2Event]], None]) -> int:
+                    return run_l2_worker(
+                        runtime.l2_deps, max_messages=batch, block_ms=block_ms,
+                        on_events=on_events,
                     )
 
-        def _run_l2(block_ms: int, on_events: Callable[[list[L2Event]], None]) -> int:
-            return run_l2_worker(
-                runtime.l2_deps, max_messages=batch, block_ms=block_ms, on_events=on_events
-            )
+                def _run_l3(block_ms: int) -> int:
+                    return run_l3_worker(
+                        runtime.l3_deps, max_messages=batch, block_ms=block_ms,
+                        on_event=on_committed,
+                    )
 
-        def _run_l3(block_ms: int) -> int:
-            return run_l3_worker(runtime.l3_deps, max_messages=batch, block_ms=block_ms)
-
-        orchestrator = runtime.l3_deps.orchestrator
-        try:
-            if once:
-                extracted, committed = _drain_once(
-                    run_l2=lambda: _run_l2(500, _collect), run_l3=lambda: _run_l3(500)
-                )
-                # Deferred endpoint inference (ADR-0022): re-template the cohorts
-                # this drain touched (and any left un-HIT by a prior crashed run).
-                flushed = orchestrator.flush()
-                typer.echo(
-                    f"drained: {extracted} envelope(s) extracted, "
-                    f"{committed} L2 event(s) committed; "
-                    f"templated {flushed.endpoints} endpoint(s) / "
-                    f"{flushed.parameters} parameter(s) across {flushed.cohorts} cohort(s)"
-                )
-                _report_parse_failures(failures)
-                return
-            typer.echo("worker running — consuming ingest -> l2-events -> l3-events (Ctrl-C to stop)")
-            try:
-                while True:
-                    _run_l2(1000, _stream)
-                    _run_l3(1000)
-                    orchestrator.flush()  # re-template dirty cohorts each pass
-            except KeyboardInterrupt:
-                typer.echo("\nstopped")
+                orchestrator = runtime.l3_deps.orchestrator
+                if once:
+                    extracted, committed = _drain_once(
+                        run_l2=lambda: _run_l2(500, _collect), run_l3=lambda: _run_l3(500)
+                    )
+                    # Deferred endpoint inference (ADR-0022): re-template the cohorts
+                    # this drain touched (and any left un-HIT by a prior crashed run).
+                    flushed = orchestrator.flush()
+                    once_summary = (
+                        extracted, committed,
+                        flushed.endpoints, flushed.parameters, flushed.cohorts,
+                    )
+                else:
+                    typer.echo(
+                        "worker running — consuming ingest -> l2-events -> l3-events "
+                        "(Ctrl-C to stop)"
+                    )
+                    try:
+                        while True:
+                            _run_l2(1000, _stream)
+                            _run_l3(1000)
+                            orchestrator.flush()  # re-template dirty cohorts each pass
+                    except KeyboardInterrupt:
+                        typer.echo("\nstopped")
         finally:
             runtime.close()
+
+        # Printed after the progress bar closes, so the summary + parse-failure
+        # report render cleanly below it.
+        if once_summary is not None:
+            extracted, committed, n_endpoints, n_parameters, n_cohorts = once_summary
+            typer.echo(
+                f"drained: {extracted} envelope(s) extracted, "
+                f"{committed} L2 event(s) committed; "
+                f"templated {n_endpoints} endpoint(s) / "
+                f"{n_parameters} parameter(s) across {n_cohorts} cohort(s)"
+            )
+            _report_parse_failures(failures)
 
     app.add_typer(worker_app, name="worker")

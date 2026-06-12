@@ -59,6 +59,22 @@ def test_worker_run_command_is_registered() -> None:
     assert "run" in result.output
 
 
+def test_worker_run_has_json_flag() -> None:
+    result = CliRunner().invoke(app, ["worker", "run", "--help"])
+    assert result.exit_code == 0
+    assert "--json" in result.output
+
+
+def test_worker_progress_disabled_yields_working_noop_callbacks() -> None:
+    # When disabled (non-TTY / --json) the context manager yields no-op callbacks
+    # so the drain code path is identical without a terminal.
+    from doo.cli_worker import _worker_progress
+
+    with _worker_progress(enabled=False) as (on_extracted, on_committed):
+        on_extracted(3)
+        on_committed()  # no terminal, no error, no output
+
+
 def test_truncate_collapses_whitespace_and_limits_length() -> None:
     assert _truncate("a   b\nc", 100) == "a b c"
     out = _truncate("x" * 300, 50)
