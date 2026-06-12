@@ -459,6 +459,12 @@ class LiteLLMCaller:
     id plus `api_base` (the org-standard path). `api_base` / `api_key` are optional
     overrides; when unset, litellm resolves credentials from its provider env vars.
 
+    `timeout_s` bounds a single proposing call. Generators call this once per gap,
+    sequentially, so without a bound a stalled gateway hangs the whole `propose`
+    run. A timed-out call raises `LLMProposalError`, which each generator already
+    catches and records as an `LLMSkipped` — the run continues. `None` disables
+    the bound (litellm's provider default applies).
+
     `litellm` is imported lazily so the module imports without the dependency; only
     constructing/using this caller requires it.
     """
@@ -470,11 +476,13 @@ class LiteLLMCaller:
         temperature: float = 0.0,
         api_base: str | None = None,
         api_key: str | None = None,
+        timeout_s: float | None = 60.0,
     ) -> None:
         self._model = model
         self._temperature = temperature
         self._api_base = api_base
         self._api_key = api_key
+        self._timeout_s = timeout_s
 
     def propose(self, pack: ContextPack) -> LLMCallResult:
         # lazy production-only dep; ignore covers both "litellm absent" (CI) and
@@ -497,10 +505,19 @@ class LiteLLMCaller:
         }
         if self._api_base is not None:
             request["api_base"] = self._api_base
+        if self._timeout_s is not None:
+            request["timeout"] = self._timeout_s
         call_kwargs = dict(request)
         if self._api_key is not None:
             call_kwargs["api_key"] = self._api_key  # out-of-band; not in `request`
-        completion = litellm.completion(**call_kwargs)
+        try:
+            completion = litellm.completion(**call_kwargs)
+        except litellm.exceptions.Timeout as exc:
+            # Surface as a parse-level failure so the generator records an
+            # `LLMSkipped` and moves on instead of the whole run blocking.
+            raise LLMProposalError(
+                f"LLM call timed out after {self._timeout_s}s"
+            ) from exc
         response = completion.model_dump() if hasattr(completion, "model_dump") else dict(completion)
         draft = _parse_tool_call(response)
         return LLMCallResult(draft=draft, request=request, response=response)

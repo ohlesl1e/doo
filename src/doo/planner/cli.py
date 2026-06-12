@@ -67,18 +67,30 @@ def _build_llm_deps() -> tuple[LLMCaller, LLMAuditSink]:
     - **Provider URL + key** (LiteLLM/OpenAI-compatible gateway, local proxy) —
       set `DOO_PLANNER_API_BASE` (+ `DOO_PLANNER_API_KEY`) and an `openai/<name>` id.
     `DOO_PLANNER_API_BASE` / `DOO_PLANNER_API_KEY` are optional overrides; unset, litellm
-    resolves credentials from its provider env vars. The audit sink persists every
-    proposing call to the same object storage as the rest of the CLI (`DOO_S3_*`).
-    Built only when an LLM generator (C2) is actually requested.
+    resolves credentials from its provider env vars. `DOO_PLANNER_TIMEOUT_S` bounds
+    a single proposing call (default 60s; set to `0` / empty to disable) — generators
+    call the model once per gap sequentially, so an unbounded stalled call would
+    otherwise hang the whole run. The audit sink persists every proposing call to
+    the same object storage as the rest of the CLI (`DOO_S3_*`). Built only when an
+    LLM generator (C2) is actually requested.
     """
 
     from doo.infra.blobs import BlobClient
 
     model = os.environ.get("DOO_PLANNER_MODEL", "claude-opus-4-8")
+    timeout_raw = os.environ.get("DOO_PLANNER_TIMEOUT_S", "60")
+    timeout_s: float | None
+    try:
+        timeout_s = float(timeout_raw) if timeout_raw else None
+    except ValueError:
+        timeout_s = 60.0
+    if timeout_s is not None and timeout_s <= 0:
+        timeout_s = None
     caller = LiteLLMCaller(
         model,
         api_base=os.environ.get("DOO_PLANNER_API_BASE") or None,
         api_key=os.environ.get("DOO_PLANNER_API_KEY") or None,
+        timeout_s=timeout_s,
     )
     blobs = BlobClient.from_config(
         endpoint_url=os.environ.get("DOO_S3_ENDPOINT", "http://localhost:9000"),

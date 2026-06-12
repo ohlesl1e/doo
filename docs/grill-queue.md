@@ -107,6 +107,20 @@ Until after slice 1+2 lands; revisit when the implementation forces the question
   disambiguation for apps that always 200 with a body-level success flag —
   tester-declared string/regex (ADR-0012-legal), the sqlmap `--string` pattern.
   Defer until a real always-200 target forces it.
+- **Cap / rank C2 candidates before the LLM call (ADR-0036).** `C2Generator`
+  makes one synchronous proposing call per `run_c2` row. C2 emits one row per
+  *ordered* principal pair × endpoint where A reached and B did not — on a real
+  engagement (`fap-hd`, 5 principals, 74 endpoints) that's 306 rows ⇒ 306
+  sequential LLM calls (~45 min on a slow gateway). Most of that fan-out is
+  redundant: the same endpoint surfaces once per non-reaching principal, and the
+  `(anon, X)` direction is rarely an authz lead. Options to grill: (a) collapse
+  C2 rows by endpoint and let the LLM pick the attacker from the full
+  per-principal evidence (the C2b pack shape already does this); (b) apply the
+  ADR-0036 deterministic prioritiser *before* proposing and truncate top-N; (c)
+  drop ordered pairs where the A side is `anon`. Per-gap progress logging + a
+  configurable per-call timeout landed 2026-06-11 so the run is observable and
+  bounded; the fan-out itself is unchanged. Revisit alongside slice 4 (the same
+  cap will gate dispatch volume).
 
 - **Burp extension.** HAR-first MVP — drop a HAR file into ingestion, see it land in the graph. No Java/Kotlin yet. For continuous capture later, **Logger++** (existing Burp extension) is the planned integration point: it ships auto CSV export and a live Elasticsearch-stream output. The integration is a small HTTP shim that speaks the ES bulk-index protocol and pipes the indexed documents into L1 ingestion as raw observations — Logger++ thinks it's writing to ES, we get streaming Burp traffic with zero custom Burp code. A custom Montoya extension is only justified if Logger++'s exported document shape lacks something we need; revisit then.
 - **OpenTelemetry SDK + collector + exporters.** Refined to "OTel-ready, OTel-not-yet" per ADR-0018: `trace_id` / `span_id` ride in `IngestionEnvelope`, `L2Event`, and `l3-events` from slice 1; structured logs include the same IDs; the SDK and exporters are deferred until slice 2-3 when distributed tracing pays off.

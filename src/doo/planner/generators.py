@@ -227,6 +227,33 @@ class LLMRunResult:
     skipped: tuple[LLMSkipped, ...]
 
 
+def _log_llm_progress(
+    generator: GeneratorId,
+    engagement_id: EngagementId,
+    *,
+    i: int,
+    total: int,
+    outcome: str,
+) -> None:
+    """Per-gap progress for an LLM-proposing generator loop.
+
+    Generators call the model once per gap, sequentially; against a slow gateway
+    a real engagement runs for tens of minutes between the `coverage.*.complete`
+    log and `planner.generator.*.complete` with nothing in between. Emitting one
+    line per gap (`outcome ∈ {proposed, rejected, skipped}`) makes a long-but-
+    healthy run distinguishable from a hung one.
+    """
+
+    log.info(
+        "planner.generator.llm.progress",
+        generator=generator,
+        engagement_id=engagement_id,
+        i=i,
+        total=total,
+        outcome=outcome,
+    )
+
+
 @runtime_checkable
 class LLMProposingGenerator(Protocol):
     """An LLM-proposing generator (ADR-0037): gaps -> packs -> proposals.
@@ -288,7 +315,7 @@ class C2Generator:
         rejected: list[LLMRejected] = []
         skipped: list[LLMSkipped] = []
 
-        for gap in gaps:
+        for i, gap in enumerate(gaps, 1):
             pack = assemble_c2_pack(
                 client,
                 gap=gap,
@@ -305,6 +332,7 @@ class C2Generator:
                         )
                     )
                 )
+                _log_llm_progress("c2", engagement_id, i=i, total=len(gaps), outcome="skipped")
                 continue
             try:
                 call = self._caller.propose(pack)
@@ -317,10 +345,12 @@ class C2Generator:
                         )
                     )
                 )
+                _log_llm_progress("c2", engagement_id, i=i, total=len(gaps), outcome="skipped")
                 continue
             outcome = resolve_draft(pack, call.draft)
             if isinstance(outcome, DraftRejected):
                 rejected.append(LLMRejected(rejection=outcome, call=call))
+                _log_llm_progress("c2", engagement_id, i=i, total=len(gaps), outcome="rejected")
                 continue
             # ADR-0041: deterministically annotate replay-breakers from a reaching
             # 2xx observation (code-set, never the LLM). A frozen proposal -> copy.
@@ -329,6 +359,7 @@ class C2Generator:
             )
             proposal = outcome.model_copy(update={"replay_hazards": hazards})
             proposed.append(LLMProposed(proposal=proposal, call=call))
+            _log_llm_progress("c2", engagement_id, i=i, total=len(gaps), outcome="proposed")
 
         log.info(
             "planner.generator.c2.complete",
@@ -384,7 +415,7 @@ class C2bGenerator:
         rejected: list[LLMRejected] = []
         skipped: list[LLMSkipped] = []
 
-        for gap in gaps:
+        for i, gap in enumerate(gaps, 1):
             pack = assemble_c2b_pack(
                 client,
                 gap=gap,
@@ -400,6 +431,7 @@ class C2bGenerator:
                         )
                     )
                 )
+                _log_llm_progress("c2b", engagement_id, i=i, total=len(gaps), outcome="skipped")
                 continue
             try:
                 call = self._caller.propose(pack)
@@ -412,10 +444,12 @@ class C2bGenerator:
                         )
                     )
                 )
+                _log_llm_progress("c2b", engagement_id, i=i, total=len(gaps), outcome="skipped")
                 continue
             outcome = resolve_draft(pack, call.draft)
             if isinstance(outcome, DraftRejected):
                 rejected.append(LLMRejected(rejection=outcome, call=call))
+                _log_llm_progress("c2b", engagement_id, i=i, total=len(gaps), outcome="rejected")
                 continue
             # ADR-0041: deterministically annotate replay-breakers (code-set, never
             # the LLM) from a reaching 2xx observation. A frozen proposal -> copy.
@@ -424,6 +458,7 @@ class C2bGenerator:
             )
             proposal = outcome.model_copy(update={"replay_hazards": hazards})
             proposed.append(LLMProposed(proposal=proposal, call=call))
+            _log_llm_progress("c2b", engagement_id, i=i, total=len(gaps), outcome="proposed")
 
         log.info(
             "planner.generator.c2b.complete",
@@ -477,7 +512,7 @@ class C3Generator:
         rejected: list[LLMRejected] = []
         skipped: list[LLMSkipped] = []
 
-        for gap in gaps:
+        for i, gap in enumerate(gaps, 1):
             pack = assemble_c3_pack(client, gap=gap, code_version=__version__, now=run_at)
             if pack is None:
                 skipped.append(
@@ -490,6 +525,7 @@ class C3Generator:
                         )
                     )
                 )
+                _log_llm_progress("c3", engagement_id, i=i, total=len(gaps), outcome="skipped")
                 continue
             try:
                 call = self._caller.propose(pack)
@@ -502,12 +538,15 @@ class C3Generator:
                         )
                     )
                 )
+                _log_llm_progress("c3", engagement_id, i=i, total=len(gaps), outcome="skipped")
                 continue
             outcome = resolve_c3_draft(pack, call.draft)
             if isinstance(outcome, DraftRejected):
                 rejected.append(LLMRejected(rejection=outcome, call=call))
+                _log_llm_progress("c3", engagement_id, i=i, total=len(gaps), outcome="rejected")
                 continue
             proposed.append(LLMProposed(proposal=outcome, call=call))
+            _log_llm_progress("c3", engagement_id, i=i, total=len(gaps), outcome="proposed")
 
         log.info(
             "planner.generator.c3.complete",
@@ -570,7 +609,7 @@ def _run_boundary_generator(
     rejected: list[LLMRejected] = []
     skipped: list[LLMSkipped] = []
 
-    for boundary_id, boundary_kind in boundaries:
+    for i, (boundary_id, boundary_kind) in enumerate(boundaries, 1):
         pack = assemble_boundary_pack(
             client,
             engagement_id=engagement_id,
@@ -588,6 +627,9 @@ def _run_boundary_generator(
                     )
                 )
             )
+            _log_llm_progress(
+                generator_id, engagement_id, i=i, total=len(boundaries), outcome="skipped"
+            )
             continue
         try:
             call = caller.propose(pack)
@@ -595,12 +637,21 @@ def _run_boundary_generator(
             skipped.append(
                 LLMSkipped(reason=f"LLM proposal unparseable for boundary {boundary_id}: {exc}")
             )
+            _log_llm_progress(
+                generator_id, engagement_id, i=i, total=len(boundaries), outcome="skipped"
+            )
             continue
         outcome = resolve_draft(pack, call.draft, generator=generator_id)
         if isinstance(outcome, DraftRejected):
             rejected.append(LLMRejected(rejection=outcome, call=call))
+            _log_llm_progress(
+                generator_id, engagement_id, i=i, total=len(boundaries), outcome="rejected"
+            )
             continue
         proposed.append(LLMProposed(proposal=outcome, call=call))
+        _log_llm_progress(
+            generator_id, engagement_id, i=i, total=len(boundaries), outcome="proposed"
+        )
 
     log.info(
         "planner.generator.boundary.complete",
@@ -732,7 +783,7 @@ class SinkGenerator:
         rejected: list[LLMRejected] = []
         skipped: list[LLMSkipped] = []
 
-        for parameter_id, sink_role in sinks:
+        for i, (parameter_id, sink_role) in enumerate(sinks, 1):
             pack = assemble_sink_pack(
                 client,
                 engagement_id=engagement_id,
@@ -748,6 +799,7 @@ class SinkGenerator:
                         "no resolvable endpoint / send-as identity"
                     )
                 )
+                _log_llm_progress("sink", engagement_id, i=i, total=len(sinks), outcome="skipped")
                 continue
             try:
                 call = self._caller.propose(pack)
@@ -755,12 +807,15 @@ class SinkGenerator:
                 skipped.append(
                     LLMSkipped(reason=f"LLM proposal unparseable for sink {parameter_id}: {exc}")
                 )
+                _log_llm_progress("sink", engagement_id, i=i, total=len(sinks), outcome="skipped")
                 continue
             outcome = resolve_sink_draft(pack, call.draft, config_key=_SINK_CONFIG_KEY)
             if isinstance(outcome, DraftRejected):
                 rejected.append(LLMRejected(rejection=outcome, call=call))
+                _log_llm_progress("sink", engagement_id, i=i, total=len(sinks), outcome="rejected")
                 continue
             proposed.append(LLMProposed(proposal=outcome, call=call))
+            _log_llm_progress("sink", engagement_id, i=i, total=len(sinks), outcome="proposed")
 
         log.info(
             "planner.generator.sink.complete",
