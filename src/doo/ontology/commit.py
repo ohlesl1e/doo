@@ -23,6 +23,7 @@ No LLM here — deterministic commit only (CLAUDE.md hard rule).
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Protocol
@@ -290,7 +291,9 @@ class CommitOrchestrator:
 
     # --- Deferred endpoint inference (ADR-0022): flush ----------------------
 
-    def flush(self) -> FlushResult:
+    def flush(
+        self, *, on_cohort: Callable[[int, int], None] | None = None
+    ) -> FlushResult:
         """Re-template dirty cohorts and promote inline value candidates (ADR-0022/0023).
 
         `commit` leaves each `RequestObservation` un-HIT and its extracted values
@@ -305,11 +308,19 @@ class CommitOrchestrator:
         Both steps emit structural `l3-events`. Dirtiness is derived from the graph,
         so flush is crash-safe and idempotent: a fully-templated, fully-promoted
         graph has no dirty cohorts and re-promotes nothing (identity-keyed MERGEs).
+
+        `on_cohort`, when given, is invoked `(completed, total)` once before the
+        cohort loop (to size a progress bar) and after each cohort is re-templated —
+        the per-cohort progress hook the `doo worker run` "finalizing" bar advances
+        on (the cohort re-templating is the dominant cost of a large flush). It must
+        not raise.
         """
 
         dirty = self._find_dirty_cohorts()
         cohorts = endpoints = parameters = retracted = 0
         engagements: set[EngagementId] = set()
+        if on_cohort is not None and dirty:
+            on_cohort(0, len(dirty))
         for engagement_id, method, host_node_id in dirty:
             engagements.add(engagement_id)
             now = datetime.now(UTC)
@@ -332,6 +343,8 @@ class CommitOrchestrator:
             endpoints += len(retemplate.endpoint_ids)
             parameters += len(retemplate.parameter_ids)
             retracted += len(retemplate.retracted_endpoint_ids)
+            if on_cohort is not None:
+                on_cohort(cohorts, len(dirty))
 
         # --- ADR-0023 promotion pass: inline value candidates -> ObservedValue. ---
         observed_values = yielded_value_edges = 0

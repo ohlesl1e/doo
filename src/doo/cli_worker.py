@@ -148,27 +148,53 @@ def _worker_progress(
 
 
 @contextlib.contextmanager
-def _finalizing(*, enabled: bool) -> Iterator[None]:
-    """A `rich` spinner for the post-drain flush (templating + inference).
+def _finalizing(*, enabled: bool) -> Iterator[Callable[[int, int], None]]:
+    """A `rich` progress bar for the post-drain flush (`orchestrator.flush`).
 
-    The progress bar tracks *commits*; the deferred-inference settle step
-    (ADR-0022 — re-template dirty cohorts, promote values, identity reconciliation,
-    `TrustBoundary` inference) runs once after all commits and has no per-item
-    progress, so a full bar would read as hung. This shows an animated "finalizing…"
-    status during that phase. When disabled (non-TTY / `--json`) yields silently —
-    the structured `flush.applied` log covers it.
+    The commit bar tracks *events*; the deferred-inference settle step (ADR-0022 —
+    re-template dirty cohorts, promote values, identity reconciliation,
+    `TrustBoundary` inference) runs once after all commits, so a full commit bar
+    would read as hung. The dominant cost is re-templating the dirty cohorts, which
+    has a known total (`len(dirty)`), so this yields a per-cohort `(completed, total)`
+    callback driving a determinate "finalizing — templating cohorts" bar; the brief
+    promotion/identity/boundary tail runs with the bar full. When disabled (non-TTY /
+    `--json`) yields a no-op callback — the structured `flush.applied` log covers it.
     """
 
     if not enabled or not sys.stderr.isatty():
-        yield
+        yield lambda _completed, _total: None
         return
 
     from rich.console import Console
+    from rich.progress import (
+        BarColumn,
+        MofNCompleteColumn,
+        Progress,
+        SpinnerColumn,
+        TextColumn,
+        TimeElapsedColumn,
+    )
 
-    with Console(file=sys.stderr).status(
-        "[bold]finalizing[/] — templating endpoints + inference…", spinner="dots"
-    ):
-        yield
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[bold]finalizing[/]"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        TextColumn("{task.description}"),
+        console=Console(file=sys.stderr),
+        transient=False,
+        redirect_stdout=True,
+        redirect_stderr=True,
+    )
+
+    with progress:
+        task = progress.add_task("templating cohorts + inference", total=None)
+
+        def on_cohort(completed: int, total: int) -> None:
+            progress.update(task, completed=completed, total=max(total, 1))
+
+        yield on_cohort
 
 
 class _WorkerRuntime:
@@ -320,8 +346,8 @@ def register_worker(app: typer.Typer) -> None:
             # as hung while templating + inference churn over the drained cohorts.
             if drain_counts is not None:
                 extracted, committed = drain_counts
-                with _finalizing(enabled=show_bar):
-                    flushed = orchestrator.flush()
+                with _finalizing(enabled=show_bar) as on_cohort:
+                    flushed = orchestrator.flush(on_cohort=on_cohort)
                 once_summary = (
                     extracted, committed,
                     flushed.endpoints, flushed.parameters, flushed.cohorts,
