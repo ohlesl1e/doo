@@ -459,6 +459,14 @@ class LiteLLMCaller:
     id plus `api_base` (the org-standard path). `api_base` / `api_key` are optional
     overrides; when unset, litellm resolves credentials from its provider env vars.
 
+    `tool_choice_mode` controls how `propose_test` is selected: `"force"` (the
+    default) pins the tool via `tool_choice={type: function, …}` so the response is
+    guaranteed-structured; `"auto"` sends `tool_choice="auto"` and relies on the
+    system prompt's "call `propose_test` exactly once" instruction. `"auto"` exists
+    because some models (e.g. `claude-fable-5`) reject forced tool use with
+    a 400 — for those, the prompt is the enforcement and a missing tool call is
+    already handled as `LLMProposalError` → skip.
+
     `timeout_s` bounds a single proposing attempt and `num_retries` is the litellm
     retry count (default **0** — re-running `propose` is the retry, idempotent per
     ADR-0007). Generators call this once per gap, sequentially, so an unbounded
@@ -478,11 +486,12 @@ class LiteLLMCaller:
         self,
         model: str,
         *,
-        temperature: float = 0.0,
+        temperature: float | None = 0.0,
         api_base: str | None = None,
         api_key: str | None = None,
         timeout_s: float | None = 60.0,
         num_retries: int = 0,
+        tool_choice_mode: str = "force",
     ) -> None:
         self._model = model
         self._temperature = temperature
@@ -490,27 +499,39 @@ class LiteLLMCaller:
         self._api_key = api_key
         self._timeout_s = timeout_s
         self._num_retries = num_retries
+        self._tool_choice_mode = tool_choice_mode
 
     def propose(self, pack: ContextPack) -> LLMCallResult:
         # lazy production-only dep; ignore covers both "litellm absent" (CI) and
         # "litellm present" (the unused-ignore that would otherwise fire locally).
         import litellm  # type: ignore[import-not-found, unused-ignore]
 
+        # Silence litellm's stderr "Provider List: …" / "Give Feedback" banners for
+        # models its cost table doesn't know (e.g. preview ids) — they look like
+        # errors but aren't, and they clobber the rich progress bar.
+        litellm.suppress_debug_info = True
+
         system, user, tool = _select_prompt_tool(pack)
+        tool_choice: Any = (
+            "auto"
+            if self._tool_choice_mode == "auto"
+            else {"type": "function", "function": {"name": "propose_test"}}
+        )
         # `request` is persisted verbatim to object storage (replay audit), so it
         # must stay secret-free: `api_base` (a URL) is safe and useful to record,
         # but `api_key` is passed to litellm out-of-band and NEVER persisted.
         request: dict[str, Any] = {
             "model": self._model,
-            "temperature": self._temperature,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
             "tools": [tool],
-            "tool_choice": {"type": "function", "function": {"name": "propose_test"}},
+            "tool_choice": tool_choice,
             "num_retries": self._num_retries,
         }
+        if self._temperature is not None:
+            request["temperature"] = self._temperature
         if self._api_base is not None:
             request["api_base"] = self._api_base
         if self._timeout_s is not None:

@@ -41,6 +41,11 @@ dev = [
     "ruff>=0.4",
     "types-PyYAML>=6.0",
 ]
+# Production-only: the planner's real LLM caller lazy-imports litellm; CI/tests
+# use FakeLLMCaller and don't need it. Install with `.[llm]` to run `planner propose`.
+llm = [
+    "litellm>=1.40",
+]
 
 [project.scripts]
 doo = "doo.cli:app"
