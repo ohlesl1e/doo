@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from doo.dispatch.interpreter.loop import MultiTurnLLMCaller
 
 from doo.dispatch.executor.dispatcher import OpaClient, RedisLeaseReader, StubOpaClient
+from doo.dispatch.executor.liveness import LivenessPolicy
 from doo.dispatch.executor.send import HttpxSender
 from doo.dispatch.ledger import JsonFileDispatchLedger
 from doo.dispatch.models import DispatchSelection
@@ -66,6 +67,36 @@ def _build_lease(engagement_id: EngagementId) -> RedisLeaseReader:
         os.environ.get("DOO_REDIS_URL", "redis://localhost:6379/0")
     )
     return RedisLeaseReader(lease=RedisLease(client, engagement_id))
+
+
+def _build_reactive() -> object:
+    """Reactive token-refresh emitter (ADR-0014/0044) on the shared Redis stream.
+
+    A dead attacker token (authz `primary` 4xx + liveness probe 4xx) publishes an
+    `auth_invalid` event the S6 auth-helper consumes. A missing/unreachable Redis
+    must not fail dispatch — fall back to a no-op recorder (logged once).
+    """
+
+    from typing import cast
+
+    from doo.dispatch.reactive import FakeReactiveEmitter, StreamReactiveEmitter
+    from doo.infra.streams import RedisStreamLike, StreamClient
+
+    try:
+        import redis
+
+        client = redis.Redis.from_url(
+            os.environ.get("DOO_REDIS_URL", "redis://localhost:6379/0")
+        )
+        return StreamReactiveEmitter(StreamClient(cast(RedisStreamLike, client)))
+    except Exception as exc:  # noqa: BLE001
+        typer.secho(
+            f"warning: reactive stream unavailable ({exc!r}); auth_invalid events "
+            "will not be emitted (auth-helper rotation disabled this run)",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+        return FakeReactiveEmitter()
 
 
 def _default_ledger() -> JsonFileDispatchLedger:
@@ -326,6 +357,10 @@ def run_cmd(
         bodies=_build_body_store(),  # type: ignore[arg-type]
         ledger=_default_ledger(),
         interpreter=_build_interpreter(),
+        # ADR-0044: declared liveness endpoints + body matchers, and the reactive
+        # refresh emitter for a dead token.
+        liveness=LivenessPolicy.from_config(cfg),
+        reactive=_build_reactive(),  # type: ignore[arg-type]
     )
 
     result = execute_run(run, deps)
@@ -346,6 +381,18 @@ def run_cmd(
                 f"  • {o.key_hash[:12]} [{o.test_class}] → {o.outcome}: {o.reason}",
                 fg=typer.colors.YELLOW,
             )
+
+    if result.liveness_unverified:
+        # ADR-0044 one-time flag: an authz 4xx fell back to `ok` because no
+        # liveness endpoint resolved — those negatives are unverified.
+        typer.secho(
+            "\nWARNING: no liveness endpoint for ≥1 AuthContext — authz 4xx "
+            "results were taken as 'boundary held' WITHOUT verifying the token is "
+            "live (ADR-0044). Declare principals[].liveness_endpoint to verify.",
+            fg=typer.colors.YELLOW,
+            bold=True,
+            err=True,
+        )
 
     sys.exit(0)
 

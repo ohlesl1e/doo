@@ -19,6 +19,12 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from doo.dispatch.executor.classify import (
+    LivenessResult,
+    classify,
+    is_auth_negative,
+    is_authz_class,
+)
 from doo.dispatch.executor.constructors import (
     ConstructorMissingError,
     constructor_for,
@@ -34,6 +40,7 @@ from doo.dispatch.executor.evidence import (
     EvidenceObservation,
     load_evidence,
 )
+from doo.dispatch.executor.liveness import LivenessPolicy, LivenessProber, ProbeOutcome
 from doo.dispatch.executor.send import Sender
 from doo.dispatch.finding import commit_finding, persist_transcript, record_verdict
 from doo.dispatch.interpreter.loop import (
@@ -52,7 +59,8 @@ from doo.dispatch.models import (
     RunOutcome,
 )
 from doo.dispatch.ontology import BodyStore, commit_agent_send
-from doo.dispatch.secrets import SecretStore
+from doo.dispatch.reactive import ReactiveEmitter
+from doo.dispatch.secrets import AuthMaterial, SecretStore
 from doo.dispatch.selection import select_testcases
 from doo.events.slice4 import DispatchStatus
 from doo.ids import DispatchRunId, EngagementId, ObservationId, TraceId
@@ -89,6 +97,12 @@ class RunDependencies:
     # The Interpreter's multi-turn caller (S3). `None` → no Interpreter (S1/S2
     # behaviour: `primary` only). Tests inject a `FakeMultiTurnCaller`.
     interpreter: MultiTurnLLMCaller | None = None
+    # ADR-0044 liveness disambiguation. `liveness` is the engagement's probe
+    # config (declared endpoints + body matchers); `None` → authz 4xx stays the
+    # least-bad `ok` (S1/S2 behaviour). `reactive` emits the ADR-0014 refresh
+    # signal on `auth_invalid`; `None` → no emit (the helper is S6).
+    liveness: LivenessPolicy | None = None
+    reactive: ReactiveEmitter | None = None
     evidence_loader: object = None  # Callable | None; defaults to graph-backed.
 
 
@@ -99,6 +113,9 @@ class RunResult:
     run: DispatchRun
     outcomes: tuple[RunOutcome, ...]
     requests_sent: int
+    # ADR-0044: True iff ≥1 authz 4xx fell back to `ok` because no liveness
+    # endpoint was resolvable for its AuthContext (the negatives are unverified).
+    liveness_unverified: bool = False
 
 
 @dataclass
@@ -197,11 +214,28 @@ def execute_run(
     dispatcher = Dispatcher(
         run=run, lease=deps.lease, opa=deps.opa, budget=tracker, sender=deps.sender
     )
+    # The liveness prober shares the run `Dispatcher` (probes pass the same gate
+    # and count against the same budget) and is cached per (AuthContext, window).
+    prober = (
+        LivenessProber(
+            dispatcher=dispatcher,
+            neo4j=deps.neo4j,
+            policy=deps.liveness,
+            engagement_id=run.engagement_id,
+        )
+        if deps.liveness is not None
+        else None
+    )
 
     outcomes: list[RunOutcome] = []
     for tc in selected:
         outcome = _execute_one(
-            tc, run=run, deps=deps, dispatcher=dispatcher, now=datetime.now(UTC)
+            tc,
+            run=run,
+            deps=deps,
+            dispatcher=dispatcher,
+            prober=prober,
+            now=datetime.now(UTC),
         )
         record_outcome(deps.ledger, outcome)
         outcomes.append(outcome)
@@ -226,7 +260,20 @@ def execute_run(
         drained=len(outcomes),
         requests_sent=tracker.sent,
     )
-    return RunResult(run=run, outcomes=tuple(outcomes), requests_sent=tracker.sent)
+    liveness_unverified = prober is not None and bool(prober.acs_without_endpoint)
+    if liveness_unverified:
+        log.warning(
+            "dispatch.run.liveness_unverified",
+            engagement_id=run.engagement_id,
+            run_id=run.run_id,
+            auth_contexts=sorted(prober.acs_without_endpoint),  # type: ignore[union-attr]
+        )
+    return RunResult(
+        run=run,
+        outcomes=tuple(outcomes),
+        requests_sent=tracker.sent,
+        liveness_unverified=liveness_unverified,
+    )
 
 
 def _execute_one(
@@ -235,6 +282,7 @@ def _execute_one(
     run: DispatchRun,
     deps: RunDependencies,
     dispatcher: Dispatcher,
+    prober: LivenessProber | None,
     now: datetime,
 ) -> RunOutcome:
     """Execute one `TestCase`'s `primary` send through the full gate (S1: no Interpreter).
@@ -318,7 +366,29 @@ def _execute_one(
             tc, run, "dispatcher_blocked", reason=result.reason, now=now
         )
 
-    # --- commit `RequestObservation(source="agent")` + `EXECUTED_AS`. ---
+    # --- authz 4xx disambiguation (ADR-0044). For an authz `primary` whose
+    # response reads as an auth negative, the bare status from `Dispatcher` is the
+    # least-bad `ok`; resolve it via body-match → liveness probe → re-classify.
+    # The probe (if sent) is committed as its own `liveness` observation; a dead
+    # token fires the ADR-0014 reactive-refresh event. ---
+    final_status: DispatchStatus = result.dispatch_status
+    probe_outcome: ProbeOutcome | None = None
+    if (
+        is_authz_class(tc.test_class)
+        and result.response is not None
+        and is_auth_negative(result.response)
+    ):
+        final_status, probe_outcome = _disambiguate_authz(
+            tc,
+            deps=deps,
+            prober=prober,
+            evidence=evidence,
+            material=material,
+            response=result.response,
+            now=now,
+        )
+
+    # --- commit the `primary` `RequestObservation(source="agent")` + `EXECUTED_AS`. ---
     obs_id = commit_agent_send(
         deps.neo4j,
         engagement_id=eid,
@@ -326,15 +396,48 @@ def _execute_one(
         key_hash=tc.key_hash,
         request=request,
         response=result.response,
-        dispatch_status=result.dispatch_status,
+        dispatch_status=final_status,
         role="primary",
         auth_context_id=tc.auth_context_id,
         bodies=deps.bodies,
         now=now,
     )
     sends.append(
-        _SendRecord(role="primary", status=result.dispatch_status, observation_id=obs_id)
+        _SendRecord(role="primary", status=final_status, observation_id=obs_id)
     )
+
+    # --- commit the liveness probe (if a fresh one was sent) + fire reactive. ---
+    if (
+        probe_outcome is not None
+        and probe_outcome.sent
+        and probe_outcome.request is not None
+        and probe_outcome.dispatch_result is not None
+        and probe_outcome.dispatch_result.sent
+    ):
+        live_obs = commit_agent_send(
+            deps.neo4j,
+            engagement_id=eid,
+            run_id=run.run_id,
+            key_hash=tc.key_hash,
+            request=probe_outcome.request,
+            response=probe_outcome.dispatch_result.response,
+            dispatch_status="ok",
+            role="liveness",
+            auth_context_id=tc.auth_context_id,
+            bodies=deps.bodies,
+            now=now,
+        )
+        sends.append(
+            _SendRecord(role="liveness", status="ok", observation_id=live_obs)
+        )
+    if final_status == "auth_invalid" and deps.reactive is not None:
+        deps.reactive.emit_auth_invalid(
+            engagement_id=eid,
+            run_id=run.run_id,
+            auth_context_id=tc.auth_context_id,
+            principal_label=material.principal_label,
+            key_hash=tc.key_hash,
+        )
 
     # --- Interpreter confirm loop (S3, ADR-0042/0045). Runs only on
     # `dispatch_status = ok` (the bytes reached the test path) and when an
@@ -342,7 +445,7 @@ def _execute_one(
     # tool context (ADR-0043: pre-send always-useful roles); every additional
     # send the loop makes goes through the SAME `dispatcher` instance, so the
     # run-wide budget + lease + OPA gate apply identically. ---
-    if deps.interpreter is not None and result.dispatch_status == "ok":
+    if deps.interpreter is not None and final_status == "ok":
         loop = _run_interpreter(
             tc,
             run=run,
@@ -473,6 +576,64 @@ def _run_interpreter(
         for role, r in ctx.sent_roles.items()
         if role != "primary"
     ]
+
+
+def _disambiguate_authz(
+    tc: DispatchTestCase,
+    *,
+    deps: RunDependencies,
+    prober: LivenessProber | None,
+    evidence: EvidenceObservation,
+    material: AuthMaterial,
+    response: object,
+    now: datetime,
+) -> tuple[DispatchStatus, ProbeOutcome | None]:
+    """Resolve an authz `primary`'s 4xx → `auth_invalid` / `replay_invalid` / `ok` (ADR-0044).
+
+    Body-match overrides (if declared) run first and short-circuit the probe; a
+    non-`ok` result there is necessarily a matcher hit (the probe has not run, so
+    `liveness_result` is still `unknown`). Otherwise a liveness probe runs and the
+    classifier re-decides with the real probe outcome.
+    """
+
+    from doo.dispatch.executor.send import HttpResponse
+
+    assert isinstance(response, HttpResponse)
+    matchers = deps.liveness.matchers if deps.liveness is not None else None
+
+    if matchers is not None and not matchers.empty:
+        by_match = classify(
+            response=response,
+            test_class=tc.test_class,  # type: ignore[arg-type]
+            role="primary",
+            replay_hazards=tc.replay_hazards,
+            liveness_result="unknown",
+            matchers=matchers,
+        )
+        if by_match != "ok":
+            return by_match, None
+
+    liveness_result: LivenessResult = "unknown"
+    outcome: ProbeOutcome | None = None
+    if prober is not None:
+        outcome = prober.probe(
+            auth_context_id=tc.auth_context_id,
+            material=material,
+            evidence=evidence,
+            test_class=tc.test_class,  # type: ignore[arg-type]
+            now=now,
+        )
+        liveness_result = outcome.result
+
+    status = classify(
+        response=response,
+        test_class=tc.test_class,  # type: ignore[arg-type]
+        role="primary",
+        replay_hazards=tc.replay_hazards,
+        liveness_result=liveness_result,
+        matchers=matchers,
+    )
+    return status, outcome
 
 
 def _outcome(

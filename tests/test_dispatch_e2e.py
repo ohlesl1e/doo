@@ -234,6 +234,224 @@ def _seed_graph(neo4j: Neo4jClient, *, attacker_ac_id: str) -> str:
     return key_hash
 
 
+ENG_LIVE = "eng-dispatch-liveness-e2e"
+
+
+def _seed_authz_graph(
+    neo4j: Neo4jClient, *, eng: str, attacker_ac_id: str, victim_ac_id: str
+) -> str:
+    """Lean seed for the liveness e2e: host + endpoint + victim obs + approved IDOR TC.
+
+    No Engagement/Scope node (the liveness test uses StubOpaClient(allow=True), so
+    no bundle is built); only what `select_testcases` + `load_evidence` read.
+    Returns the TestCase `key_hash`.
+    """
+    now = datetime.now(UTC)
+    cross = _cross(now)
+    neo4j.execute_write(
+        """
+        MERGE (h:Host {engagement_id: $eid, id: $hid})
+        ON CREATE SET h.scheme = 'https', h.canonical_hostname = $hostname,
+                      h.port = null, h.is_ip_literal = false, h += $cross
+        MERGE (e:Endpoint {engagement_id: $eid, id: $epid})
+        ON CREATE SET e.method = 'GET', e.path_template = '/orders/{order_id}',
+                      e += $cross
+        MERGE (e)-[:ON_HOST]->(h)
+        MERGE (acA:AuthContext {engagement_id: $eid, id: $ac_victim})
+        ON CREATE SET acA.auth_hash = 'ah-v', acA.tier = 'declared',
+                      acA.is_anonymous = false, acA.token_kind = 'bearer', acA += $cross
+        MERGE (acB:AuthContext {engagement_id: $eid, id: $ac_attacker})
+        ON CREATE SET acB.auth_hash = 'ah-a', acB.tier = 'declared',
+                      acB.is_anonymous = false, acB.token_kind = 'bearer', acB += $cross
+        MERGE (r:RequestObservation {engagement_id: $eid, observation_id: 'obs-v-live'})
+        ON CREATE SET r.id = 'obs-v-live', r.method = 'GET',
+                      r.concrete_path = '/orders/123', r.response_status = 200,
+                      r.headers = ['Accept=application/json'], r.query = [],
+                      r.cookies = [], r += $cross
+        MERGE (r)-[:HIT]->(e)
+        MERGE (r)-[:ON_HOST]->(h)
+        MERGE (r)-[:OBSERVED_UNDER]->(acA)
+        """,
+        eid=eng,
+        hid=HOST_ID,
+        hostname=HOSTNAME,
+        epid=EP_ID,
+        ac_victim=victim_ac_id,
+        ac_attacker=attacker_ac_id,
+        cross=cross,
+    )
+    payload_hash = hashlib.sha256(b"").hexdigest()
+    key_hash = compute_testcase_key_hash(
+        engagement_id=EngagementId(eng),
+        test_class="idor",
+        target_endpoint_id=EP_ID,
+        target_parameter_id=None,
+        target_trust_boundary_id=None,
+        payload_class="auth-token-swap",
+        payload_hash=payload_hash,  # type: ignore[arg-type]
+        auth_context_id=attacker_ac_id,  # type: ignore[arg-type]
+    )
+    neo4j.execute_write(
+        """
+        MATCH (e:Endpoint {engagement_id: $eid, id: $epid})
+        MERGE (t:TestCase {engagement_id: $eid, key_hash: $kh})
+        ON CREATE SET t.test_class = 'idor', t.payload_class = 'auth-token-swap',
+                      t.payload_hash = $ph, t.auth_context_id = $ac_attacker,
+                      t.target_endpoint_id = $epid, t.review_status = 'approved',
+                      t.expected_yield = 0.9, t.generator = 'c2', t.hold = ['order_id'],
+                      t.replay_hazards = [], t.source = 'llm-planner',
+                      t.confidence = 0.99, t += $cross
+        MERGE (t)-[:TARGETS_ENDPOINT]->(e)
+        """,
+        eid=eng,
+        epid=EP_ID,
+        kh=key_hash,
+        ph=payload_hash,
+        ac_attacker=attacker_ac_id,
+        cross=cross,
+    )
+    return key_hash
+
+
+class _PathScriptedSender:
+    """`Sender` that returns a canned response keyed by request path; records sends."""
+
+    def __init__(self, by_path: dict[str, HttpResponse]) -> None:
+        self._by_path = by_path
+        self.sent: list[object] = []
+
+    def send(self, request: object) -> HttpResponse:
+        self.sent.append(request)
+        path = request.path  # type: ignore[attr-defined]
+        return self._by_path.get(path, HttpResponse(status=500, body=b"unscripted"))
+
+
+def _liveness_config(eng: str) -> EngagementConfig:
+    """Attacker principal declares a `liveness_endpoint` (ADR-0044)."""
+    return EngagementConfig.model_validate(
+        {
+            "engagement": {"id": eng, "name": "liveness e2e"},
+            "environment": "staging",
+            "scope": {
+                "host_patterns": [HOSTNAME],
+                "allowed_methods": ["GET"],
+                "allowed_path_patterns": ["/**"],
+            },
+            "dispatch": {"arming": "auto", "interpreter": "confirm"},
+            "principals": [
+                {
+                    "label": "victim-a",
+                    "auth_contexts": [{"kind": "bearer", "token": "${E2E_VICTIM}"}],
+                },
+                {
+                    "label": "attacker-b",
+                    "auth_contexts": [{"kind": "bearer", "token": "${E2E_ATTACKER}"}],
+                    "liveness_endpoint": {"method": "GET", "path": "/me"},
+                },
+            ],
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "probe_status,expected_status,expect_reactive",
+    [
+        (200, "ok", False),  # token live → boundary genuinely held
+        (403, "auth_invalid", True),  # token dead → auth_invalid + reactive refresh
+    ],
+)
+def test_authz_liveness_e2e(
+    neo4j_client: Neo4jClient,
+    redis_url: str,
+    probe_status: int,
+    expected_status: str,
+    expect_reactive: bool,
+) -> None:
+    """ADR-0044: an authz `primary` 403 + a liveness probe disambiguates the status.
+
+    primary(/orders/123)=403; probe(/me)=200 → `ok`; probe(/me)=403 → `auth_invalid`
+    + one reactive `auth_invalid` event.
+    """
+    from doo.dispatch.executor.liveness import LivenessPolicy
+    from doo.dispatch.reactive import FakeReactiveEmitter
+
+    env = {"E2E_VICTIM": VICTIM_TOKEN, "E2E_ATTACKER": ATTACKER_TOKEN}
+    config = _liveness_config(ENG_LIVE)
+    secrets = EnvSecretStore.from_config(config, env=env)
+    attacker_ac_id = auth_context_id(
+        EngagementId(ENG_LIVE), compute_auth_hash("bearer", ATTACKER_TOKEN)
+    )
+    victim_ac_id = auth_context_id(
+        EngagementId(ENG_LIVE), compute_auth_hash("bearer", VICTIM_TOKEN)
+    )
+    key_hash = _seed_authz_graph(
+        neo4j_client,
+        eng=ENG_LIVE,
+        attacker_ac_id=attacker_ac_id,
+        victim_ac_id=victim_ac_id,
+    )
+
+    rclient = redis.Redis.from_url(redis_url)
+    lease = RedisLease(rclient, EngagementId(ENG_LIVE))
+    lease.set_active(ttl_seconds=60)
+
+    sender = _PathScriptedSender(
+        {
+            "/orders/123": HttpResponse(status=403, body=b'{"error":"forbidden"}'),
+            "/me": HttpResponse(status=probe_status, body=b'{"id":"attacker"}'),
+        }
+    )
+    reactive = FakeReactiveEmitter()
+    run = arm_run(
+        config=config,
+        selection=DispatchSelection(test_classes=("idor",), limit=1),
+        actor="e2e-tester",
+    )
+    deps = RunDependencies(
+        neo4j=neo4j_client,
+        lease=RedisLeaseReader(lease=lease),
+        opa=StubOpaClient(allow=True),
+        sender=sender,  # type: ignore[arg-type]
+        secrets=secrets,
+        bodies=NoopBodyStore(),
+        ledger=InMemoryDispatchLedger(),
+        liveness=LivenessPolicy.from_config(config, env=env),
+        reactive=reactive,
+    )
+    result = execute_run(run, deps)
+
+    assert result.outcomes[0].outcome == "executed"
+    # primary + liveness probe both went on the wire.
+    paths = [r.path for r in sender.sent]  # type: ignore[attr-defined]
+    assert paths == ["/orders/123", "/me"]
+    assert result.requests_sent == 2
+
+    # The `primary` EXECUTED_AS edge carries the DISAMBIGUATED status.
+    rows = neo4j_client.execute_read(
+        """
+        MATCH (t:TestCase {engagement_id: $eid, key_hash: $kh})
+              -[x:EXECUTED_AS {run_id: $rid}]->(:RequestObservation)
+        RETURN x.request_role AS role, x.dispatch_status AS status
+        ORDER BY role
+        """,
+        eid=ENG_LIVE,
+        kh=key_hash,
+        rid=run.run_id,
+    )
+    by_role = {r["role"]: r["status"] for r in rows}
+    assert by_role["primary"] == expected_status
+    # The probe is recorded as its own `liveness` agent observation (ADR-0044).
+    assert by_role.get("liveness") == "ok"
+
+    # The reactive refresh fires exactly when the token is judged dead.
+    assert len(reactive.events) == (1 if expect_reactive else 0)
+    if expect_reactive:
+        ev = reactive.events[0]
+        assert ev["kind"] == "auth_invalid"
+        assert ev["auth_context_id"] == attacker_ac_id
+        assert ev["principal_label"] == "attacker-b"
+
+
 def test_dispatch_spine_e2e(
     neo4j_client: Neo4jClient, redis_url: str, engagement_config: EngagementConfig
 ) -> None:

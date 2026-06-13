@@ -306,6 +306,32 @@ class KnownSignals(BaseModel):
     headers: dict[str, str] = Field(default_factory=dict)
 
 
+class LivenessEndpoint(BaseModel):
+    """A Principal's known-allowed warm-up request, for the ADR-0044 liveness probe.
+
+    The tester's own warm-up knowledge (ADR-0012-legal): a request that returns
+    2xx while the Principal's token is live (e.g. `GET /me`). The Executor sends
+    it under the *same* `AuthContext` to disambiguate an authz `primary`'s 4xx —
+    probe 2xx ⇒ token live (the boundary genuinely held); probe 4xx ⇒ token dead
+    (`auth_invalid` + ADR-0014 reactive refresh). Optional: undeclared falls back
+    to the first observed self-endpoint (`/me`/`/userinfo`/…).
+    """
+
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    method: HttpMethod = "GET"
+    path: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _normalise(self) -> Self:
+        if not self.path.startswith("/"):
+            raise ValueError(
+                f"liveness_endpoint.path must be absolute (start with /); got {self.path!r}"
+            )
+        object.__setattr__(self, "method", self.method.upper())
+        return self
+
+
 class DeclaredPrincipal(BaseModel):
     """A test account the tester controls (ADR-0012 + ADR-0010).
 
@@ -320,6 +346,9 @@ class DeclaredPrincipal(BaseModel):
     description: str | None = None
     auth_contexts: tuple[DeclaredAuthContext, ...] = ()
     known_signals: KnownSignals = Field(default_factory=KnownSignals)
+    # Optional known-allowed warm-up request for the ADR-0044 liveness probe.
+    # Undeclared → the Executor falls back to an inferred self-endpoint.
+    liveness_endpoint: LivenessEndpoint | None = None
 
     _coerce_auth_contexts = field_validator("auth_contexts", mode="before")(_list_to_tuple)
 
@@ -410,6 +439,28 @@ class DispatchConfig(BaseModel):
     # Per-`TestCase` Interpreter tool-call cap (ADR-0042). Distinct from the
     # run-wide `request_budget` (one tool call may cost >1 wire send, ADR-0043).
     max_tool_calls: int = Field(default=6, ge=1)
+    # Optional per-engagement body-match overrides (ADR-0044): regexes (the
+    # sqlmap `--string` shape) run against an authz `primary`'s 4xx body BEFORE
+    # the liveness probe and short-circuit it. `auth_invalid_match` ⇒ token dead;
+    # `replay_invalid_match` ⇒ the replay (not the token) is stale. Validated to
+    # compile here so a bad pattern is a loud load-time error, not a run-time one.
+    auth_invalid_match: str | None = None
+    replay_invalid_match: str | None = None
+
+    @model_validator(mode="after")
+    def _match_patterns_compile(self) -> Self:
+        for name, pat in (
+            ("auth_invalid_match", self.auth_invalid_match),
+            ("replay_invalid_match", self.replay_invalid_match),
+        ):
+            if pat is not None:
+                try:
+                    re.compile(pat)
+                except re.error as exc:
+                    raise ValueError(
+                        f"dispatch.{name} is not a valid regex: {exc}"
+                    ) from exc
+        return self
 
 
 class LLMConfig(BaseModel):
