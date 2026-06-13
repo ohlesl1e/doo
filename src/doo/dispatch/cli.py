@@ -29,14 +29,23 @@ from doo.dispatch.ledger import JsonFileDispatchLedger
 from doo.dispatch.models import DispatchSelection
 from doo.dispatch.ontology import NoopBodyStore
 from doo.dispatch.run import RunDependencies, arm_run, execute_run
-from doo.dispatch.secrets import EnvSecretStore
+from doo.dispatch.secrets import EnvSecretStore, RotatableSecretStore
 from doo.ids import EngagementId
 from doo.infra.neo4j_driver import Neo4jClient
 from doo.infra.redis_lease import RedisLease
 from doo.observability.logging import configure_logging, get_logger
 from doo.setup.config import ArmingMode, EngagementConfig
 
-__all__ = ["dispatch_app", "StubOpaClient"]
+__all__ = ["dispatch_app", "finding_app", "auth_helper_app", "StubOpaClient"]
+
+
+def _rotation_path() -> Path:
+    """Path the auth-helper writes rotated material to + the Executor reads (S6)."""
+
+    override = os.environ.get("DOO_SECRET_ROTATION_PATH")
+    if override:
+        return Path(override)
+    return Path(os.path.expanduser("~")) / ".doo" / "secret_rotation.json"
 
 dispatch_app = typer.Typer(
     help="Dispatch: arm and drain a budget-bounded run over approved TestCases "
@@ -353,7 +362,9 @@ def run_cmd(
             unsafe_stub=unsafe_stub_opa,
         ),
         sender=HttpxSender(),
-        secrets=EnvSecretStore.from_config(cfg),
+        secrets=RotatableSecretStore(
+            base=EnvSecretStore.from_config(cfg), rotation_path=_rotation_path()
+        ),
         bodies=_build_body_store(),  # type: ignore[arg-type]
         ledger=_default_ledger(),
         interpreter=_build_interpreter(),
@@ -582,3 +593,76 @@ def finding_review_cmd(
         "\nconfirm: doo finding review -e <eng> --confirm <key>\n"
         "reject:  doo finding review -e <eng> --reject <key> --reason '…'"
     )
+
+
+# ---------------------------------------------------------------------------
+# `doo auth-helper run` (ADR-0014/#91) — sibling of `doo engagement keepalive`.
+# ---------------------------------------------------------------------------
+
+auth_helper_app = typer.Typer(
+    help="Auth-helper: rotate declared AuthContexts (proactive + reactive, "
+    "ADR-0014). A SIBLING process — holds refresh creds in its OWN env; the "
+    "dispatcher never does. Run alongside `doo engagement keepalive`.",
+    no_args_is_help=True,
+)
+
+
+@auth_helper_app.command("run")
+def auth_helper_run_cmd(
+    engagement: str = typer.Option(..., "--engagement", "-e"),
+    config: Path = typer.Option(
+        ..., "--config", "-c", exists=True, readable=True, resolve_path=True,
+        help="Engagement YAML (auth_contexts[].refresh blocks + ${VAR} token refs).",
+    ),
+) -> None:
+    """Rotate declared AuthContexts until SIGTERM (ADR-0014: never the agent process).
+
+    Proactive (per `validity_window_s`) + reactive (consumes the `auth_invalid`
+    events the dispatcher emits) rotation, rate-limited per AuthContext. Refresh
+    credentials come from THIS process's env. New material lands in the rotation
+    file the dispatcher's `RotatableSecretStore` reads.
+    """
+
+    from typing import cast
+
+    from doo.dispatch.auth_helper import AuthHelper
+    from doo.infra.streams import RedisStreamLike, StreamClient
+
+    configure_logging()
+    cfg = _load_config(config)
+    if cfg.engagement.id != engagement:
+        typer.secho(
+            f"--engagement {engagement!r} != config engagement.id {cfg.engagement.id!r}",
+            fg=typer.colors.RED, err=True,
+        )
+        raise typer.Exit(code=2)
+
+    neo4j = _build_neo4j()
+    streams: StreamClient | None = None
+    try:
+        import redis
+
+        client = redis.Redis.from_url(
+            os.environ.get("DOO_REDIS_URL", "redis://localhost:6379/0")
+        )
+        streams = StreamClient(cast(RedisStreamLike, client))
+    except Exception as exc:  # noqa: BLE001
+        typer.secho(
+            f"warning: reactive stream unavailable ({exc!r}); proactive-only",
+            fg=typer.colors.YELLOW, err=True,
+        )
+
+    helper = AuthHelper.from_config(
+        cfg, neo4j=neo4j, rotation_path=_rotation_path(), streams=streams
+    )
+    if not helper.managed:
+        typer.secho(
+            "no AuthContexts declare a `refresh:` block — nothing to rotate.",
+            fg=typer.colors.YELLOW, err=True,
+        )
+        raise typer.Exit(code=0)
+    typer.echo(
+        f"auth-helper for {engagement}: managing {len(helper.managed)} AuthContext(s); "
+        f"rotation file {_rotation_path()}. Ctrl-C to stop."
+    )
+    raise typer.Exit(code=helper.run())

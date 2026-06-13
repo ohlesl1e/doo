@@ -13,8 +13,10 @@ is never written to the graph, the ledger, blobs, or logs (the same discipline a
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol
 
 from doo.canonical.identity import auth_context_id, compute_auth_hash
@@ -91,3 +93,77 @@ class EnvSecretStore:
 
     def material_for(self, auth_context_id: AuthContextId) -> AuthMaterial | None:
         return self.by_id.get(auth_context_id)
+
+
+@dataclass(frozen=True, slots=True)
+class RotatableSecretStore:
+    """`SecretStore` that overlays a helper-written rotation file (ADR-0014, S6).
+
+    Wraps a `base` (env-backed) store and, on **each** `material_for`, re-reads a
+    JSON rotation file (`DOO_SECRET_ROTATION_PATH`, `{auth_context_id: raw}`) the
+    auth-helper writes when it rotates a token. The Executor calls `material_for`
+    per-TestCase, so a mid-run rotation is picked up without a restart. A missing
+    file = no overlay (today's env-only behaviour). The overlay carries only the
+    raw token; `kind` / `principal_label` / `tier` come from the base declaration
+    of the SAME `auth_context_id`, or — for a freshly-rotated id not in the base —
+    a `_meta` sidecar the helper writes alongside the raw value.
+    """
+
+    base: SecretStore
+    rotation_path: Path
+
+    def _overlay(self) -> dict[str, dict[str, str]]:
+        if not self.rotation_path.exists():
+            return {}
+        try:
+            data: dict[str, dict[str, str]] = json.loads(self.rotation_path.read_text())
+            return data
+        except (json.JSONDecodeError, OSError):
+            return {}
+
+    def material_for(self, auth_context_id: AuthContextId) -> AuthMaterial | None:
+        entry = self._overlay().get(str(auth_context_id))
+        if entry is not None and entry.get("raw"):
+            base_mat = self.base.material_for(auth_context_id)
+            return AuthMaterial(
+                kind=entry.get("kind", base_mat.kind if base_mat else "bearer"),  # type: ignore[arg-type]
+                raw=entry["raw"],
+                principal_label=entry.get(
+                    "principal_label",
+                    base_mat.principal_label if base_mat else "rotated",
+                ),
+                tier=entry.get("tier", base_mat.tier if base_mat else "declared"),
+            )
+        return self.base.material_for(auth_context_id)
+
+
+def write_rotation_entry(
+    rotation_path: Path,
+    *,
+    auth_context_id: AuthContextId,
+    raw: str,
+    kind: str,
+    principal_label: str,
+    tier: str = "declared",
+) -> None:
+    """Write/overwrite one rotated AuthContext's material into the rotation file.
+
+    Called by the auth-helper after a successful refresh; the Executor's
+    `RotatableSecretStore` reads it on the next `material_for`. The file holds raw
+    tokens — it lives on the helper/agent host only, never the graph (ADR-0015).
+    """
+
+    data: dict[str, dict[str, str]] = {}
+    if rotation_path.exists():
+        try:
+            data = json.loads(rotation_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            data = {}
+    data[str(auth_context_id)] = {
+        "raw": raw,
+        "kind": kind,
+        "principal_label": principal_label,
+        "tier": tier,
+    }
+    rotation_path.parent.mkdir(parents=True, exist_ok=True)
+    rotation_path.write_text(json.dumps(data, indent=2))

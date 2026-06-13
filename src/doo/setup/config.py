@@ -255,18 +255,77 @@ _LABEL_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _RESERVED_LABELS = frozenset({"anon"})
 
 
+# Token-refresh mechanism for the auth-helper sibling process (ADR-0014, S6).
+RefreshMechanism = Literal["command", "oauth_refresh", "http"]
+
+
+class RefreshConfig(BaseModel):
+    """How the auth-helper rotates one declared `AuthContext` (ADR-0014, #91).
+
+    The helper — NEVER the dispatcher — acts on this. Refresh credentials live in
+    the **helper's** env (referenced by var name here), never inline, never in the
+    dispatcher's env. The loader validates shape only; the helper executes:
+
+    - `command`: shell out to a tester script (`command`); fresh token on stdout.
+    - `oauth_refresh`: a refresh-grant POST to `token_url` using
+      `refresh_token_env` (+ optional client id/secret env).
+    - `http`: a templated request to `http_url`; `${VAR}` in `http_body` is
+      substituted from the helper's env.
+
+    `validity_window_s` drives the proactive timer (refresh at
+    `now + validity_window_s − margin_s`); `max_refreshes_per_hour` bounds the
+    reactive path so an `auth_invalid` storm cannot hammer the IdP.
+    """
+
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    mechanism: RefreshMechanism
+    # `command`
+    command: str | None = None
+    # `oauth_refresh`
+    token_url: str | None = None
+    refresh_token_env: str | None = None
+    client_id_env: str | None = None
+    client_secret_env: str | None = None
+    # `http`
+    http_url: str | None = None
+    http_method: str = "POST"
+    http_headers: dict[str, str] = Field(default_factory=dict)
+    http_body: str | None = None
+    # Timing / rate-limit.
+    validity_window_s: int | None = Field(default=None, ge=1)
+    margin_s: int = Field(default=60, ge=0)
+    max_refreshes_per_hour: int = Field(default=3, ge=1)
+
+    @model_validator(mode="after")
+    def _mechanism_shape(self) -> Self:
+        if self.mechanism == "command" and not self.command:
+            raise ValueError("refresh.mechanism=command requires `command`")
+        if self.mechanism == "oauth_refresh" and not (
+            self.token_url and self.refresh_token_env
+        ):
+            raise ValueError(
+                "refresh.mechanism=oauth_refresh requires `token_url` + `refresh_token_env`"
+            )
+        if self.mechanism == "http" and not self.http_url:
+            raise ValueError("refresh.mechanism=http requires `http_url`")
+        return self
+
+
 class DeclaredAuthContext(BaseModel):
     """One declared `AuthContext` for a Principal (ADR-0012).
 
     `token` is an env-var reference (`${VAR}`), never an inline secret. The loader
     resolves it at load time, hashes it at the boundary, and discards the raw
-    value — it never reaches the graph (ADR-0015).
+    value — it never reaches the graph (ADR-0015). `refresh` (optional) tells the
+    auth-helper sibling process how to rotate it (ADR-0014, S6).
     """
 
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
 
     kind: AuthContextKind
     token: str = Field(min_length=1)
+    refresh: RefreshConfig | None = None
 
     @model_validator(mode="after")
     def _token_is_env_ref(self) -> Self:
