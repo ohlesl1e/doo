@@ -29,6 +29,7 @@ dependencies = [
     "pyjwt>=2.8",
     "pyyaml>=6.0",
     "rich>=13",
+    "httpx>=0.27",
 ]
 
 [project.optional-dependencies]

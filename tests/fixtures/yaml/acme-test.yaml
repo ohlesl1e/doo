@@ -9,6 +9,8 @@ engagement:
   name: Acme comprehensive E2E
   description: Comprehensive slice-1 end-to-end exercise.
 
+environment: staging
+
 scope:
   host_patterns:
     - "api.example.com"

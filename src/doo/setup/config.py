@@ -365,6 +365,53 @@ class AuthConfig(BaseModel):
     _coerce_names = field_validator("session_cookie_names", mode="before")(_list_to_tuple)
 
 
+# ---------------------------------------------------------------------------
+# Dispatch (slice 4, ADR-0042): two orthogonal mode axes; `environment` gates
+# the legal matrix at LOAD time (not at dispatch time).
+# ---------------------------------------------------------------------------
+
+# Tester-declared engagement environment (ADR-0042). A fact about the tester's
+# setup, not the target's internals (ADR-0012-legal). REQUIRED — no default — so
+# the tester is forced to state it; the loader rejects illegal mode combos for
+# `production` at load.
+Environment = Literal["staging", "production"]
+
+# `arming`: does a human press go before each dispatch run? (ADR-0042). `auto`
+# skips the arm prompt; the run still drains *approved* tests only.
+ArmingMode = Literal["review", "auto"]
+
+# `interpreter`: may the agent expand the target set in-run? (ADR-0042). MVP
+# ships `confirm` only; `freelance` is a designed-for seam (staging-only).
+InterpreterMode = Literal["confirm", "freelance"]
+
+
+class DispatchConfig(BaseModel):
+    """Per-engagement dispatch defaults (ADR-0042).
+
+    `arming` × `interpreter` are orthogonal axes; `EngagementConfig.environment`
+    constrains which combinations are legal — on `production` ONLY
+    `review + confirm` is representable. The constraint is enforced by
+    `EngagementConfig`'s model validator (it needs both this block AND
+    `environment`), not here.
+
+    Budgets are per-run defaults; `doo dispatch run` may tighten them. The kill
+    switch and the OPA gate are containment, not consent — the human arming
+    decision is consent (ADR-0042).
+    """
+
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    arming: ArmingMode = "review"
+    interpreter: InterpreterMode = "confirm"
+    # Per-run hard caps (ADR-0042: budget-bounded). `request_budget` counts EVERY
+    # wire send (primary, baselines, hazard-warmup, liveness — ADR-0043/0044).
+    request_budget: int = Field(default=200, ge=1)
+    wallclock_budget_s: int = Field(default=1800, ge=1)
+    # Per-`TestCase` Interpreter tool-call cap (ADR-0042). Distinct from the
+    # run-wide `request_budget` (one tool call may cost >1 wire send, ADR-0043).
+    max_tool_calls: int = Field(default=6, ge=1)
+
+
 class LLMConfig(BaseModel):
     """LLM provider routing for the slice-3 planner (ADR-0037, S2a).
 
@@ -390,10 +437,14 @@ class EngagementConfig(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
 
     engagement: EngagementMeta
+    # ADR-0042: REQUIRED, no default. A fact about the tester's setup
+    # (ADR-0012-legal), and the gate on the dispatch-mode matrix below.
+    environment: Environment
     scope: ScopeRules
     kill_switch: KillSwitchConfig = Field(default_factory=KillSwitchConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
+    dispatch: DispatchConfig = Field(default_factory=DispatchConfig)
     principals: tuple[DeclaredPrincipal, ...] = ()
 
     _coerce_principals = field_validator("principals", mode="before")(_list_to_tuple)
@@ -403,6 +454,34 @@ class EngagementConfig(BaseModel):
         labels = [p.label for p in self.principals]
         if len(set(labels)) != len(labels):
             raise ValueError("principal labels must be unique within an engagement")
+        return self
+
+    @model_validator(mode="after")
+    def _environment_gates_dispatch_modes(self) -> Self:
+        """Reject illegal `arming × interpreter` combos at LOAD time (ADR-0042).
+
+        On `environment = production` the ONLY legal combination is
+        `review + confirm`: the kill switch and run budget are containment, not
+        consent; on a production target consent means a human saw the test. A
+        human *arming* a `freelance` run does not satisfy that — they will not
+        see what it actually sends. Enforced here (not at dispatch) so a
+        misconfigured engagement fails loud and early, naming the rule.
+        """
+
+        if self.environment == "production":
+            if self.dispatch.arming != "review":
+                raise ValueError(
+                    f"environment=production requires dispatch.arming=review "
+                    f"(got {self.dispatch.arming!r}); auto-arming is staging-only "
+                    "(ADR-0042: human-in-the-loop on production targets)"
+                )
+            if self.dispatch.interpreter != "confirm":
+                raise ValueError(
+                    f"environment=production requires dispatch.interpreter=confirm "
+                    f"(got {self.dispatch.interpreter!r}); freelance is staging-only "
+                    "(ADR-0042: a human arming a freelance run is not "
+                    "human-in-the-loop for what it actually sends)"
+                )
         return self
 
 

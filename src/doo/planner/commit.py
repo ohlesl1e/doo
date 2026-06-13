@@ -69,10 +69,19 @@ class ValidatedTestCase:
     payload_hash: Sha256Hex
     auth_context_id: AuthContextId
     source: str
+    # The deterministic generator that selected this target (ADR-0036). Persisted
+    # for the slice-4 selection predicate (`--select generator=c2`). NOT part of
+    # `key_hash` (ADR-0007: same content via different generators is one test).
+    generator: str
     expected_yield: float
     expected_yield_method: str
     justification: str
     expected_outcome: str
+    # Authz-replay execution intent (ADR-0041): the param names held verbatim from
+    # the evidence observation while auth is swapped. Persisted so the slice-4
+    # constructor (ADR-0043) can apply it deterministically. Like `replay_hazards`,
+    # a derivable execution-fidelity annotation — NOT part of `key_hash`.
+    hold: tuple[str, ...] = ()
     # Replay-fidelity annotation (ADR-0041): the deterministically-detected
     # replay-breaker roles in the evidencing observation. Set by code, never the LLM,
     # and **not** part of `key_hash` (a derivable execution-fidelity annotation, like
@@ -161,7 +170,9 @@ def commit_testcase(
             t.expected_yield_method = $expected_yield_method,
             t.justification = $justification,
             t.expected_outcome = $expected_outcome,
+            t.hold = $hold,
             t.replay_hazards = $replay_hazards,
+            t.generator = $generator,
             t.source = $source,
             t.source_id = $source_id,
             t.llm_audit_key = $llm_audit_key,
@@ -197,7 +208,9 @@ def commit_testcase(
         expected_yield_method=vtc.expected_yield_method,
         justification=vtc.justification,
         expected_outcome=vtc.expected_outcome,
+        hold=list(vtc.hold),
         replay_hazards=list(vtc.replay_hazards),
+        generator=vtc.generator,
         source=vtc.source,
         source_id=None,
         llm_audit_key=vtc.llm_audit_key,

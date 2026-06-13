@@ -164,8 +164,11 @@ def test_executed_as_edge_dispatch_status_enum() -> None:
         request_observation_id="ro-1",
         engagement_id="acme-2026",
         dispatch_status="ok",
+        request_role="primary",
+        run_id="run-aaaaaaaaaaaa",
     )
     assert edge.dispatch_status == "ok"
+    assert edge.request_role == "primary"
 
 
 def test_executed_as_edge_rejects_unknown_status() -> None:
@@ -181,15 +184,18 @@ def test_executed_as_edge_rejects_unknown_status() -> None:
             request_observation_id="ro-1",
             engagement_id="acme-2026",
             dispatch_status="something-new",
+            request_role="primary",
+            run_id="run-aaaaaaaaaaaa",
         )
 
 
 def test_dispatch_statuses_match_adr_0013() -> None:
-    """Locks in the ADR-0013 enum so a future change must update both this test
-    and the contracts in one PR."""
+    """Locks in the ADR-0013 (+ ADR-0041 `replay_invalid`) enum so a future change
+    must update both this test and the contracts in one PR."""
     assert set(DISPATCH_STATUSES) == {
         "ok",
         "auth_invalid",
+        "replay_invalid",
         "rate_limited",
         "dispatcher_blocked",
         "transport_error",

@@ -55,6 +55,10 @@ TrustBoundaryId = NewType("TrustBoundaryId", str)
 FindingId = NewType("FindingId", str)
 """A `Finding` node id."""
 
+DispatchRunId = NewType("DispatchRunId", str)
+"""A dispatch-run id (ADR-0042: the authorization unit). Not a graph node — keyed
+on the dispatch ledger and `EXECUTED_AS` edges."""
+
 # Layer-boundary identifiers.
 EventId = NewType("EventId", str)
 """An `IngestionEnvelope.event_id` (UUID, distinct from any business identity)."""

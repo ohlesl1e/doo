@@ -1,0 +1,366 @@
+"""Dispatch-run driver: arm → select → iterate (construct → dispatch → record).
+
+The S1 spine end-to-end with **no LLM**: per `TestCase` the Executor's
+`(test_class, primary)` constructor builds a `ConcreteRequest`, the Dispatcher
+gates it (lease → stub OPA → budget → wire), and the result is committed as a
+`RequestObservation(source="agent")` + `EXECUTED_AS` edge plus a `RunOutcome`
+ledger row.
+
+The Interpreter (S5) plugs into `_execute_one` after the `primary` send; the
+hazard-resolver registry (S3) plugs into the constructor lookup; real Rego (S2)
+swaps `StubOpaClient`; the liveness probe (S4) plugs into `executor.classify`.
+This module owns only the **orchestration** — every deep decision lives in a
+unit-tested module it composes.
+"""
+
+from __future__ import annotations
+
+import uuid
+from dataclasses import dataclass
+from datetime import UTC, datetime
+
+from doo.dispatch.executor.constructors import (
+    ConstructorMissingError,
+    constructor_for,
+)
+from doo.dispatch.executor.dispatcher import (
+    BudgetTracker,
+    Dispatcher,
+    LeaseReader,
+    OpaClient,
+)
+from doo.dispatch.executor.evidence import (
+    DispatchTestCase,
+    EvidenceObservation,
+    load_evidence,
+)
+from doo.dispatch.executor.send import Sender
+from doo.dispatch.ledger import DispatchLedger, record_armed, record_outcome
+from doo.dispatch.models import (
+    DispatchRun,
+    DispatchSelection,
+    RequestRole,
+    RunBudget,
+    RunOutcome,
+)
+from doo.dispatch.ontology import BodyStore, commit_agent_send
+from doo.dispatch.secrets import SecretStore
+from doo.dispatch.selection import select_testcases
+from doo.events.slice4 import DispatchStatus
+from doo.ids import DispatchRunId, EngagementId, ObservationId, TraceId
+from doo.infra.neo4j_driver import Neo4jClient
+from doo.observability.ids import new_trace_id
+from doo.observability.logging import bind_correlation, get_logger
+from doo.setup.config import ArmingMode, EngagementConfig, InterpreterMode
+
+log = get_logger(__name__)
+
+
+def new_run_id() -> DispatchRunId:
+    """A fresh dispatch-run id (`run-<12hex>`)."""
+
+    return DispatchRunId(f"run-{uuid.uuid4().hex[:12]}")
+
+
+@dataclass(frozen=True, slots=True)
+class RunDependencies:
+    """Every IO dependency the run driver needs, injected (testable seam).
+
+    `evidence_loader` defaults to the graph-backed `load_evidence` but is
+    injectable so the e2e and unit tests can supply synthetic evidence without
+    seeding a full `RequestObservation` subgraph.
+    """
+
+    neo4j: Neo4jClient
+    lease: LeaseReader
+    opa: OpaClient
+    sender: Sender
+    secrets: SecretStore
+    bodies: BodyStore
+    ledger: DispatchLedger
+    evidence_loader: object = None  # Callable | None; defaults to graph-backed.
+
+
+@dataclass(frozen=True, slots=True)
+class RunResult:
+    """Outcome of one `execute_run` call: the armed run + per-TestCase outcomes."""
+
+    run: DispatchRun
+    outcomes: tuple[RunOutcome, ...]
+    requests_sent: int
+
+
+@dataclass
+class _SendRecord:
+    role: RequestRole
+    status: DispatchStatus
+    observation_id: ObservationId | None
+
+
+def arm_run(
+    *,
+    config: EngagementConfig,
+    selection: DispatchSelection,
+    actor: str,
+    arming: ArmingMode | None = None,
+    interpreter: InterpreterMode | None = None,
+    budget: RunBudget | None = None,
+    now: datetime | None = None,
+) -> DispatchRun:
+    """Construct a `DispatchRun` from config + CLI overrides (ADR-0042).
+
+    `arming` / `interpreter` default to the engagement's `dispatch:` block; a CLI
+    override is re-validated against `environment` by `DispatchRun`'s
+    model_validator (defence-in-depth: `--arming auto` on a production engagement
+    raises here, naming the rule). `budget` defaults to the engagement's; a CLI
+    override may only **tighten** it (the smaller of the two wins).
+    """
+
+    run_at = now or datetime.now(UTC)
+    cfg_budget = RunBudget(
+        request_budget=config.dispatch.request_budget,
+        wallclock_budget_s=config.dispatch.wallclock_budget_s,
+        max_tool_calls=config.dispatch.max_tool_calls,
+    )
+    eff_budget = (
+        cfg_budget
+        if budget is None
+        else RunBudget(
+            request_budget=min(cfg_budget.request_budget, budget.request_budget),
+            wallclock_budget_s=min(
+                cfg_budget.wallclock_budget_s, budget.wallclock_budget_s
+            ),
+            max_tool_calls=min(cfg_budget.max_tool_calls, budget.max_tool_calls),
+        )
+    )
+    return DispatchRun(
+        engagement_id=config.engagement.id,
+        run_id=new_run_id(),
+        trace_id=TraceId(new_trace_id()),
+        environment=config.environment,
+        arming=arming or config.dispatch.arming,
+        interpreter=interpreter or config.dispatch.interpreter,
+        selection=selection,
+        budget=eff_budget,
+        actor=actor,
+        armed_at=run_at,
+    )
+
+
+def execute_run(
+    run: DispatchRun,
+    deps: RunDependencies,
+    *,
+    testcases: list[DispatchTestCase] | None = None,
+) -> RunResult:
+    """Drain a dispatch run: select → per-TestCase (construct → dispatch → record).
+
+    `testcases` is injectable for tests; when `None`, the graph-backed selection
+    runs. The run is recorded in the dispatch ledger (`armed` row first, then a
+    `RunOutcome` per TestCase). The Dispatcher's budget tracker is shared across
+    every TestCase so the run-wide `request_budget` is a true ceiling.
+    """
+
+    bind_correlation(trace_id=run.trace_id, engagement_id=run.engagement_id)
+    record_armed(deps.ledger, run)
+    log.info(
+        "dispatch.run.armed",
+        engagement_id=run.engagement_id,
+        run_id=run.run_id,
+        actor=run.actor,
+        environment=run.environment,
+        arming=run.arming,
+        interpreter=run.interpreter,
+        selection=run.selection.describe(),
+        request_budget=run.budget.request_budget,
+    )
+
+    selected = (
+        testcases
+        if testcases is not None
+        else select_testcases(
+            deps.neo4j, engagement_id=run.engagement_id, selection=run.selection
+        )
+    )
+    tracker = BudgetTracker(run.budget)
+    dispatcher = Dispatcher(
+        run=run, lease=deps.lease, opa=deps.opa, budget=tracker, sender=deps.sender
+    )
+
+    outcomes: list[RunOutcome] = []
+    for tc in selected:
+        outcome = _execute_one(
+            tc, run=run, deps=deps, dispatcher=dispatcher, now=datetime.now(UTC)
+        )
+        record_outcome(deps.ledger, outcome)
+        outcomes.append(outcome)
+        # Stop draining once the budget is exhausted: subsequent TestCases would
+        # all be `dispatcher_blocked(request_budget_exhausted)`, which is noise.
+        if tracker.request_budget_exhausted() or tracker.wallclock_exceeded():
+            log.info(
+                "dispatch.run.budget_exhausted",
+                engagement_id=run.engagement_id,
+                run_id=run.run_id,
+                sent=tracker.sent,
+                drained=len(outcomes),
+                selected=len(selected),
+            )
+            break
+
+    log.info(
+        "dispatch.run.complete",
+        engagement_id=run.engagement_id,
+        run_id=run.run_id,
+        selected=len(selected),
+        drained=len(outcomes),
+        requests_sent=tracker.sent,
+    )
+    return RunResult(run=run, outcomes=tuple(outcomes), requests_sent=tracker.sent)
+
+
+def _execute_one(
+    tc: DispatchTestCase,
+    *,
+    run: DispatchRun,
+    deps: RunDependencies,
+    dispatcher: Dispatcher,
+    now: datetime,
+) -> RunOutcome:
+    """Execute one `TestCase`'s `primary` send through the full gate (S1: no Interpreter).
+
+    Order: constructor lookup → evidence load → auth-material lookup →
+    hazard-gate (S1: any `replay_hazards` → `hazard_unresolved`, ADR-0043) →
+    construct → dispatch → commit `EXECUTED_AS`. Each refusal path is a named
+    `RunOutcome` reason that surfaces in `doo dispatch review`.
+    """
+
+    eid = run.engagement_id
+    sends: list[_SendRecord] = []
+
+    # --- constructor lookup (ADR-0043). ---
+    try:
+        construct = constructor_for(tc.test_class, "primary")
+    except ConstructorMissingError as exc:
+        return _outcome(tc, run, "constructor_missing", reason=str(exc), now=now)
+
+    # --- evidence load. ---
+    loader = deps.evidence_loader or (
+        lambda t: load_evidence(deps.neo4j, engagement_id=eid, testcase=t)
+    )
+    evidence: EvidenceObservation | None = loader(tc)  # type: ignore[operator]
+    if evidence is None:
+        return _outcome(
+            tc,
+            run,
+            "hazard_unresolved",
+            reason="no evidencing RequestObservation resolves for this target",
+            now=now,
+        )
+
+    # --- auth-material lookup (ADR-0012/0015). ---
+    material = deps.secrets.material_for(tc.auth_context_id)
+    if material is None:
+        return _outcome(
+            tc,
+            run,
+            "hazard_unresolved",
+            reason=(
+                f"no live token material for auth_context_id "
+                f"{tc.auth_context_id!r} (declared principals only; check "
+                "${VAR} env refs)"
+            ),
+            now=now,
+        )
+
+    # --- hazard gate (S1, ADR-0043): no resolver registry yet, so any detected
+    # `replay_hazards` is unresolvable → refuse + surface. S3 replaces this with
+    # the per-`kind` resolver dispatch. ---
+    if tc.replay_hazards:
+        return _outcome(
+            tc,
+            run,
+            "hazard_unresolved",
+            reason=(
+                f"replay_hazards {list(tc.replay_hazards)!r} detected and no "
+                "resolver registered (S3); refusing primary send"
+            ),
+            now=now,
+        )
+
+    # --- construct (pure). ---
+    request = construct(tc, evidence, material)
+
+    # --- dispatch (lease → OPA → budget → wire → classify). ---
+    result = dispatcher.dispatch(
+        request,
+        test_class=tc.test_class,  # type: ignore[arg-type]
+        payload_class=tc.payload_class,
+        role="primary",
+        principal_tier=material.tier,
+        target_confidence=evidence.confidence,
+        now=now,
+    )
+
+    if not result.sent:
+        # Gate deny: no observation (nothing observed). RunOutcome only.
+        return _outcome(
+            tc, run, "dispatcher_blocked", reason=result.reason, now=now
+        )
+
+    # --- commit `RequestObservation(source="agent")` + `EXECUTED_AS`. ---
+    obs_id = commit_agent_send(
+        deps.neo4j,
+        engagement_id=eid,
+        run_id=run.run_id,
+        key_hash=tc.key_hash,
+        request=request,
+        response=result.response,
+        dispatch_status=result.dispatch_status,
+        role="primary",
+        auth_context_id=tc.auth_context_id,
+        bodies=deps.bodies,
+        now=now,
+    )
+    sends.append(
+        _SendRecord(role="primary", status=result.dispatch_status, observation_id=obs_id)
+    )
+
+    return _outcome(
+        tc,
+        run,
+        "executed",
+        reason=None,
+        sends=tuple((s.role, s.status, s.observation_id) for s in sends),
+        now=now,
+    )
+
+
+def _outcome(
+    tc: DispatchTestCase,
+    run: DispatchRun,
+    kind: str,
+    *,
+    reason: str | None,
+    now: datetime,
+    sends: tuple[tuple[RequestRole, DispatchStatus, ObservationId | None], ...] = (),
+) -> RunOutcome:
+    return RunOutcome(
+        engagement_id=run.engagement_id,
+        run_id=run.run_id,
+        key_hash=tc.key_hash,
+        test_class=tc.test_class,  # type: ignore[arg-type]
+        outcome=kind,  # type: ignore[arg-type]
+        reason=reason,
+        sends=sends,
+        at=now,
+    )
+
+
+__all__ = [
+    "RunDependencies",
+    "RunResult",
+    "arm_run",
+    "execute_run",
+    "new_run_id",
+    "EngagementId",
+]

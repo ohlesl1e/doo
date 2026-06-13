@@ -58,11 +58,12 @@ PayloadClass = Literal[
     "no-payload",
 ]
 
-# Dispatch status per ADR-0013. Coverage queries filter to `ok` when computing
-# "tested and clean."
+# Dispatch status per ADR-0013 + ADR-0041 (`replay_invalid`). Coverage queries
+# filter to `ok` when computing "tested and clean."
 DispatchStatus = Literal[
     "ok",
     "auth_invalid",
+    "replay_invalid",
     "rate_limited",
     "dispatcher_blocked",
     "transport_error",
@@ -70,6 +71,7 @@ DispatchStatus = Literal[
 DISPATCH_STATUSES: tuple[DispatchStatus, ...] = (
     "ok",
     "auth_invalid",
+    "replay_invalid",
     "rate_limited",
     "dispatcher_blocked",
     "transport_error",
@@ -209,9 +211,11 @@ class Finding(Inferred):
 class ExecutedAsEdge(Provenanced):
     """The `TestCase -[EXECUTED_AS]-> RequestObservation` edge.
 
-    Carries `dispatch_status` per ADR-0013. The edge is the per-execution
-    record; coverage queries filter to `dispatch_status = "ok"` when computing
-    "tested and clean."
+    Carries `dispatch_status` per ADR-0013, plus `request_role` and `run_id`
+    (ADR-0042/0043) so coverage and audit can distinguish a `primary` send from
+    a baseline and group sends by the dispatch run that authorised them. The
+    edge is the per-execution record; coverage queries filter to
+    `dispatch_status = "ok"` when computing "tested and clean."
     """
 
     model_config = ConfigDict(strict=True, extra="forbid")
@@ -220,3 +224,9 @@ class ExecutedAsEdge(Provenanced):
     request_observation_id: ObservationId
     engagement_id: EngagementId
     dispatch_status: DispatchStatus
+    # ADR-0043: which constructor produced this send (`primary`, `baseline_*`,
+    # `liveness`, `hazard_warmup`). Kept as a free `str` here (not the
+    # `RequestRole` Literal) because the role enum is keyed on `test_class` and
+    # the edge is test-class-agnostic.
+    request_role: str
+    run_id: str

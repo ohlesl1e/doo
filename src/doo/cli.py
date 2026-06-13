@@ -15,6 +15,7 @@ import typer
 
 from doo.cli_worker import register_worker
 from doo.coverage.cli import coverage_app
+from doo.dispatch.cli import dispatch_app
 from doo.engagement.cli_keepalive import register_keepalive
 from doo.ingestion.cli_ingest import register_ingest
 from doo.observability.ids import new_span_id, new_trace_id
@@ -40,6 +41,9 @@ app.add_typer(coverage_app, name="coverage")
 
 # Slice-3: mount the planner sub-app (`doo planner propose|review`, ADR-0040).
 app.add_typer(planner_app, name="planner")
+
+# Slice-4: mount the dispatch sub-app (`doo dispatch run`, ADR-0042).
+app.add_typer(dispatch_app, name="dispatch")
 
 log = get_logger(__name__)
 

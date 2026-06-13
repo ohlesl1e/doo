@@ -58,6 +58,7 @@ class FakeGraphState:
             kill_switch_refresh_seconds=base.kill_switch_refresh_seconds,
             session_cookie_names=base.session_cookie_names,
             identity_key=base.identity_key,
+            environment=base.environment,
             declared_principals=dict(self.principals.get(engagement_id, {})),
         )
 
@@ -120,6 +121,7 @@ class FakeGraphState:
                     ],
                     session_cookie_names=tuple(m.properties.get("session_cookie_names") or ()),
                     identity_key=m.properties.get("identity_key"),
+                    environment=m.properties.get("environment"),
                 )
             elif m.kind == "engagement_rebind_scope":
                 eid = m.properties["engagement_id"]
@@ -133,6 +135,7 @@ class FakeGraphState:
                     kill_switch_refresh_seconds=prev.kill_switch_refresh_seconds,
                     session_cookie_names=prev.session_cookie_names,
                     identity_key=prev.identity_key,
+                    environment=prev.environment,
                 )
             elif m.kind == "engagement_update":
                 eid = m.properties["id"]
@@ -157,6 +160,11 @@ class FakeGraphState:
                         if "identity_key" in m.properties
                         else prev.identity_key
                     ),
+                    environment=(
+                        m.properties.get("environment")
+                        if "environment" in m.properties
+                        else prev.environment
+                    ),
                 )
 
 
@@ -167,6 +175,7 @@ def _base_config_dict() -> dict:
             "name": "Acme spring engagement",
             "description": "Bug bounty research against Acme",
         },
+        "environment": "staging",
         "scope": {
             "host_patterns": ["api.acme.example"],
             "allowed_methods": ["GET", "POST"],
