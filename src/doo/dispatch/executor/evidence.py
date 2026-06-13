@@ -75,9 +75,13 @@ class DispatchTestCase:
     target_trust_boundary_id: str | None
     hold: tuple[str, ...]
     replay_hazards: tuple[str, ...]
-    expected_yield: float
-    generator: str | None
-    confidence: float
+    # Resolvable-hazard `source_hint`s (`"<kind>=<url>"`, ADR-0041): where the
+    # hazard resolver fetches a fresh token (csrf). Set by the planner; a
+    # `doo dispatch review --set-hint` override takes precedence at run time.
+    hazard_source_hints: tuple[str, ...] = ()
+    expected_yield: float = 0.0
+    generator: str | None = None
+    confidence: float = 1.0
 
 
 def load_evidence(

@@ -292,6 +292,16 @@ RunOutcomeKind = Literal[
 ]
 
 
+class HazardInfo(BaseModel):
+    """Structured `hazard_unresolved` detail for `doo dispatch review` (ADR-0041)."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: str
+    param: str
+    reason: str
+
+
 class RunOutcome(BaseModel):
     """The per-`TestCase` record one dispatch run leaves in the dispatch ledger.
 
@@ -308,6 +318,9 @@ class RunOutcome(BaseModel):
     test_class: TestClass
     outcome: RunOutcomeKind
     reason: str | None = None
+    # On `hazard_unresolved`: the structured `{kind, param, reason}` (ADR-0041) so
+    # `doo dispatch review` can offer a targeted `--set-hint` / `--ignore-hazard`.
+    hazard: HazardInfo | None = None
     # On `executed`: the `(role, dispatch_status, observation_id)` per send.
     sends: tuple[tuple[RequestRole, DispatchStatus, ObservationId | None], ...] = ()
     at: datetime
@@ -329,7 +342,7 @@ class DispatchLedgerEvent(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    kind: Literal["armed", "outcome"]
+    kind: Literal["armed", "outcome", "override"]
     engagement_id: EngagementId
     run_id: DispatchRunId
     timestamp: datetime
@@ -342,6 +355,13 @@ class DispatchLedgerEvent(BaseModel):
     environment: Environment | None = None
     # `outcome` only:
     outcome: RunOutcome | None = None
+    # `override` only (S5 `doo dispatch review`): a tester-supplied hazard fix the
+    # NEXT run reads. `set_hint` supplies a `source_hint`; `ignore_hazard` sends
+    # anyway (accept `replay_invalid` risk). Not run-scoped — `run_id` is a sentinel.
+    key_hash: TestCaseKeyHash | None = None
+    override_action: Literal["set_hint", "ignore_hazard"] | None = None
+    hazard_kind: str | None = None
+    hint: str | None = None
 
     @model_validator(mode="after")
     def _kind_shape(self) -> DispatchLedgerEvent:
@@ -350,7 +370,18 @@ class DispatchLedgerEvent(BaseModel):
                 raise ValueError("armed event requires actor + selection + budget")
             if self.outcome is not None:
                 raise ValueError("armed event carries no outcome")
-        else:
+        elif self.kind == "outcome":
             if self.outcome is None:
                 raise ValueError("outcome event requires an outcome")
+        else:  # override
+            if (
+                self.key_hash is None
+                or self.override_action is None
+                or self.hazard_kind is None
+            ):
+                raise ValueError(
+                    "override event requires key_hash + override_action + hazard_kind"
+                )
+            if self.override_action == "set_hint" and not self.hint:
+                raise ValueError("set_hint override requires a hint")
         return self

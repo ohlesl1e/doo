@@ -452,6 +452,170 @@ def test_authz_liveness_e2e(
         assert ev["principal_label"] == "attacker-b"
 
 
+ENG_HZ = "eng-dispatch-csrf-e2e"
+
+
+def _seed_csrf_graph(
+    neo4j: Neo4jClient,
+    *,
+    eng: str,
+    attacker_ac_id: str,
+    victim_ac_id: str,
+    with_referer: bool,
+) -> str:
+    """Seed an approved IDOR TestCase whose evidence carries a `_csrf` query param.
+
+    When `with_referer`, the victim observation also carries a `Referer` header so
+    the run derives a CSRF `source_hint` and resolves it; otherwise the hazard is
+    unresolvable. Returns the TestCase `key_hash`.
+    """
+    now = datetime.now(UTC)
+    cross = _cross(now)
+    headers = ["Accept=application/json"]
+    if with_referer:
+        headers.append("Referer=https://shop.example.com/orders/new")
+    neo4j.execute_write(
+        """
+        MERGE (h:Host {engagement_id: $eid, id: $hid})
+        ON CREATE SET h.scheme = 'https', h.canonical_hostname = $hostname,
+                      h.port = null, h.is_ip_literal = false, h += $cross
+        MERGE (e:Endpoint {engagement_id: $eid, id: $epid})
+        ON CREATE SET e.method = 'GET', e.path_template = '/orders/{order_id}',
+                      e += $cross
+        MERGE (e)-[:ON_HOST]->(h)
+        MERGE (acA:AuthContext {engagement_id: $eid, id: $ac_victim})
+        ON CREATE SET acA.auth_hash='ah-v', acA.tier='declared',
+                      acA.is_anonymous=false, acA.token_kind='bearer', acA += $cross
+        MERGE (acB:AuthContext {engagement_id: $eid, id: $ac_attacker})
+        ON CREATE SET acB.auth_hash='ah-a', acB.tier='declared',
+                      acB.is_anonymous=false, acB.token_kind='bearer', acB += $cross
+        MERGE (r:RequestObservation {engagement_id: $eid, observation_id: 'obs-csrf'})
+        ON CREATE SET r.id='obs-csrf', r.method='GET', r.concrete_path='/orders/123',
+                      r.response_status=200, r.headers=$headers,
+                      r.query=['_csrf=stale-token'], r.cookies=[], r += $cross
+        MERGE (r)-[:HIT]->(e)
+        MERGE (r)-[:ON_HOST]->(h)
+        MERGE (r)-[:OBSERVED_UNDER]->(acA)
+        """,
+        eid=eng, hid=HOST_ID, hostname=HOSTNAME, epid=EP_ID,
+        ac_victim=victim_ac_id, ac_attacker=attacker_ac_id, headers=headers, cross=cross,
+    )
+    payload_hash = hashlib.sha256(b"").hexdigest()
+    key_hash = compute_testcase_key_hash(
+        engagement_id=EngagementId(eng), test_class="idor",
+        target_endpoint_id=EP_ID, target_parameter_id=None, target_trust_boundary_id=None,
+        payload_class="auth-token-swap", payload_hash=payload_hash,  # type: ignore[arg-type]
+        auth_context_id=attacker_ac_id,  # type: ignore[arg-type]
+    )
+    neo4j.execute_write(
+        """
+        MATCH (e:Endpoint {engagement_id: $eid, id: $epid})
+        MERGE (t:TestCase {engagement_id: $eid, key_hash: $kh})
+        ON CREATE SET t.test_class='idor', t.payload_class='auth-token-swap',
+                      t.payload_hash=$ph, t.auth_context_id=$ac_attacker,
+                      t.target_endpoint_id=$epid, t.review_status='approved',
+                      t.expected_yield=0.9, t.generator='c2', t.hold=['order_id'],
+                      t.replay_hazards=['csrf_token'], t.source='llm-planner',
+                      t.confidence=0.99, t += $cross
+        MERGE (t)-[:TARGETS_ENDPOINT]->(e)
+        """,
+        eid=eng, epid=EP_ID, kh=key_hash, ph=payload_hash, ac_attacker=attacker_ac_id, cross=cross,
+    )
+    return key_hash
+
+
+def test_csrf_hazard_resolution_e2e(
+    neo4j_client: Neo4jClient, redis_url: str
+) -> None:
+    """S5: a `_csrf` replay hazard is fetched + spliced so the IDOR `primary` sends.
+
+    With a `Referer`, the run warm-fetches the form page, extracts a fresh token,
+    splices it, and the `primary` carries it. Without one, the hazard is
+    unresolvable → `hazard_unresolved`, visible in `doo dispatch review`.
+    """
+    from doo.dispatch.executor.liveness import LivenessPolicy
+
+    config = _liveness_config(ENG_HZ)  # reuse the two-principal staging config shape
+    config = config.model_copy(update={"engagement": config.engagement.model_copy(update={"id": ENG_HZ})})
+    env = {"E2E_VICTIM": VICTIM_TOKEN, "E2E_ATTACKER": ATTACKER_TOKEN}
+    secrets = EnvSecretStore.from_config(config, env=env)
+    attacker_ac_id = auth_context_id(EngagementId(ENG_HZ), compute_auth_hash("bearer", ATTACKER_TOKEN))
+    victim_ac_id = auth_context_id(EngagementId(ENG_HZ), compute_auth_hash("bearer", VICTIM_TOKEN))
+
+    rclient = redis.Redis.from_url(redis_url)
+    lease = RedisLease(rclient, EngagementId(ENG_HZ))
+    lease.set_active(ttl_seconds=60)
+
+    # --- phase A: Referer present → warmup fetch resolves the token. ---
+    _seed_csrf_graph(
+        neo4j_client, eng=ENG_HZ, attacker_ac_id=attacker_ac_id,
+        victim_ac_id=victim_ac_id, with_referer=True,
+    )
+    sender = _PathScriptedSender(
+        {
+            "/orders/new": HttpResponse(
+                status=200, body=b'<form><input name="_csrf" value="FRESH-TOKEN"></form>'
+            ),
+            "/orders/123": HttpResponse(status=200, body=b'{"order_id":123}'),
+        }
+    )
+    ledger = InMemoryDispatchLedger()
+    run = arm_run(
+        config=config,
+        selection=DispatchSelection(test_classes=("idor",), limit=1),
+        actor="e2e",
+    )
+    deps = RunDependencies(
+        neo4j=neo4j_client, lease=RedisLeaseReader(lease=lease),
+        opa=StubOpaClient(allow=True), sender=sender,  # type: ignore[arg-type]
+        secrets=secrets, bodies=NoopBodyStore(), ledger=ledger,
+        liveness=LivenessPolicy.from_config(config, env=env),
+    )
+    result = execute_run(run, deps)
+
+    assert result.outcomes[0].outcome == "executed"
+    # warmup (/orders/new) then primary (/orders/123).
+    paths = [r.path for r in sender.sent]  # type: ignore[attr-defined]
+    assert paths == ["/orders/new", "/orders/123"]
+    primary = sender.sent[1]
+    assert dict(primary.query).get("_csrf") == "FRESH-TOKEN"  # type: ignore[attr-defined]
+
+    # --- phase B: no Referer, no hint → hazard_unresolved + dispatch review. ---
+    eng_b = ENG_HZ + "-b"
+    cfg_b = config.model_copy(update={"engagement": config.engagement.model_copy(update={"id": eng_b})})
+    secrets_b = EnvSecretStore.from_config(cfg_b, env=env)
+    attacker_b = auth_context_id(EngagementId(eng_b), compute_auth_hash("bearer", ATTACKER_TOKEN))
+    victim_b = auth_context_id(EngagementId(eng_b), compute_auth_hash("bearer", VICTIM_TOKEN))
+    lease_b = RedisLease(rclient, EngagementId(eng_b))
+    lease_b.set_active(ttl_seconds=60)
+    kh_b = _seed_csrf_graph(
+        neo4j_client, eng=eng_b, attacker_ac_id=attacker_b,
+        victim_ac_id=victim_b, with_referer=False,
+    )
+    ledger_b = InMemoryDispatchLedger()
+    run_b = arm_run(
+        config=cfg_b, selection=DispatchSelection(test_classes=("idor",), limit=1), actor="e2e"
+    )
+    deps_b = RunDependencies(
+        neo4j=neo4j_client, lease=RedisLeaseReader(lease=lease_b),
+        opa=StubOpaClient(allow=True), sender=_PathScriptedSender({}),  # type: ignore[arg-type]
+        secrets=secrets_b, bodies=NoopBodyStore(), ledger=ledger_b,
+        liveness=LivenessPolicy.from_config(cfg_b, env=env),
+    )
+    result_b = execute_run(run_b, deps_b)
+    outcome_b = result_b.outcomes[0]
+    assert outcome_b.outcome == "hazard_unresolved"
+    assert outcome_b.hazard is not None
+    assert outcome_b.hazard.kind == "csrf_token" and outcome_b.hazard.param == "_csrf"
+    assert kh_b == outcome_b.key_hash
+
+    # `doo dispatch review` would list it: the latest non-executed outcome.
+    events = ledger_b.all_for_engagement(EngagementId(eng_b))
+    refused = [e.outcome for e in events if e.kind == "outcome" and e.outcome is not None
+               and e.outcome.outcome == "hazard_unresolved"]
+    assert len(refused) == 1 and refused[0].hazard is not None
+
+
 def test_dispatch_spine_e2e(
     neo4j_client: Neo4jClient, redis_url: str, engagement_config: EngagementConfig
 ) -> None:

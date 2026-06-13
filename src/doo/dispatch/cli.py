@@ -398,6 +398,98 @@ def run_cmd(
 
 
 # ---------------------------------------------------------------------------
+# `doo dispatch review` (S5/#90) — triage refused TestCases + set hazard overrides.
+# ---------------------------------------------------------------------------
+
+# Outcomes worth a human's attention (a refused or blocked test, not an executed one).
+_REVIEWABLE_OUTCOMES = frozenset(
+    {"hazard_unresolved", "dispatcher_blocked", "constructor_missing"}
+)
+
+
+@dispatch_app.command("review")
+def review_cmd(
+    engagement: str = typer.Option(..., "--engagement", "-e"),
+    as_json: bool = typer.Option(False, "--json", help="Emit the reviewable outcomes as JSON."),
+    set_hint: tuple[str, str, str] = typer.Option(
+        ("", "", ""),
+        "--set-hint",
+        help="Supply a hazard source_hint: <key_hash> <kind> <url>. The next run reads it.",
+    ),
+    ignore_hazard: tuple[str, str] = typer.Option(
+        ("", ""),
+        "--ignore-hazard",
+        help="Send anyway despite a hazard: <key_hash> <kind> (accepts replay_invalid risk).",
+    ),
+) -> None:
+    """List refused/blocked TestCases from the dispatch ledger; set hazard overrides (ADR-0041).
+
+    The latest non-`executed` `RunOutcome` per TestCase (`hazard_unresolved` with
+    its `{kind, param, reason}`, `dispatcher_blocked`, `constructor_missing`).
+    `--set-hint` / `--ignore-hazard` append an override the next `doo dispatch run`
+    consults before resolving that hazard.
+    """
+
+    import json as _json
+
+    from doo.dispatch.ledger import record_override
+    from doo.dispatch.models import RunOutcome
+    from doo.ids import TestCaseKeyHash
+
+    configure_logging()
+    ledger = _default_ledger()
+    eid = EngagementId(engagement)
+
+    if set_hint[0]:
+        key, kind, url = set_hint
+        record_override(
+            ledger, engagement_id=eid, key_hash=TestCaseKeyHash(key),
+            action="set_hint", hazard_kind=kind, hint=url,
+        )
+        typer.echo(f"set-hint recorded: {key[:12]} {kind} → {url}")
+        return
+    if ignore_hazard[0]:
+        key, kind = ignore_hazard
+        record_override(
+            ledger, engagement_id=eid, key_hash=TestCaseKeyHash(key),
+            action="ignore_hazard", hazard_kind=kind,
+        )
+        typer.echo(f"ignore-hazard recorded: {key[:12]} {kind} (next run sends anyway)")
+        return
+
+    # List: latest non-executed outcome per key_hash.
+    latest: dict[str, RunOutcome] = {}
+    for ev in ledger.all_for_engagement(eid):
+        if ev.kind == "outcome" and ev.outcome is not None:
+            latest[str(ev.outcome.key_hash)] = ev.outcome
+    reviewable = [o for o in latest.values() if o.outcome in _REVIEWABLE_OUTCOMES]
+
+    if as_json:
+        typer.echo(_json.dumps([o.model_dump(mode="json") for o in reviewable], indent=2))
+        return
+    if not reviewable:
+        typer.echo(f"no reviewable (refused/blocked) outcomes in engagement {engagement!r}")
+        return
+    typer.echo(f"{len(reviewable)} reviewable outcome(s) in engagement {engagement!r}:\n")
+    for o in reviewable:
+        typer.secho(
+            f"  {o.key_hash[:12]}  [{o.test_class}] → {o.outcome}",
+            fg=typer.colors.YELLOW,
+        )
+        if o.hazard is not None:
+            h = o.hazard
+            typer.echo(f"      hazard {h.kind} on {h.param!r}: {h.reason}")
+            typer.echo(
+                f"      fix:  doo dispatch review -e {engagement} --set-hint "
+                f"{o.key_hash} {h.kind} <url>\n"
+                f"      skip: doo dispatch review -e {engagement} --ignore-hazard "
+                f"{o.key_hash} {h.kind}"
+            )
+        elif o.reason:
+            typer.echo(f"      {o.reason}")
+
+
+# ---------------------------------------------------------------------------
 # `doo finding review` (ADR-0045) — sibling of `doo planner review`.
 # ---------------------------------------------------------------------------
 

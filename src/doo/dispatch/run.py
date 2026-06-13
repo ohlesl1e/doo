@@ -27,6 +27,7 @@ from doo.dispatch.executor.classify import (
 )
 from doo.dispatch.executor.constructors import (
     ConstructorMissingError,
+    _splice_auth,
     constructor_for,
 )
 from doo.dispatch.executor.dispatcher import (
@@ -40,8 +41,15 @@ from doo.dispatch.executor.evidence import (
     EvidenceObservation,
     load_evidence,
 )
+from doo.dispatch.executor.hazards import (
+    HazardSplice,
+    Unresolved,
+    apply_splices,
+    locate_hazard,
+    resolve_hazard,
+)
 from doo.dispatch.executor.liveness import LivenessPolicy, LivenessProber, ProbeOutcome
-from doo.dispatch.executor.send import Sender
+from doo.dispatch.executor.send import HttpResponse, Sender
 from doo.dispatch.finding import commit_finding, persist_transcript, record_verdict
 from doo.dispatch.interpreter.loop import (
     ConfirmLoopResult,
@@ -50,10 +58,18 @@ from doo.dispatch.interpreter.loop import (
 )
 from doo.dispatch.interpreter.models import SendToolResult
 from doo.dispatch.interpreter.tools import ToolContext
-from doo.dispatch.ledger import DispatchLedger, record_armed, record_outcome
+from doo.dispatch.ledger import (
+    DispatchLedger,
+    record_armed,
+    record_outcome,
+    resolve_overrides,
+)
 from doo.dispatch.models import (
+    ConcreteRequest,
+    DispatchLedgerEvent,
     DispatchRun,
     DispatchSelection,
+    HazardInfo,
     RequestRole,
     RunBudget,
     RunOutcome,
@@ -63,7 +79,13 @@ from doo.dispatch.reactive import ReactiveEmitter
 from doo.dispatch.secrets import AuthMaterial, SecretStore
 from doo.dispatch.selection import select_testcases
 from doo.events.slice4 import DispatchStatus
-from doo.ids import DispatchRunId, EngagementId, ObservationId, TraceId
+from doo.ids import (
+    AuthContextId,
+    DispatchRunId,
+    EngagementId,
+    ObservationId,
+    TraceId,
+)
 from doo.infra.neo4j_driver import Neo4jClient
 from doo.observability.ids import new_trace_id
 from doo.observability.logging import bind_correlation, get_logger
@@ -227,6 +249,10 @@ def execute_run(
         else None
     )
 
+    # Hazard overrides set via `doo dispatch review` (set-hint / ignore-hazard);
+    # read once, consulted per-TestCase before resolving its replay_hazards (S5).
+    overrides = resolve_overrides(deps.ledger, run.engagement_id)
+
     outcomes: list[RunOutcome] = []
     for tc in selected:
         outcome = _execute_one(
@@ -235,6 +261,7 @@ def execute_run(
             deps=deps,
             dispatcher=dispatcher,
             prober=prober,
+            overrides=overrides,
             now=datetime.now(UTC),
         )
         record_outcome(deps.ledger, outcome)
@@ -283,6 +310,7 @@ def _execute_one(
     deps: RunDependencies,
     dispatcher: Dispatcher,
     prober: LivenessProber | None,
+    overrides: dict[tuple[str, str], DispatchLedgerEvent],
     now: datetime,
 ) -> RunOutcome:
     """Execute one `TestCase`'s `primary` send through the full gate (S1: no Interpreter).
@@ -331,20 +359,34 @@ def _execute_one(
             now=now,
         )
 
-    # --- hazard gate (S1, ADR-0043): no resolver registry yet, so any detected
-    # `replay_hazards` is unresolvable → refuse + surface. S3 replaces this with
-    # the per-`kind` resolver dispatch. ---
+    # --- replay-hazard resolution (S5, ADR-0041/0043): resolve each detected
+    # hazard (csrf fetch+splice / nonce strip / timestamp now) into edits applied
+    # to the evidence before the pure constructor runs. Warmup fetches are real
+    # Dispatcher sends (role `hazard_warmup`). An unresolved hazard refuses the
+    # `primary` send and surfaces in `doo dispatch review`. ---
+    hazard_sends: list[_SendRecord] = []
     if tc.replay_hazards:
-        return _outcome(
+        adjusted, unresolved, hazard_sends = _resolve_replay_hazards(
             tc,
-            run,
-            "hazard_unresolved",
-            reason=(
-                f"replay_hazards {list(tc.replay_hazards)!r} detected and no "
-                "resolver registered (S3); refusing primary send"
-            ),
+            run=run,
+            deps=deps,
+            dispatcher=dispatcher,
+            evidence=evidence,
+            material=material,
+            overrides=overrides,
             now=now,
         )
+        if unresolved is not None:
+            return _outcome(
+                tc,
+                run,
+                "hazard_unresolved",
+                reason=f"{unresolved.kind} on {unresolved.param!r}: {unresolved.reason}",
+                hazard=unresolved,
+                now=now,
+            )
+        evidence = adjusted
+    sends.extend(hazard_sends)
 
     # --- construct (pure). ---
     request = construct(tc, evidence, material)
@@ -596,8 +638,6 @@ def _disambiguate_authz(
     classifier re-decides with the real probe outcome.
     """
 
-    from doo.dispatch.executor.send import HttpResponse
-
     assert isinstance(response, HttpResponse)
     matchers = deps.liveness.matchers if deps.liveness is not None else None
 
@@ -636,6 +676,131 @@ def _disambiguate_authz(
     return status, outcome
 
 
+def _parse_hints(hints: tuple[str, ...]) -> dict[str, str]:
+    """Parse `("csrf_token=<url>", …)` into `{kind: url}` (planner-emitted hints)."""
+
+    out: dict[str, str] = {}
+    for h in hints:
+        kind, _, url = h.partition("=")
+        if kind and url:
+            out[kind] = url
+    return out
+
+
+def _resolve_replay_hazards(
+    tc: DispatchTestCase,
+    *,
+    run: DispatchRun,
+    deps: RunDependencies,
+    dispatcher: Dispatcher,
+    evidence: EvidenceObservation,
+    material: AuthMaterial,
+    overrides: dict[tuple[str, str], DispatchLedgerEvent],
+    now: datetime,
+) -> tuple[EvidenceObservation, HazardInfo | None, list[_SendRecord]]:
+    """Resolve `tc.replay_hazards` into evidence edits (ADR-0041/0043).
+
+    Returns `(adjusted_evidence, unresolved_or_None, warmup_sends)`. For each
+    hazard kind: an `ignore_hazard` override drops it (send anyway); otherwise the
+    field is located in the evidence and resolved (csrf fetch+splice / nonce strip
+    / timestamp now). The CSRF `source_hint` precedence is: `set_hint` override →
+    planner-emitted hint → the evidence's observed `Referer`. The first
+    `Unresolved` hazard short-circuits to a refusal.
+    """
+
+    planner_hints = _parse_hints(tc.hazard_source_hints)
+    referer = next(
+        (v for k, v in evidence.headers.items() if k.lower() == "referer"), None
+    )
+    warmup_sends: list[_SendRecord] = []
+    splices: list[HazardSplice] = []
+
+    for kind in tc.replay_hazards:
+        ov = overrides.get((str(tc.key_hash), kind))
+        if ov is not None and ov.override_action == "ignore_hazard":
+            continue  # tester accepted the replay_invalid risk — send anyway.
+
+        located = locate_hazard(kind, evidence)  # type: ignore[arg-type]
+        if located is None:
+            # Detected at plan time but absent from this evidence — nothing to
+            # replay, so nothing to break.
+            continue
+
+        source_hint: str | None = None
+        if ov is not None and ov.override_action == "set_hint":
+            source_hint = ov.hint
+        source_hint = source_hint or planner_hints.get(kind) or referer
+
+        def _fetch(method: str, path: str) -> HttpResponse | None:
+            req = _warmup_request(
+                method=method, path=path, evidence=evidence, material=material,
+                auth_context_id=tc.auth_context_id,
+            )
+            dr = dispatcher.dispatch(
+                req,
+                test_class=tc.test_class,  # type: ignore[arg-type]
+                payload_class="benign-probe",
+                role="hazard_warmup",
+                principal_tier=material.tier,
+                target_confidence=evidence.confidence,
+                now=now,
+            )
+            if dr.sent and dr.response is not None:
+                obs = commit_agent_send(
+                    deps.neo4j,
+                    engagement_id=run.engagement_id,
+                    run_id=run.run_id,
+                    key_hash=tc.key_hash,
+                    request=req,
+                    response=dr.response,
+                    dispatch_status="ok",
+                    role="hazard_warmup",
+                    auth_context_id=tc.auth_context_id,
+                    bodies=deps.bodies,
+                    now=now,
+                )
+                warmup_sends.append(
+                    _SendRecord(role="hazard_warmup", status="ok", observation_id=obs)
+                )
+                return dr.response
+            return None
+
+        resolution = resolve_hazard(located, source_hint=source_hint, fetch=_fetch)
+        if isinstance(resolution, Unresolved):
+            return evidence, HazardInfo(
+                kind=resolution.kind, param=resolution.param, reason=resolution.reason
+            ), warmup_sends
+        splices.extend(resolution.splices)
+
+    return apply_splices(evidence, tuple(splices)), None, warmup_sends
+
+
+def _warmup_request(
+    *,
+    method: str,
+    path: str,
+    evidence: EvidenceObservation,
+    material: AuthMaterial,
+    auth_context_id: AuthContextId,
+) -> ConcreteRequest:
+    """A standalone `hazard_warmup` GET to the source_hint page under the test's auth."""
+
+    headers, cookies = _splice_auth(
+        headers={}, cookies={}, material=material, session_cookie_name=None
+    )
+    return ConcreteRequest(
+        method=method,
+        host=evidence.host,
+        path=path,
+        path_template=path,
+        query=(),
+        headers=tuple(sorted(headers.items())),
+        cookies=tuple(sorted(cookies.items())),
+        body=None,
+        auth_context_id=auth_context_id,
+    )
+
+
 def _outcome(
     tc: DispatchTestCase,
     run: DispatchRun,
@@ -643,6 +808,7 @@ def _outcome(
     *,
     reason: str | None,
     now: datetime,
+    hazard: HazardInfo | None = None,
     sends: tuple[tuple[RequestRole, DispatchStatus, ObservationId | None], ...] = (),
 ) -> RunOutcome:
     return RunOutcome(
@@ -652,6 +818,7 @@ def _outcome(
         test_class=tc.test_class,  # type: ignore[arg-type]
         outcome=kind,  # type: ignore[arg-type]
         reason=reason,
+        hazard=hazard,
         sends=sends,
         at=now,
     )

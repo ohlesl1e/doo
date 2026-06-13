@@ -363,6 +363,7 @@ def validate(
         # (absent from `key_hash` above).
         hold=proposal.hold,
         replay_hazards=proposal.replay_hazards,
+        hazard_source_hints=proposal.hazard_source_hints,
         llm_audit_key=proposal.llm_audit_key,
     )
 

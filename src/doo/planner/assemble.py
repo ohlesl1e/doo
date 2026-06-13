@@ -58,7 +58,10 @@ from doo.planner.models import (
     PackTarget,
     ReplayHazardRole,
 )
-from doo.planner.replay_hazards import hazards_for_value_candidates
+from doo.planner.replay_hazards import (
+    hazards_for_value_candidates,
+    source_hints_for_value_candidates,
+)
 
 log = get_logger(__name__)
 
@@ -830,3 +833,37 @@ def fetch_reaching_observation_hazards(
         return ()
     candidates = _parse_value_candidates(rows[0]["value_candidates"])
     return hazards_for_value_candidates(candidates)
+
+
+def fetch_reaching_observation_source_hints(
+    client: Neo4jClient,
+    engagement_id: EngagementId,
+    *,
+    endpoint_id: str,
+) -> tuple[str, ...]:
+    """`source_hint`s for the reaching observation's resolvable hazards (ADR-0041).
+
+    Sibling of `fetch_reaching_observation_hazards`, over the same most-recent
+    reaching 2xx observation: emits `"csrf_token=<referer>"` when the request
+    carried a CSRF token + a `Referer` (the page that minted it), so slice-4 can
+    fetch a fresh token under the test's auth. Empty when there is nothing to hint.
+    """
+
+    frag = for_engagement(engagement_id, var="r")
+    rows = client.execute_read(
+        f"""
+        MATCH (r:RequestObservation)-[:HIT]->(e:Endpoint {{id: $endpoint_id}})
+        {frag.and_("r.status = 'active' AND e.status = 'active'")}
+          AND r.response_status >= 200 AND r.response_status <= 299
+          AND r.value_candidates IS NOT NULL
+        RETURN r.value_candidates AS value_candidates
+        ORDER BY coalesce(r.last_seen, r.ingested_at) DESC, r.observation_id ASC
+        LIMIT 1
+        """,
+        endpoint_id=endpoint_id,
+        **frag.parameters,
+    )
+    if not rows:
+        return ()
+    candidates = _parse_value_candidates(rows[0]["value_candidates"])
+    return source_hints_for_value_candidates(candidates)

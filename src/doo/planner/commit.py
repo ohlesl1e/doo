@@ -87,6 +87,9 @@ class ValidatedTestCase:
     # and **not** part of `key_hash` (a derivable execution-fidelity annotation, like
     # `hold`). Persisted as a node property for the review surface.
     replay_hazards: tuple[str, ...] = ()
+    # Resolvable-hazard `source_hint`s (`"<kind>=<url>"`, ADR-0041): where the
+    # slice-4 resolver fetches a fresh token (csrf). Code-set, not in `key_hash`.
+    hazard_source_hints: tuple[str, ...] = ()
     # Object-storage key of the proposing LLM call (ADR-0037), or None for a
     # deterministic proposal. Committed onto the node as replay provenance.
     llm_audit_key: str | None = None
@@ -172,6 +175,7 @@ def commit_testcase(
             t.expected_outcome = $expected_outcome,
             t.hold = $hold,
             t.replay_hazards = $replay_hazards,
+            t.hazard_source_hints = $hazard_source_hints,
             t.generator = $generator,
             t.source = $source,
             t.source_id = $source_id,
@@ -210,6 +214,7 @@ def commit_testcase(
         expected_outcome=vtc.expected_outcome,
         hold=list(vtc.hold),
         replay_hazards=list(vtc.replay_hazards),
+        hazard_source_hints=list(vtc.hazard_source_hints),
         generator=vtc.generator,
         source=vtc.source,
         source_id=None,

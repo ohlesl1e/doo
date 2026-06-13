@@ -302,3 +302,31 @@ def hazards_for_value_candidates(
             continue
         fields.append(HazardField(name=name, value=vc.value, is_header=is_header))
     return detect_replay_hazards(tuple(fields))
+
+
+def source_hints_for_value_candidates(
+    candidates: tuple[ValueCandidate, ...],
+) -> tuple[str, ...]:
+    """`source_hint`s (`"<kind>=<url>"`) for hazards a refresh can resolve (ADR-0041).
+
+    For `csrf_token`, the hint is the page the token was carried *from* — the
+    request's `Referer` header (the form/page that minted the token). Slice-4's
+    resolver fetches it under the test's auth to splice a fresh token. Returns an
+    empty tuple when there is no CSRF hazard or no observed `Referer`. Other kinds
+    (`nonce` strip / `timestamp` now) need no hint, so none is emitted for them.
+    """
+
+    if "csrf_token" not in hazards_for_value_candidates(candidates):
+        return ()
+    referer = next(
+        (
+            vc.value
+            for vc in candidates
+            if vc.role == "input"
+            and vc.section == "header"
+            and (vc.header_name or "").lower() == "referer"
+            and vc.value
+        ),
+        None,
+    )
+    return (f"csrf_token={referer}",) if referer else ()

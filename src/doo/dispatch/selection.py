@@ -58,6 +58,7 @@ def select_testcases(
                t.target_trust_boundary_id AS target_trust_boundary_id,
                coalesce(t.hold, []) AS hold,
                coalesce(t.replay_hazards, []) AS replay_hazards,
+               coalesce(t.hazard_source_hints, []) AS hazard_source_hints,
                coalesce(t.expected_yield, 0.0) AS expected_yield,
                t.generator AS generator,
                coalesce(t.confidence, 0.99) AS confidence
@@ -78,6 +79,7 @@ def select_testcases(
             target_trust_boundary_id=r["target_trust_boundary_id"],
             hold=tuple(r["hold"] or ()),
             replay_hazards=tuple(r["replay_hazards"] or ()),
+            hazard_source_hints=tuple(r["hazard_source_hints"] or ()),
             expected_yield=float(r["expected_yield"]),
             generator=r["generator"],
             confidence=float(r["confidence"]),

@@ -15,14 +15,18 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 from doo.dispatch.models import DispatchLedgerEvent, DispatchRun, RunOutcome
-from doo.ids import DispatchRunId, EngagementId
+from doo.ids import DispatchRunId, EngagementId, TestCaseKeyHash
 from doo.observability.logging import get_logger
 
 log = get_logger(__name__)
+
+# Sentinel `run_id` for engagement-scoped (not run-scoped) `override` events.
+OVERRIDE_RUN_ID = DispatchRunId("_override")
 
 
 class DispatchLedger(Protocol):
@@ -32,6 +36,10 @@ class DispatchLedger(Protocol):
 
     def events_for(
         self, engagement_id: EngagementId, run_id: DispatchRunId
+    ) -> list[DispatchLedgerEvent]: ...
+
+    def all_for_engagement(
+        self, engagement_id: EngagementId
     ) -> list[DispatchLedgerEvent]: ...
 
 
@@ -70,6 +78,15 @@ class JsonFileDispatchLedger:
             if e.get("engagement_id") == engagement_id and e.get("run_id") == run_id
         ]
 
+    def all_for_engagement(
+        self, engagement_id: EngagementId
+    ) -> list[DispatchLedgerEvent]:
+        return [
+            DispatchLedgerEvent.model_validate(e)
+            for e in self._read_raw()
+            if e.get("engagement_id") == engagement_id
+        ]
+
 
 @dataclass
 class InMemoryDispatchLedger:
@@ -88,6 +105,11 @@ class InMemoryDispatchLedger:
             for e in self.events
             if e.engagement_id == engagement_id and e.run_id == run_id
         ]
+
+    def all_for_engagement(
+        self, engagement_id: EngagementId
+    ) -> list[DispatchLedgerEvent]:
+        return [e for e in self.events if e.engagement_id == engagement_id]
 
 
 def record_armed(ledger: DispatchLedger, run: DispatchRun) -> None:
@@ -121,3 +143,46 @@ def record_outcome(ledger: DispatchLedger, outcome: RunOutcome) -> None:
             outcome=outcome,
         )
     )
+
+
+def record_override(
+    ledger: DispatchLedger,
+    *,
+    engagement_id: EngagementId,
+    key_hash: TestCaseKeyHash,
+    action: Literal["set_hint", "ignore_hazard"],
+    hazard_kind: str,
+    hint: str | None = None,
+    now: datetime | None = None,
+) -> None:
+    """Append a `doo dispatch review` hazard override the next run reads (S5/#90)."""
+
+    ledger.append(
+        DispatchLedgerEvent(
+            kind="override",
+            engagement_id=engagement_id,
+            run_id=OVERRIDE_RUN_ID,
+            timestamp=now or datetime.now(UTC),
+            key_hash=key_hash,
+            override_action=action,
+            hazard_kind=hazard_kind,
+            hint=hint,
+        )
+    )
+
+
+def resolve_overrides(
+    ledger: DispatchLedger, engagement_id: EngagementId
+) -> dict[tuple[str, str], DispatchLedgerEvent]:
+    """Latest-wins `(key_hash, hazard_kind) → override` map for the engagement.
+
+    Read once at run start; the run driver consults it before resolving each
+    hazard (a `set_hint` supplies the `source_hint`; an `ignore_hazard` drops the
+    hazard so the `primary` sends anyway).
+    """
+
+    out: dict[tuple[str, str], DispatchLedgerEvent] = {}
+    for e in ledger.all_for_engagement(engagement_id):
+        if e.kind == "override" and e.key_hash is not None and e.hazard_kind is not None:
+            out[(str(e.key_hash), e.hazard_kind)] = e
+    return out

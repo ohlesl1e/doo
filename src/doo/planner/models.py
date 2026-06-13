@@ -201,6 +201,13 @@ class PlannerProposal(BaseModel):
     # dispatch_status land in slice 4.
     replay_hazards: tuple[str, ...] = ()
 
+    # Resolvable-hazard `source_hint`s (`"<kind>=<url>"`, ADR-0041): for a
+    # `csrf_token`, the page the token was minted on (the observed `Referer`), so
+    # the slice-4 resolver can fetch a fresh token under the test's auth. Set by
+    # CODE alongside `replay_hazards`; like it, NOT part of the key_hash. Empty when
+    # no hint applies (nonce/timestamp need none; no observed Referer).
+    hazard_source_hints: tuple[str, ...] = ()
+
     # Object-storage key of the verbatim LLM request/response that produced this
     # proposal (ADR-0037 replayability). Set only for `mode == "llm"` proposals —
     # the service persists the audit, stamps the key here, and commits it onto the
