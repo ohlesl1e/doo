@@ -18,7 +18,7 @@ from pathlib import Path
 
 import typer
 
-from doo.dispatch.executor.dispatcher import RedisLeaseReader, StubOpaClient
+from doo.dispatch.executor.dispatcher import OpaClient, RedisLeaseReader, StubOpaClient
 from doo.dispatch.executor.send import HttpxSender
 from doo.dispatch.ledger import JsonFileDispatchLedger
 from doo.dispatch.models import DispatchSelection
@@ -30,6 +30,8 @@ from doo.infra.neo4j_driver import Neo4jClient
 from doo.infra.redis_lease import RedisLease
 from doo.observability.logging import configure_logging, get_logger
 from doo.setup.config import ArmingMode, EngagementConfig
+
+__all__ = ["dispatch_app", "StubOpaClient"]
 
 dispatch_app = typer.Typer(
     help="Dispatch: arm and drain a budget-bounded run over approved TestCases "
@@ -75,6 +77,51 @@ def _load_config(config_path: Path) -> EngagementConfig:
 
     raw = yaml.safe_load(config_path.read_text())
     return EngagementConfig.model_validate(raw)
+
+
+def _build_opa(
+    neo4j: Neo4jClient, engagement_id: EngagementId, *, environment: str, unsafe_stub: bool
+) -> OpaClient:
+    """Build the dispatcher's OPA client (ADR-0046).
+
+    Generates the bundle from the `Scope` node (so planner-side `is_in_scope` and
+    this gate cannot drift) and constructs an `OpaEvalClient`. If `opa` is not
+    on PATH and `--unsafe-stub-opa` was passed: warn loudly and fall back to the
+    always-allow stub — **staging only**; on `production` this combination is
+    refused (the dispatcher's OPA check is the correctness gate, CLAUDE.md).
+    """
+
+    from doo.policy.bundle import build_bundle
+    from doo.policy.opa_client import OpaEvalClient, OpaUnavailableError
+
+    overlay = os.environ.get("DOO_OPA_OVERLAY")
+    bundle = build_bundle(
+        neo4j,
+        engagement_id,
+        overlay_rego=Path(overlay) if overlay else None,
+    )
+    try:
+        return OpaEvalClient(bundle)
+    except OpaUnavailableError as exc:
+        if not unsafe_stub:
+            typer.secho(f"refused: {exc}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=4) from exc
+        if environment == "production":
+            typer.secho(
+                "refused: --unsafe-stub-opa is staging-only; the dispatcher's "
+                "OPA check is the correctness gate on production (ADR-0046)",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            raise typer.Exit(code=4) from exc
+        typer.secho(
+            "WARNING: `opa` not available; --unsafe-stub-opa active "
+            "(ALWAYS-ALLOW). Staging only.",
+            fg=typer.colors.YELLOW,
+            bold=True,
+            err=True,
+        )
+        return StubOpaClient(allow=True)
 
 
 def _build_body_store() -> object:
@@ -160,6 +207,12 @@ def run_cmd(
         "--arming",
         help="Override dispatch.arming (review|auto). auto refuses on production (ADR-0042).",
     ),
+    unsafe_stub_opa: bool = typer.Option(
+        False,
+        "--unsafe-stub-opa",
+        help="STAGING ONLY: fall back to an always-allow OPA stub when `opa` is "
+        "not on PATH. Refuses on production (ADR-0046).",
+    ),
     actor: str = typer.Option(
         os.environ.get("USER", "unknown"),
         "--actor",
@@ -214,12 +267,18 @@ def run_cmd(
             typer.secho("not armed; aborting.", fg=typer.colors.YELLOW, err=True)
             raise typer.Exit(code=0)
 
+    neo4j = _build_neo4j()
     deps = RunDependencies(
-        neo4j=_build_neo4j(),
+        neo4j=neo4j,
         lease=_build_lease(cfg.engagement.id),
-        # S1: stub OPA (always-allow). S2 swaps in the generated-from-Scope Rego
-        # client (ADR-0046). The gate sequence is unchanged.
-        opa=StubOpaClient(allow=True),
+        # ADR-0046: bundle generated from the `Scope` node + fixed Rego ruleset.
+        # The gate sequence (lease → OPA → budget → wire) is unchanged from S1.
+        opa=_build_opa(
+            neo4j,
+            cfg.engagement.id,
+            environment=cfg.environment,
+            unsafe_stub=unsafe_stub_opa,
+        ),
         sender=HttpxSender(),
         secrets=EnvSecretStore.from_config(cfg),
         bodies=_build_body_store(),  # type: ignore[arg-type]
