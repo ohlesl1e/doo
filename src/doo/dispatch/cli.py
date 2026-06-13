@@ -124,6 +124,44 @@ def _build_opa(
         return StubOpaClient(allow=True)
 
 
+def _build_interpreter() -> object | None:
+    """Build the multi-turn Interpreter caller (ADR-0043: native loop, litellm).
+
+    Same env vars as the Planner (`DOO_PLANNER_MODEL`, `DOO_PLANNER_API_BASE`,
+    `DOO_PLANNER_TEMPERATURE`) so one model id serves both. `DOO_NO_INTERPRETER=1`
+    disables it (S1/S2 behaviour: `primary` only, no verdict) — useful for a
+    smoke run before the model is configured.
+    """
+
+    if os.environ.get("DOO_NO_INTERPRETER"):
+        typer.secho(
+            "DOO_NO_INTERPRETER set: confirm loop disabled (primary-only run).",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+        return None
+
+    from doo.dispatch.interpreter.loop import LiteLLMMultiTurnCaller
+
+    model = os.environ.get("DOO_PLANNER_MODEL", "anthropic/claude-opus-4-8")
+    temperature_raw = os.environ.get("DOO_PLANNER_TEMPERATURE", "0.0").strip()
+    temperature: float | None
+    if temperature_raw == "" or temperature_raw.lower() == "none":
+        temperature = None
+    else:
+        try:
+            temperature = float(temperature_raw)
+        except ValueError:
+            temperature = 0.0
+    return LiteLLMMultiTurnCaller(
+        model,
+        temperature=temperature,
+        api_base=os.environ.get("DOO_PLANNER_API_BASE") or None,
+        api_key=os.environ.get("DOO_PLANNER_API_KEY") or None,
+        timeout_s=120.0,
+    )
+
+
 def _build_body_store() -> object:
     """Body store: MinIO `BlobClient` if configured, else drop bodies.
 
@@ -283,6 +321,7 @@ def run_cmd(
         secrets=EnvSecretStore.from_config(cfg),
         bodies=_build_body_store(),  # type: ignore[arg-type]
         ledger=_default_ledger(),
+        interpreter=_build_interpreter(),
     )
 
     result = execute_run(run, deps)
@@ -305,3 +344,98 @@ def run_cmd(
             )
 
     sys.exit(0)
+
+
+# ---------------------------------------------------------------------------
+# `doo finding review` (ADR-0045) — sibling of `doo planner review`.
+# ---------------------------------------------------------------------------
+
+finding_app = typer.Typer(
+    help="Finding lifecycle: review proposed Findings (slice 4, ADR-0045). "
+    "Only `confirmed` Findings feed reporting.",
+    no_args_is_help=True,
+)
+
+
+def _default_finding_ledger() -> object:
+    from doo.dispatch.finding import JsonFileFindingLedger
+
+    override = os.environ.get("DOO_FINDING_LEDGER_PATH")
+    if override:
+        return JsonFileFindingLedger(Path(override))
+    home = Path(os.path.expanduser("~"))
+    return JsonFileFindingLedger(home / ".doo" / "finding_ledger.json")
+
+
+@finding_app.command("review")
+def finding_review_cmd(
+    engagement: str = typer.Option(..., "--engagement", "-e"),
+    confirm: str | None = typer.Option(
+        None, "--confirm", help="Confirm one Finding by its finding_key (or 12-char prefix)."
+    ),
+    reject: str | None = typer.Option(
+        None, "--reject", help="Reject one Finding by its finding_key (or 12-char prefix)."
+    ),
+    reason: str | None = typer.Option(None, "--reason"),
+    actor: str = typer.Option(os.environ.get("USER", "unknown"), "--actor"),
+) -> None:
+    """List `proposed` Findings (with transcript link); confirm/reject one (ADR-0045)."""
+
+    from doo.dispatch.finding import list_proposed_findings, review_finding
+    from doo.ids import FindingId
+
+    configure_logging()
+    neo4j = _build_neo4j()
+    ledger = _default_finding_ledger()
+    eid = EngagementId(engagement)
+
+    proposed = list_proposed_findings(neo4j, eid)
+
+    if confirm or reject:
+        target = (confirm or reject or "").strip()
+        # Allow a 12-char prefix (the CLI prints prefixes).
+        match = next(
+            (f for f in proposed if f.finding_key == target or f.finding_key.startswith(target)),
+            None,
+        )
+        if match is None:
+            typer.secho(
+                f"no proposed Finding matching {target!r} in engagement {engagement!r}",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        decision = "confirm" if confirm else "reject"
+        event = review_finding(
+            neo4j,
+            ledger,  # type: ignore[arg-type]
+            engagement_id=eid,
+            finding_key=FindingId(match.finding_key),
+            decision=decision,  # type: ignore[arg-type]
+            actor=actor,
+            reason=reason,
+        )
+        typer.echo(
+            f"Finding {match.finding_key[:12]} [{match.category}/{match.severity}] "
+            f"{event.prior_status} → {event.new_status} by {actor}"
+        )
+        return
+
+    if not proposed:
+        typer.echo(f"no proposed Findings in engagement {engagement!r}")
+        return
+    typer.echo(f"{len(proposed)} proposed Finding(s) in engagement {engagement!r}:\n")
+    for f in proposed:
+        typer.echo(
+            f"  {f.finding_key[:12]}  [{f.severity:>8}] {f.category:<24} "
+            f"affects {f.affects}"
+        )
+        typer.echo(f"      {f.title}")
+        typer.echo(
+            f"      references {len(f.referenced_testcases)} TestCase(s); "
+            f"transcript: {f.transcript_key or '(not persisted)'}"
+        )
+    typer.echo(
+        "\nconfirm: doo finding review -e <eng> --confirm <key>\n"
+        "reject:  doo finding review -e <eng> --reject <key> --reason '…'"
+    )

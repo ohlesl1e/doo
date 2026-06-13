@@ -35,6 +35,14 @@ from doo.dispatch.executor.evidence import (
     load_evidence,
 )
 from doo.dispatch.executor.send import Sender
+from doo.dispatch.finding import commit_finding, persist_transcript, record_verdict
+from doo.dispatch.interpreter.loop import (
+    ConfirmLoopResult,
+    MultiTurnLLMCaller,
+    run_confirm_loop,
+)
+from doo.dispatch.interpreter.models import SendToolResult
+from doo.dispatch.interpreter.tools import ToolContext
 from doo.dispatch.ledger import DispatchLedger, record_armed, record_outcome
 from doo.dispatch.models import (
     DispatchRun,
@@ -78,6 +86,9 @@ class RunDependencies:
     secrets: SecretStore
     bodies: BodyStore
     ledger: DispatchLedger
+    # The Interpreter's multi-turn caller (S3). `None` → no Interpreter (S1/S2
+    # behaviour: `primary` only). Tests inject a `FakeMultiTurnCaller`.
+    interpreter: MultiTurnLLMCaller | None = None
     evidence_loader: object = None  # Callable | None; defaults to graph-backed.
 
 
@@ -325,6 +336,29 @@ def _execute_one(
         _SendRecord(role="primary", status=result.dispatch_status, observation_id=obs_id)
     )
 
+    # --- Interpreter confirm loop (S3, ADR-0042/0045). Runs only on
+    # `dispatch_status = ok` (the bytes reached the test path) and when an
+    # Interpreter caller is wired. The `primary` result is pre-loaded into the
+    # tool context (ADR-0043: pre-send always-useful roles); every additional
+    # send the loop makes goes through the SAME `dispatcher` instance, so the
+    # run-wide budget + lease + OPA gate apply identically. ---
+    if deps.interpreter is not None and result.dispatch_status == "ok":
+        loop = _run_interpreter(
+            tc,
+            run=run,
+            deps=deps,
+            dispatcher=dispatcher,
+            evidence=evidence,
+            attacker_material=material,
+            primary_obs_id=obs_id,
+            primary_response=result.response,
+            now=now,
+        )
+        sends.extend(
+            _SendRecord(role=r, status=s, observation_id=o)
+            for (r, s, o) in loop
+        )
+
     return _outcome(
         tc,
         run,
@@ -333,6 +367,112 @@ def _execute_one(
         sends=tuple((s.role, s.status, s.observation_id) for s in sends),
         now=now,
     )
+
+
+def _run_interpreter(
+    tc: DispatchTestCase,
+    *,
+    run: DispatchRun,
+    deps: RunDependencies,
+    dispatcher: Dispatcher,
+    evidence: EvidenceObservation,
+    attacker_material: object,
+    primary_obs_id: ObservationId,
+    primary_response: object,
+    now: datetime,
+) -> list[tuple[RequestRole, DispatchStatus, ObservationId | None]]:
+    """Drive the confirm loop for one TestCase; record verdict (+ Finding on vulnerable).
+
+    Returns the additional `(role, status, obs_id)` sends the loop made (for the
+    `RunOutcome.sends` record). The full transcript is persisted to blobs keyed
+    by `(run_id, key_hash)` (ADR-0045 replayability).
+    """
+
+    ctx = ToolContext(
+        run=run,
+        neo4j=deps.neo4j,
+        dispatcher=dispatcher,
+        secrets=deps.secrets,
+        bodies=deps.bodies,
+        testcase=tc,
+        evidence=evidence,
+        attacker_material=attacker_material,  # type: ignore[arg-type]
+    )
+    # Pre-load the `primary` result so the Interpreter sees it on turn 1
+    # (ADR-0043). The body is cached under `role:primary` for `read_response_body`.
+    body_ref = None
+    http_status = None
+    size = 0
+    if primary_response is not None:
+        http_status = primary_response.status  # type: ignore[attr-defined]
+        body = primary_response.body  # type: ignore[attr-defined]
+        size = len(body)
+        if body:
+            body_ref = "role:primary"
+            ctx.bodies_by_ref[body_ref] = body
+    ctx.sent_roles["primary"] = SendToolResult(
+        role="primary",
+        dispatch_status="ok",
+        http_status=http_status,
+        response_size=size,
+        observation_id=primary_obs_id,
+        body_ref=body_ref,
+    )
+    ctx.observation_ids.append(primary_obs_id)
+
+    loop_result: ConfirmLoopResult = run_confirm_loop(
+        ctx,
+        deps.interpreter,  # type: ignore[arg-type]
+        max_tool_calls=run.budget.max_tool_calls,
+        expected_outcome="(see TestCase justification)",
+    )
+
+    transcript_key = persist_transcript(
+        deps.bodies,
+        engagement_id=run.engagement_id,
+        run_id=run.run_id,
+        key_hash=tc.key_hash,
+        transcript=loop_result.transcript,
+        verdict=loop_result.verdict,
+    )
+
+    record_verdict(
+        deps.neo4j,
+        engagement_id=run.engagement_id,
+        key_hash=tc.key_hash,
+        verdict=loop_result.verdict,
+        run_id=run.run_id,
+        transcript_key=transcript_key,
+        now=now,
+    )
+
+    if loop_result.verdict.verdict == "vulnerable":
+        commit_finding(
+            deps.neo4j,
+            engagement_id=run.engagement_id,
+            testcase=tc,
+            verdict=loop_result.verdict,
+            run_id=run.run_id,
+            transcript_key=transcript_key,
+            now=now,
+        )
+
+    log.info(
+        "interpreter.loop.complete",
+        engagement_id=run.engagement_id,
+        run_id=run.run_id,
+        key_hash=tc.key_hash,
+        verdict=loop_result.verdict.verdict,
+        tool_calls_used=loop_result.tool_calls_used,
+        terminated_by=loop_result.terminated_by,
+    )
+
+    # The loop's additional sends (excluding the pre-loaded `primary`).
+    return [
+        (r.role, r.dispatch_status, r.observation_id)  # type: ignore[misc]
+        for role, r in ctx.sent_roles.items()
+        if role != "primary"
+    ]
 
 
 def _outcome(

@@ -143,6 +143,124 @@ def idor_primary(
 
 
 # ---------------------------------------------------------------------------
+# (idor, baseline_victim): the same held object under the OWNER'S auth.
+# ---------------------------------------------------------------------------
+
+
+def idor_baseline_victim(
+    testcase: DispatchTestCase,
+    evidence: EvidenceObservation,
+    auth: AuthMaterial,
+) -> ConcreteRequest:
+    """The IDOR `baseline_victim`: the victim's request under the **victim's** auth.
+
+    The control the Interpreter diffs the `primary` against (ADR-0043): a
+    generic-200 that returns the same body for everyone is NOT an IDOR. `auth`
+    here is the **victim's** material (the evidence's `victim_auth_context_id`,
+    not the TestCase's attacker `auth_context_id`); the run driver looks it up
+    and passes it. This send is *not* a new TestCase (a control, not a
+    hypothesis) but it IS a real send through the Dispatcher under the victim's
+    auth — so `AuthContext` rotation (ADR-0014) and rate limits apply.
+    """
+
+    path, query = _apply_hold(evidence=evidence, hold=testcase.hold)
+    headers, cookies = _splice_auth(
+        headers=evidence.headers,
+        cookies=evidence.cookies,
+        material=auth,
+        session_cookie_name=None,
+    )
+    # The send is OBSERVED_UNDER the victim's AuthContext, not the TestCase's.
+    victim_ac = evidence.victim_auth_context_id or testcase.auth_context_id
+    return ConcreteRequest(
+        method=evidence.method,
+        host=evidence.host,
+        path=path,
+        path_template=evidence.path_template,
+        query=tuple(sorted(query.items())),
+        headers=tuple(sorted(headers.items())),
+        cookies=tuple(sorted(cookies.items())),
+        body=None,
+        body_content_type=evidence.body_content_type,
+        auth_context_id=victim_ac,
+    )
+
+
+# ---------------------------------------------------------------------------
+# (idor, baseline_negative): held identifier swapped to a known-nonexistent value.
+# ---------------------------------------------------------------------------
+
+# A reserved, structurally-valid identifier that no real target should have
+# minted (cuid-shaped, kebab-prefixed). The Interpreter compares the `primary`
+# against this to rule out "any id 200s" — if even a nonexistent id returns the
+# same body, the `primary`'s 200 proves nothing.
+_NONEXISTENT_SENTINEL = "doo-nonexistent-000000000000"
+
+
+def idor_baseline_negative(
+    testcase: DispatchTestCase,
+    evidence: EvidenceObservation,
+    auth: AuthMaterial,
+) -> ConcreteRequest:
+    """The IDOR `baseline_negative`: held id → known-nonexistent, attacker's auth.
+
+    Rules out "any id 200s" (ADR-0043). The held identifier in the path / query
+    is swapped to a sentinel no real target should have; everything else
+    (including the attacker auth, since we're testing the *attacker's* view of a
+    nonexistent resource) matches the `primary`.
+    """
+
+    # Swap each held param: in the path, replace the segment that matches the
+    # evidence's concrete value at the `{param}` position; in the query, replace
+    # the named key. `hold` carries human-readable labels (slice-3); for S3 we
+    # swap the **first variable path segment** (the `{…}` template position) and
+    # any query key whose name appears in `hold`.
+    path = _swap_path_variable(
+        evidence.concrete_path, evidence.path_template, _NONEXISTENT_SENTINEL
+    )
+    query = {
+        k: (_NONEXISTENT_SENTINEL if k in set(testcase.hold) else v)
+        for k, v in evidence.query.items()
+    }
+    headers, cookies = _splice_auth(
+        headers=evidence.headers,
+        cookies=evidence.cookies,
+        material=auth,
+        session_cookie_name=None,
+    )
+    return ConcreteRequest(
+        method=evidence.method,
+        host=evidence.host,
+        path=path,
+        path_template=evidence.path_template,
+        query=tuple(sorted(query.items())),
+        headers=tuple(sorted(headers.items())),
+        cookies=tuple(sorted(cookies.items())),
+        body=None,
+        body_content_type=evidence.body_content_type,
+        auth_context_id=testcase.auth_context_id,
+    )
+
+
+def _swap_path_variable(concrete: str, template: str, replacement: str) -> str:
+    """Replace each `{…}`-template segment's concrete value with `replacement`.
+
+    `/orders/{order_id}` × `/orders/123` → `/orders/<replacement>`. Segments
+    where the template is literal stay verbatim. When the template has no
+    `{…}` segment, the concrete path is returned unchanged (a query-param IDOR
+    handles the swap via `query` instead).
+    """
+
+    c_segs = [s for s in concrete.split("/") if s != ""]
+    t_segs = [s for s in template.split("/") if s != ""]
+    out: list[str] = []
+    for i, cs in enumerate(c_segs):
+        ts = t_segs[i] if i < len(t_segs) else cs
+        out.append(replacement if ts.startswith("{") and ts.endswith("}") else cs)
+    return "/" + "/".join(out)
+
+
+# ---------------------------------------------------------------------------
 # Registry.
 # ---------------------------------------------------------------------------
 
@@ -155,6 +273,8 @@ class _Key:
 
 _REGISTRY: dict[_Key, Constructor] = {
     _Key("idor", "primary"): idor_primary,
+    _Key("idor", "baseline_victim"): idor_baseline_victim,
+    _Key("idor", "baseline_negative"): idor_baseline_negative,
 }
 
 

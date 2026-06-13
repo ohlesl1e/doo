@@ -124,9 +124,12 @@ def schema_statements() -> tuple[SchemaStatement, ...]:
         "TrustBoundary": ("engagement_id", "kind", "between_a_id", "between_b_id"),
         "Asset": ("engagement_id", "kind", "normalized_value"),
         "ObservedValue": ("engagement_id", "value_hash"),
-        # Slice-4 hedge: TestCase and Finding.
+        # Slice-4 hedge: TestCase and Finding. Finding identity is the soft
+        # content-addressed `finding_key` (ADR-0045) — `(engagement_id,
+        # finding_key)` unique-indexed so two TestCases proving the same
+        # `(category, affected)` converge on one Finding via MERGE.
         "TestCase": ("engagement_id", "key_hash"),
-        "Finding": ("engagement_id", "id"),
+        "Finding": ("engagement_id", "finding_key"),
     }
 
     for label, props in scoped_identity.items():

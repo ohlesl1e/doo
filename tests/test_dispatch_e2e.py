@@ -27,6 +27,12 @@ import redis
 from doo.canonical.identity import auth_context_id, compute_auth_hash
 from doo.dispatch.executor.dispatcher import RedisLeaseReader, StubOpaClient
 from doo.dispatch.executor.send import HttpResponse, StubSender
+from doo.dispatch.finding import (
+    InMemoryFindingLedger,
+    list_proposed_findings,
+    review_finding,
+)
+from doo.dispatch.interpreter.loop import FakeMultiTurnCaller
 from doo.dispatch.ledger import InMemoryDispatchLedger
 from doo.dispatch.models import DispatchSelection
 from doo.dispatch.ontology import NoopBodyStore
@@ -326,6 +332,97 @@ def test_dispatch_spine_e2e(
     persisted_headers = obs_rows[0]["headers"]
     assert any(h.startswith("Authorization=") for h in persisted_headers)
     assert ATTACKER_TOKEN not in " ".join(persisted_headers)
+
+    # === S3: arm a SECOND run with a fake Interpreter (ADR-0045). ===
+    # Scripted: read primary body → emit_verdict(vulnerable). Assert the verdict
+    # lands on the TestCase (4th axis) and a `Finding@proposed` is committed with
+    # `REFERENCES → TestCase` + `AFFECTS → Endpoint`.
+    fake_interpreter = FakeMultiTurnCaller(
+        script=[
+            [("read_response_body", {"body_ref": "role:primary"})],
+            [
+                (
+                    "emit_verdict",
+                    {
+                        "verdict": "vulnerable",
+                        "justification": "primary 200 returned victim's order under attacker auth",
+                        "observed_vs_expected": "200 with owner=victim; expected boundary to deny",
+                        "evidence_refs": [],
+                        "proposed_severity": "high",
+                        "vuln_category": "idor",
+                        "affected_refs": ["TARGET"],
+                    },
+                )
+            ],
+        ]
+    )
+    run3 = arm_run(
+        config=engagement_config,
+        selection=DispatchSelection(test_classes=("idor",), limit=1),
+        actor="e2e-tester",
+    )
+    deps3 = RunDependencies(
+        neo4j=neo4j_client,
+        lease=RedisLeaseReader(lease=lease),
+        opa=StubOpaClient(allow=True),
+        sender=StubSender(
+            response=HttpResponse(status=200, body=b'{"order_id":123,"owner":"victim"}')
+        ),
+        secrets=secrets,
+        bodies=NoopBodyStore(),
+        ledger=ledger,
+        interpreter=fake_interpreter,
+    )
+    result3 = execute_run(run3, deps3)
+    assert result3.outcomes[0].outcome == "executed"
+
+    # 4th-axis verdict on the TestCase node.
+    vrows = neo4j_client.execute_read(
+        """
+        MATCH (t:TestCase {engagement_id: $eid, key_hash: $kh})
+        RETURN t.interpreter_verdict AS v, t.interpreter_run_id AS rid
+        """,
+        eid=ENG,
+        kh=key_hash,
+    )
+    assert vrows[0]["v"] == "vulnerable"
+    assert vrows[0]["rid"] == run3.run_id
+
+    # `Finding@proposed` with `REFERENCES → TestCase` + `AFFECTS → Endpoint`.
+    frows = neo4j_client.execute_read(
+        """
+        MATCH (f:Finding {engagement_id: $eid})-[:REFERENCES]->
+              (t:TestCase {key_hash: $kh})
+        OPTIONAL MATCH (f)-[:AFFECTS]->(a)
+        RETURN f.finding_key AS fk, f.finding_status AS status,
+               f.disclosure_status AS disc, f.category AS cat, f.source AS src,
+               labels(a) AS affects_labels
+        """,
+        eid=ENG,
+        kh=key_hash,
+    )
+    assert len(frows) == 1
+    assert frows[0]["status"] == "proposed"
+    assert frows[0]["disc"] == "unreported"
+    assert frows[0]["cat"] == "idor"
+    assert frows[0]["src"] == "llm-interpreter"
+    assert "Endpoint" in (frows[0]["affects_labels"] or [])
+    finding_key = frows[0]["fk"]
+
+    # `doo finding review` flow: list → confirm → ledger row + denormalised status.
+    proposed = list_proposed_findings(neo4j_client, EngagementId(ENG))
+    assert len(proposed) == 1 and proposed[0].finding_key == finding_key
+    fledger = InMemoryFindingLedger()
+    ev = review_finding(
+        neo4j_client,
+        fledger,
+        engagement_id=EngagementId(ENG),
+        finding_key=finding_key,
+        decision="confirm",
+        actor="e2e-tester",
+    )
+    assert ev.prior_status == "proposed" and ev.new_status == "confirmed"
+    assert len(fledger.events) == 1
 
     # --- kill the lease → next send is `dispatcher_blocked('kill_switch')`. ---
     lease.release()
