@@ -64,7 +64,7 @@ class NoopBodyStore:
 
     def put_body(
         self, engagement_id: EngagementId, *, raw: bytes, content_type: str
-    ) -> BlobRef | None:  # type: ignore[override]
+    ) -> BlobRef | None:
         return None
 
 

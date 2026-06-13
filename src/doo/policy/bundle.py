@@ -125,7 +125,7 @@ def load_scope_for_engagement(
             f"(got {env!r}); re-run `doo engagement start` with the slice-4 "
             "config (ADR-0042)"
         )
-    return scope, env  # type: ignore[return-value]
+    return scope, env
 
 
 def build_bundle(

@@ -10,8 +10,10 @@ the `primary` (no side channel, ADR-0046).
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import cast
 
 from doo.dispatch.executor.constructors import ConstructorMissingError, constructor_for
 from doo.dispatch.executor.dispatcher import Dispatcher
@@ -20,11 +22,16 @@ from doo.dispatch.interpreter.models import SendToolResult
 from doo.dispatch.models import ROLES_BY_TEST_CLASS, DispatchRun, RequestRole
 from doo.dispatch.ontology import BodyStore, commit_agent_send
 from doo.dispatch.secrets import AuthMaterial, SecretStore
+from doo.events.slice4 import TestClass
 from doo.ids import ObservationId, TestCaseKeyHash
 from doo.infra.neo4j_driver import Neo4jClient
 from doo.observability.logging import get_logger
 
 log = get_logger(__name__)
+
+# Default role set for a test class not in `ROLES_BY_TEST_CLASS` — typed so the
+# `dict.get` default matches the value type (`tuple[RequestRole, ...]`).
+_PRIMARY_ONLY: tuple[RequestRole, ...] = ("primary",)
 
 
 @dataclass
@@ -52,7 +59,11 @@ class ToolContext:
     observation_ids: list[ObservationId] = field(default_factory=list)
 
     def allowed_roles(self) -> tuple[RequestRole, ...]:
-        return ROLES_BY_TEST_CLASS.get(self.testcase.test_class, ("primary",))  # type: ignore[arg-type]
+        # `DispatchTestCase.test_class` is a `str` (read from the graph); by
+        # construction it is a committed `TestClass`, so narrow it for the lookup.
+        return ROLES_BY_TEST_CLASS.get(
+            cast(TestClass, self.testcase.test_class), _PRIMARY_ONLY
+        )
 
 
 class ToolError(Exception):
@@ -79,7 +90,7 @@ def send_http_request_within_scope(ctx: ToolContext, *, role: str) -> SendToolRe
             f"role {role!r} is not in this test_class={ctx.testcase.test_class!r}'s "
             f"role set {list(ctx.allowed_roles())!r} (ADR-0043 confirm-mode boundary)"
         )
-    typed_role: RequestRole = role  # type: ignore[assignment]
+    typed_role: RequestRole = role
 
     if typed_role in ctx.sent_roles:
         # Idempotent: a re-ask returns the prior result, no extra wire send.
@@ -189,8 +200,9 @@ def read_response_body(ctx: ToolContext, *, body_ref: str) -> str:
     return body.decode("utf-8", errors="replace")
 
 
-# Tool name → implementation (the dispatch table the loop reads).
-TOOL_IMPLS = {
+# Tool name → implementation (the dispatch table the loop reads). The two tools
+# have different signatures, so the value type is the generic callable.
+TOOL_IMPLS: dict[str, Callable[..., object]] = {
     "send_http_request_within_scope": send_http_request_within_scope,
     "read_response_body": read_response_body,
 }

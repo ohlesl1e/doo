@@ -15,8 +15,12 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import typer
+
+if TYPE_CHECKING:
+    from doo.dispatch.interpreter.loop import MultiTurnLLMCaller
 
 from doo.dispatch.executor.dispatcher import OpaClient, RedisLeaseReader, StubOpaClient
 from doo.dispatch.executor.send import HttpxSender
@@ -124,7 +128,7 @@ def _build_opa(
         return StubOpaClient(allow=True)
 
 
-def _build_interpreter() -> object | None:
+def _build_interpreter() -> MultiTurnLLMCaller | None:
     """Build the multi-turn Interpreter caller (ADR-0043: native loop, litellm).
 
     Same env vars as the Planner (`DOO_PLANNER_MODEL`, `DOO_PLANNER_API_BASE`,
