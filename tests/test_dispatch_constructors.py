@@ -13,6 +13,7 @@ import pytest
 from doo.canonical.value_objects import HostRef
 from doo.dispatch.executor.constructors import (
     ConstructorMissingError,
+    authbypass_primary,
     constructor_for,
     has_constructor,
     idor_primary,
@@ -133,3 +134,37 @@ def test_constructor_is_pure() -> None:
     a = idor_primary(tc, ev, mat)
     b = idor_primary(tc, ev, mat)
     assert a == b
+
+
+# --- S7: all MVP authz classes registered (ADR-0043). ---
+
+
+@pytest.mark.parametrize(
+    ("test_class", "roles"),
+    [
+        ("bola", ("primary", "baseline_victim", "baseline_negative")),
+        ("auth-bypass", ("primary", "baseline_victim")),
+        ("privilege-escalation", ("primary", "baseline_victim")),
+        ("boundary-violation", ("primary", "baseline_victim")),
+    ],
+)
+def test_authz_classes_have_constructors(test_class: str, roles: tuple[str, ...]) -> None:
+    for role in roles:
+        assert has_constructor(test_class, role), f"{test_class}/{role}"
+        assert constructor_for(test_class, role) is not None
+
+
+def test_authbypass_primary_strips_all_credentials() -> None:
+    """`(auth-bypass, primary)`: anonymous replay — no auth header, no cookies."""
+    material = AuthMaterial(kind="bearer", raw="ATTACKER", principal_label="user-b")
+    ev = _evidence(
+        headers={"Authorization": "Bearer victim-token", "Accept": "application/json"},
+        cookies={"session": "victim-sess"},
+    )
+    req = authbypass_primary(_testcase(test_class="auth-bypass"), ev, material)
+    headers = dict(req.headers)
+    assert "Authorization" not in headers  # no credential at all
+    assert "ATTACKER" not in str(req.headers)  # attacker material NOT spliced
+    assert req.cookies == ()  # session cookie dropped
+    assert headers.get("Accept") == "application/json"  # non-auth header kept
+    assert req.auth_context_id == "ac-attacker"  # provenance still the TC's context

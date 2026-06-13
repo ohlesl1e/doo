@@ -522,11 +522,13 @@ def persist_transcript(
     (the verdict + justification still land on the TestCase node).
     """
 
+    from doo.dispatch.interpreter.loop import INTERPRETER_PROMPT_VERSION
+
     body = {
         "engagement_id": engagement_id,
         "run_id": run_id,
         "key_hash": key_hash,
-        "prompt_version": "interpreter-confirm/1",
+        "prompt_version": INTERPRETER_PROMPT_VERSION,
         "transcript": list(transcript),
         "verdict": verdict.model_dump(mode="json"),
     }

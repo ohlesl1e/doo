@@ -242,6 +242,42 @@ def idor_baseline_negative(
     )
 
 
+# ---------------------------------------------------------------------------
+# (auth-bypass, primary): the victim's request with NO credential at all.
+# ---------------------------------------------------------------------------
+
+
+def authbypass_primary(
+    testcase: DispatchTestCase,
+    evidence: EvidenceObservation,
+    auth: AuthMaterial,
+) -> ConcreteRequest:
+    """The auth-bypass `primary`: replay the victim's request ANONYMOUSLY (ADR-0043).
+
+    Tests whether the endpoint is reachable with no authentication at all: every
+    auth-carrying header is stripped and NO material is spliced (the `auth`
+    argument is ignored on purpose); cookies — which carry the session — are
+    dropped wholesale. The send is still attributed to the TestCase's
+    `auth_context_id` for the `EXECUTED_AS` edge (provenance), even though the wire
+    request carries no credential.
+    """
+
+    path, query = _apply_hold(evidence=evidence, hold=testcase.hold)
+    headers = {k: v for k, v in evidence.headers.items() if k.lower() not in _AUTH_HEADERS}
+    return ConcreteRequest(
+        method=evidence.method,
+        host=evidence.host,
+        path=path,
+        path_template=evidence.path_template,
+        query=tuple(sorted(query.items())),
+        headers=tuple(sorted(headers.items())),
+        cookies=(),  # drop the session cookie(s) — anonymous send.
+        body=None,
+        body_content_type=evidence.body_content_type,
+        auth_context_id=testcase.auth_context_id,
+    )
+
+
 def _swap_path_variable(concrete: str, template: str, replacement: str) -> str:
     """Replace each `{…}`-template segment's concrete value with `replacement`.
 
@@ -271,10 +307,26 @@ class _Key:
     role: RequestRole
 
 
+# The authz classes are all evidence-replays under a swapped identity (ADR-0043):
+# `primary` replays under the attacker's auth, `baseline_victim` under the
+# victim's, `baseline_negative` swaps the held id to a nonexistent sentinel. They
+# share the idor constructors; only `auth-bypass primary` differs (strips all
+# auth). `boundary-violation` resolves its evidence via the TrustBoundary's
+# `DERIVED_FROM` chain — handled upstream by `load_evidence`, so the constructor is
+# identical (ADR-0039).
 _REGISTRY: dict[_Key, Constructor] = {
     _Key("idor", "primary"): idor_primary,
     _Key("idor", "baseline_victim"): idor_baseline_victim,
     _Key("idor", "baseline_negative"): idor_baseline_negative,
+    _Key("bola", "primary"): idor_primary,
+    _Key("bola", "baseline_victim"): idor_baseline_victim,
+    _Key("bola", "baseline_negative"): idor_baseline_negative,
+    _Key("privilege-escalation", "primary"): idor_primary,
+    _Key("privilege-escalation", "baseline_victim"): idor_baseline_victim,
+    _Key("boundary-violation", "primary"): idor_primary,
+    _Key("boundary-violation", "baseline_victim"): idor_baseline_victim,
+    _Key("auth-bypass", "primary"): authbypass_primary,
+    _Key("auth-bypass", "baseline_victim"): idor_baseline_victim,
 }
 
 

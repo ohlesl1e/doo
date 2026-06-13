@@ -37,8 +37,48 @@ from doo.observability.logging import get_logger
 log = get_logger(__name__)
 
 # Prompt/algorithm version stamped on the persisted transcript (ADR-0005); bump
-# when the system prompt or tool schemas change.
-INTERPRETER_PROMPT_VERSION = "interpreter-confirm/1"
+# when the system prompt or tool schemas change. /2 adds per-test_class guidance.
+INTERPRETER_PROMPT_VERSION = "interpreter-confirm/2"
+
+# Per-`test_class` guidance appended to the base prompt (S7/#92). Mirrors the
+# Planner's per-kind prompt selection: the deciding question differs by class.
+_CLASS_GUIDANCE: dict[str, str] = {
+    "idor": (
+        "\n\nTHIS CLASS — IDOR: the attacker requested another user's object by id. "
+        "Vulnerable = the attacker's `primary` returns the VICTIM's object "
+        "(compare `baseline_victim`); rule out a generic-200 with `baseline_negative`."
+    ),
+    "bola": (
+        "\n\nTHIS CLASS — BOLA (broken object-level authz): like IDOR but the "
+        "object is a collection/sub-resource. Vulnerable = the attacker reads/acts "
+        "on an object owned by another tenant/user. Diff `baseline_victim`; "
+        "`baseline_negative` rules out 'any id works'."
+    ),
+    "auth-bypass": (
+        "\n\nTHIS CLASS — AUTH-BYPASS: the `primary` was sent with NO credential. "
+        "Vulnerable = an endpoint that should require auth served a 2xx anonymously "
+        "(compare `baseline_victim`, the same request WITH the owner's auth — it "
+        "should differ only by identity, not by gate)."
+    ),
+    "privilege-escalation": (
+        "\n\nTHIS CLASS — PRIVILEGE-ESCALATION: a lower-tier principal hit a "
+        "higher-privilege action. Vulnerable = the low-tier `primary` succeeded "
+        "where only the privileged `baseline_victim` should."
+    ),
+    "boundary-violation": (
+        "\n\nTHIS CLASS — BOUNDARY-VIOLATION: the test crosses a declared "
+        "TrustBoundary (capability/tenant, ADR-0039). Vulnerable = the attacker "
+        "side reached what only the stronger/other side should; `baseline_victim` "
+        "is that authorized side."
+    ),
+}
+
+
+def system_prompt_for(test_class: str) -> str:
+    """The Interpreter system prompt for a `test_class` (base + per-class clause)."""
+
+    return SYSTEM_PROMPT + _CLASS_GUIDANCE.get(test_class, "")
+
 
 SYSTEM_PROMPT = (
     "You are the INTERPRETER for one approved security test case. The test has "
@@ -222,7 +262,7 @@ def run_confirm_loop(
 
     tools = interpreter_tools(ctx.testcase.test_class)  # type: ignore[arg-type]
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt_for(ctx.testcase.test_class)},
         {
             "role": "user",
             "content": json.dumps(

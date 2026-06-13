@@ -17,8 +17,17 @@ import os
 
 import typer
 
-from doo.coverage.models import C1Result, C2bResult, C2Result, C3Result, C4Result
-from doo.coverage.queries import run_c1, run_c2, run_c2b, run_c3, run_c4
+from doo.coverage.models import C1Result, C2bResult, C2Result, C3Result, C4Result, C5Result
+from doo.coverage.queries import (
+    run_c1,
+    run_c2,
+    run_c2b,
+    run_c3,
+    run_c4,
+    run_c5,
+    run_c5a,
+    run_c5b,
+)
 from doo.ids import EngagementId
 from doo.infra.neo4j_driver import Neo4jClient
 
@@ -368,3 +377,77 @@ def c4(
         typer.echo(_json.dumps([r.model_dump(mode="json") for r in rows], indent=2))
     else:
         _render_c4_table(rows)
+
+
+def _render_c5_table(rows: list[C5Result], *, query_id: str) -> None:
+    label = {
+        "C5": "boundaries not tested-to-verdict",
+        "C5a": "boundaries with no proposed TestCase",
+        "C5b": "boundaries with no approved TestCase",
+    }[query_id]
+    if not rows:
+        typer.echo(f"{query_id}: no gaps ({label}: none).")
+        return
+    typer.echo(f"{query_id} — {label}: {len(rows)}")
+    typer.echo(f"{'KIND':<12} {'BOUNDARY':<22} {'BETWEEN':<40} {'CONF':>6}")
+    for r in rows:
+        between = f"{r.between_a_id[:18]} | {r.between_b_id[:18]}"
+        typer.echo(
+            f"{r.kind:<12} {r.boundary_id[:22]:<22} {between:<40} "
+            f"{r.effective_confidence:>6.3f}"
+        )
+
+
+def _coverage_c5(
+    query_id: str, engagement: str, min_confidence: float, as_json: bool
+) -> None:
+    from doo.observability.ids import new_span_id, new_trace_id
+    from doo.observability.logging import bind_correlation, configure_logging
+
+    configure_logging()
+    bind_correlation(trace_id=new_trace_id(), span_id=new_span_id())
+    runner = {"C5": run_c5, "C5a": run_c5a, "C5b": run_c5b}[query_id]
+    client = _build_client()
+    try:
+        rows = runner(client, EngagementId(engagement), min_confidence=min_confidence)
+    finally:
+        client.close()
+    if as_json:
+        import json as _json
+
+        typer.echo(_json.dumps([r.model_dump(mode="json") for r in rows], indent=2))
+    else:
+        _render_c5_table(rows, query_id=query_id)
+
+
+@coverage_app.command("c5")
+def c5(
+    engagement: str = typer.Option(..., "--engagement", "-e", help="Engagement id."),
+    min_confidence: float = typer.Option(0.0, "--min-confidence"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """C5: TrustBoundaries with no TestCase executed to an Interpreter verdict (ADR-0047)."""
+
+    _coverage_c5("C5", engagement, min_confidence, as_json)
+
+
+@coverage_app.command("c5a")
+def c5a(
+    engagement: str = typer.Option(..., "--engagement", "-e", help="Engagement id."),
+    min_confidence: float = typer.Option(0.0, "--min-confidence"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """C5a: TrustBoundaries with no *proposed* TestCase (the Planner skipped them)."""
+
+    _coverage_c5("C5a", engagement, min_confidence, as_json)
+
+
+@coverage_app.command("c5b")
+def c5b(
+    engagement: str = typer.Option(..., "--engagement", "-e", help="Engagement id."),
+    min_confidence: float = typer.Option(0.0, "--min-confidence"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """C5b: TrustBoundaries with no *approved* TestCase (nothing armed-able)."""
+
+    _coverage_c5("C5b", engagement, min_confidence, as_json)
