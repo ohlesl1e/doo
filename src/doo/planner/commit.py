@@ -49,6 +49,9 @@ _SOURCE_BY_GENERATOR = {"c1": "deterministic-c1"}
 # proposing *mode*, not the generator id, is what distinguishes an LLM contribution
 # from a deterministic one (CLAUDE.md: `source: "llm-<task>"`).
 LLM_PLANNER_SOURCE = "llm-planner"
+# The Interpreter's follow-up proposals commit a distinct source (ADR-0045/S8) so
+# provenance separates them from the Planner's, though they share this path.
+LLM_INTERPRETER_SOURCE = "llm-interpreter"
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +128,7 @@ def commit_testcase(
     vtc: ValidatedTestCase,
     *,
     now: datetime | None = None,
+    code_version: str | None = None,
 ) -> CommitOutcome:
     """Idempotently commit a validated `TestCase` at `review_status = proposed`.
 
@@ -221,7 +225,7 @@ def commit_testcase(
         llm_audit_key=vtc.llm_audit_key,
         confidence=VALIDATED_CONFIDENCE,
         now=run_at,
-        code_version=__version__,
+        code_version=code_version or __version__,
         target_id=target_id,
     )
     # The target MATCH is guaranteed to succeed: the validator resolved the target
@@ -256,7 +260,7 @@ def source_for(generator: str, mode: str) -> str:
     """
 
     if mode == "llm":
-        return LLM_PLANNER_SOURCE
+        return LLM_INTERPRETER_SOURCE if generator == "interpreter" else LLM_PLANNER_SOURCE
     return source_for_generator(generator)
 
 

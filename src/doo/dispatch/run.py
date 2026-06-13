@@ -56,6 +56,7 @@ from doo.dispatch.interpreter.loop import (
     MultiTurnLLMCaller,
     run_confirm_loop,
 )
+from doo.dispatch.interpreter.mode import select_interpreter_mode
 from doo.dispatch.interpreter.models import SendToolResult
 from doo.dispatch.interpreter.tools import ToolContext
 from doo.dispatch.ledger import (
@@ -599,6 +600,19 @@ def _run_interpreter(
             verdict=loop_result.verdict,
             run_id=run.run_id,
             transcript_key=transcript_key,
+            now=now,
+        )
+
+    # Follow-ups → the InterpreterMode strategy (ADR-0042/0045/S8). `confirm`
+    # re-validates + commits them at `review_status=proposed` (source
+    # `llm-interpreter`); `freelance` raises (unimplemented seam). Never in-run.
+    if loop_result.verdict.follow_ups:
+        select_interpreter_mode(run.interpreter).handle_follow_ups(
+            loop_result.verdict.follow_ups,
+            neo4j=deps.neo4j,
+            engagement_id=run.engagement_id,
+            auth_context_id=tc.auth_context_id,
+            default_target_endpoint_id=tc.target_endpoint_id,
             now=now,
         )
 

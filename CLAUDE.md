@@ -32,7 +32,7 @@ Plus cross-cutting observability/audit via OpenTelemetry.
 1. ✅ **shipped** — Ingestion + graph (Burp/HAR → Neo4j).
 2. ✅ **shipped** — Coverage analysis (deterministic queries C1/C2/C2b/C3/C4 — ~60% of value, ~10% of risk).
 3. ✅ **shipped** — LLM-assisted hypothesis generation: the Planner (proposes + validates + human-reviews; nothing dispatched). `TrustBoundary` inference + C4 + sink_params landed here.
-4. ⬅ **next** — Bounded agent execution: Executor + Interpreter; adds `EXECUTED_AS` / `dispatch_status` + C5 + reporting.
+4. ✅ **shipped** — Bounded agent execution: Executor + Interpreter; adds `EXECUTED_AS` / `dispatch_status` (incl. ADR-0044 liveness disambiguation), replay-hazard resolution, the auth-helper rotation sibling, C5/C5a/C5b, and Interpreter follow-ups.
 
 Build vertically through one slice before broadening. Do not scaffold all five layers in parallel. **Ontology (L3) is not a separate slice** — it was built in slice 1 and each later slice extends it only when a consumer needs a new inference. The canonical slice definitions live in `ARCHITECTURE.md` → "Build order (the slices)".
 
@@ -73,7 +73,7 @@ Build vertically through one slice before broadening. Do not scaffold all five l
 
 1. Read `ARCHITECTURE.md` (esp. "Build order (the slices)" — the canonical roadmap), `ONTOLOGY.md`, `CONTEXT.md` (domain language), and `docs/adr/` (decisions to date — 0001 through 0047).
 2. Check `docs/grill-queue.md` — open design decisions worth grilling, plus deliberate deferrals.
-3. Confirm which slice we're working on. **Slices 1–3 are shipped; slice 4 (bounded agent execution: Executor + Interpreter) is next.** If unclear, ask before generating code.
+3. Confirm which slice we're working on. **Slices 1–4 are shipped** (slice 4 = bounded agent execution: Executor + Interpreter). The MVP five-layer vertical is complete; if unclear what's next, ask before generating code.
 
 ## What NOT to do
 
@@ -88,7 +88,7 @@ Build vertically through one slice before broadening. Do not scaffold all five l
 
 The ontology (`ONTOLOGY.md`) design is complete: all six steps drafted, all three originally-open questions resolved (Asset / TrustBoundary / Payload), 47 ADRs recorded. `TrustBoundary` inference (capability + tenant) shipped in slice 3.
 
-**Slices 1–3 are shipped** (slice-2 coverage closed by ADR-0033/0034/0035; slice 3 / the Planner by ADR-0036–0041). **Slice 4 (bounded agent execution — Executor + Interpreter) is grilled (ADR-0042–0047) and is the build target.** PRDs: slice-1 #2 (tracers #3–#10), slice-2 #49 (#50–#57), slice-3 #59 (tracers #61–#67), slice-4 #85 (tracers #86–#93).
+**Slices 1–4 are shipped** (slice-2 coverage closed by ADR-0033/0034/0035; slice 3 / the Planner by ADR-0036–0041; **slice 4 / Executor + Interpreter by ADR-0042–0047**, tracers #86–#93: dispatch spine, real OPA, the confirm loop + Finding lifecycle, the ADR-0044 liveness classifier, replay-hazard resolvers + `doo dispatch review`, the auth-helper rotation sibling, all MVP authz classes + C5/C5a/C5b, and Interpreter follow-ups + the `InterpreterMode` seam). PRDs: slice-1 #2 (tracers #3–#10), slice-2 #49 (#50–#57), slice-3 #59 (tracers #61–#67), slice-4 #85 (tracers #86–#93).
 
 ## Agent skills
 

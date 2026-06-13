@@ -18,11 +18,31 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from doo.dispatch.models import ROLES_BY_TEST_CLASS, RequestRole
-from doo.events.slice4 import FindingCategory, FindingSeverity, TestClass
+from doo.events.slice4 import FindingCategory, FindingSeverity, PayloadClass, TestClass
 from doo.ids import ObservationId
 
 Verdict = Literal["vulnerable", "not_vulnerable", "inconclusive"]
 VERDICTS: tuple[Verdict, ...] = ("vulnerable", "not_vulnerable", "inconclusive")
+
+
+class FollowUpProposal(BaseModel):
+    """A genuinely-new test the confirm loop surfaced (ADR-0045, S8/#93).
+
+    NOT dispatched in-run: in `confirm` mode it goes back through the slice-3
+    Validator + commit path (`source = "llm-interpreter"`) and lands at
+    `review_status = proposed` for human review — same scope/XOR/dedup guards as a
+    Planner proposal. `target_handle` is `"TARGET"` (the current TestCase's own
+    target) or an endpoint id the Validator resolves + scope-checks; a
+    hallucinated/out-of-scope handle is discarded-and-logged, never committed.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    test_class: TestClass
+    payload_class: PayloadClass
+    target_handle: str = Field(min_length=1)
+    justification: str = Field(min_length=1)
+    expected_outcome: str = Field(min_length=1)
 
 
 class InterpreterVerdict(BaseModel):
@@ -50,6 +70,10 @@ class InterpreterVerdict(BaseModel):
     # Interpreter sees pack-local handles, not raw node ids; the deterministic
     # commit code resolves them — same hallucination guard as the Planner.
     affected_refs: tuple[str, ...] = ()
+    # Genuinely-new tests the loop surfaced (S8/#93). Re-validated + committed at
+    # `review_status = proposed`, `source = "llm-interpreter"` — never dispatched
+    # in-run (confirm mode). Empty for most verdicts.
+    follow_ups: tuple[FollowUpProposal, ...] = ()
 
     @model_validator(mode="after")
     def _vulnerable_requires_category(self) -> InterpreterVerdict:
@@ -200,6 +224,37 @@ EMIT_VERDICT_TOOL: dict[str, Any] = {
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Target handle(s) ('TARGET'). ONLY if verdict=vulnerable.",
+                },
+                "follow_ups": {
+                    "type": "array",
+                    "description": (
+                        "OPTIONAL: genuinely-NEW test hypotheses you noticed while "
+                        "judging (e.g. the same endpoint exposes another param). "
+                        "These are NOT sent now — they go to human review. Leave "
+                        "empty unless you saw something concrete and out-of-scope "
+                        "of THIS test."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "test_class": {"type": "string"},
+                            "payload_class": {"type": "string"},
+                            "target_handle": {
+                                "type": "string",
+                                "description": "'TARGET' (this endpoint) or an endpoint id.",
+                            },
+                            "justification": {"type": "string"},
+                            "expected_outcome": {"type": "string"},
+                        },
+                        "required": [
+                            "test_class",
+                            "payload_class",
+                            "target_handle",
+                            "justification",
+                            "expected_outcome",
+                        ],
+                    },
                 },
             },
             "required": ["verdict", "justification", "observed_vs_expected"],

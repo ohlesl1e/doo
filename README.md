@@ -6,11 +6,12 @@ doo ingests passive testing data (Burp traffic, HAR files, recon output), builds
 
 ## Status
 
-**Slices 1–3 complete.**
+**Slices 1–4 complete — the MVP five-layer vertical is end-to-end.**
 
 - **Slice 1 — ingestion + graph.** Drop in a HAR file and get an engagement-isolated Neo4j graph of the target: canonicalised hosts, templated endpoints, aggregated parameters, declared/discovered/anonymous principals, request/response bodies in object storage, and promoted values (`ObservedValue`) — provenance on every node, secrets hashed at the L2 boundary.
 - **Slice 2 — coverage analysis.** Deterministic, read-only queries over the graph (`doo coverage`): C1 dead endpoints, C2/C2b presence- and content-differential authz gaps, C3 leak-to-input pivots, C4 capability-tier gaps. Surfaces gaps at query time; writes nothing back.
 - **Slice 3 — the Planner (the first LLM).** `doo planner propose` turns coverage gaps into typed test **proposals** and `doo planner review` is the deterministically-prioritised human review queue. Deterministic candidate generators select targets (C1–C4, capability/tenant `TrustBoundary`s, and sink-shaped params); for gaps that need reasoning an LLM proposes a structured `TestCase` (enums + handle references, **never request bytes**); a deterministic Validator resolves/scopes/dedups it; survivors commit as content-addressed `TestCase`s at `review_status = proposed`. **Nothing is dispatched** — approved tests wait for slice 4.
+- **Slice 4 — bounded agent execution (the first traffic).** `doo dispatch run` arms a budget-bounded run that drains `approved` tests through one Dispatcher gate (kill-switch lease → real OPA → budget → wire); a deterministic Executor builds each request (the LLM never composes bytes) and an Interpreter confirm-loop judges the result into a verdict — the fourth `TestCase` axis — committing a `Finding@proposed` when `vulnerable`. Adds the ADR-0044 liveness `dispatch_status` classifier, replay-hazard resolution + `doo dispatch review`, the `doo auth-helper` token-rotation sibling, C5/C5a/C5b boundary coverage, and Interpreter `follow_ups` back to the Planner. `doo finding review` is the human gate before reporting.
 
 CI (lint + types + the full testcontainer suite) is in place. See [**Running doo**](#running-doo) below to run it.
 
@@ -42,7 +43,7 @@ Build vertically through one slice before broadening:
 1. ✅ **Ingestion + graph** — Burp/HAR → Neo4j, queryable.
 2. ✅ **Coverage analysis** — deterministic queries over the graph (~60% of the value, ~10% of the risk).
 3. ✅ **LLM-assisted hypothesis generation** — the Planner proposes, a deterministic Validator checks, a human approves; nothing dispatched.
-4. ⬅ **Bounded agent execution** — next; only after 1–3 are solid.
+4. ✅ **Bounded agent execution** — Executor + Interpreter; the first slice that sends traffic, under human arming + kill-switch + dispatcher-side OPA.
 
 ## Repository layout
 
@@ -152,6 +153,38 @@ DOO_PLANNER_MODEL=anthropic/claude-sonnet-4-6   # default: claude-opus-4-8
 
 Per ADR-0037 the exact context pack + LLM request/response are persisted to object storage for every proposal (replayability); `DOO_S3_*` (already set for ingestion) is reused.
 
+### Dispatch + confirm + report (slice 4)
+
+The first commands that **send traffic**. A dispatch run is the authorization unit (ADR-0042): one arming decision drains a budget-bounded selection of `approved` `TestCase`s, each through the Dispatcher gate (kill-switch lease → OPA → budget → wire). The kill-switch keepalive **must** be running in another terminal, and on `production` engagements only `arming=review` + `interpreter=confirm` is permitted.
+
+```sh
+# 0. In a SEPARATE terminal — the kill switch the dispatcher reads on every send.
+.venv/bin/doo engagement keepalive acme-test
+
+# (optional) token rotation sibling — proactive + reactive; holds refresh creds in
+# ITS env, never the dispatcher's. Rotated material lands where the Executor reads it.
+.venv/bin/doo auth-helper run --engagement acme-test --config engagement.yaml
+
+# 1. Arm + drain a run (real OPA needs `opa` on PATH; --unsafe-stub-opa is staging-only).
+.venv/bin/doo dispatch run -e acme-test -c engagement.yaml --select test_class=idor -n 20
+#   per TestCase: deterministic constructor → Dispatcher gate → wire → EXECUTED_AS,
+#   then the Interpreter confirm loop judges it (verdict = the 4th TestCase axis).
+
+# 2. Triage refusals (hazard_unresolved / dispatcher_blocked); supply a CSRF source_hint
+#    or accept the replay risk — the next run reads the override.
+.venv/bin/doo dispatch review -e acme-test
+.venv/bin/doo dispatch review -e acme-test --set-hint <key_hash> csrf_token /orders/new
+
+# 3. Review proposed Findings (a `vulnerable` verdict commits one); only confirmed feed reporting.
+.venv/bin/doo finding review -e acme-test
+.venv/bin/doo finding review -e acme-test --confirm <finding_key> --actor you
+
+# 4. What boundaries are still untested-to-verdict? (also c5a / c5b)
+.venv/bin/doo coverage c5 --engagement acme-test
+```
+
+The LLM never composes request bytes (constructors do) and never sets `dispatch_status` (a deterministic classifier does, ADR-0013/0044). The Interpreter picks request *roles* from a closed per-`test_class` enum and may surface `follow_ups` — new hypotheses that go back through the Planner's Validator to `review_status=proposed` (`source=llm-interpreter`), never dispatched in-run (`confirm` mode). The Interpreter uses the same `DOO_PLANNER_*` model config as the Planner.
+
 ### Command reference
 
 | Command | What it does |
@@ -161,9 +194,13 @@ Per ADR-0037 the exact context pack + LLM request/response are persisted to obje
 | `doo engagement keepalive <id>` | Run the external kill-switch lease keeper |
 | `doo ingest har --engagement <id> <har>` | L1: upload the HAR + queue an envelope |
 | `doo worker run [--once] [--batch N]` | L2+L3: drain the streams into the graph |
-| `doo coverage c1\|c2\|c2b\|c3\|c4 --engagement <id>` | Deterministic coverage gaps (read-only; `--json` available) |
+| `doo coverage c1\|c2\|c2b\|c3\|c4\|c5\|c5a\|c5b --engagement <id>` | Deterministic coverage gaps (read-only; `--json` available). C5* are TrustBoundary test coverage |
 | `doo planner propose --engagement <id> [-g <gen>]` | Select gaps → propose + validate + commit `TestCase`s (no dispatch) |
 | `doo planner review --engagement <id> [--approve\|--reject <key> --actor <who>]` | Prioritised review queue; approve/reject into the audit ledger |
+| `doo dispatch run -e <id> -c <yaml> [--select k=v -n N]` | Arm + drain a budget-bounded run: gate → send → `EXECUTED_AS` → confirm-loop verdict |
+| `doo dispatch review -e <id> [--set-hint\|--ignore-hazard …]` | Triage refused/blocked TestCases; set hazard overrides the next run reads |
+| `doo finding review -e <id> [--confirm\|--reject <key> --actor <who>]` | Review `proposed` Findings; only `confirmed` feed reporting |
+| `doo auth-helper run -e <id> -c <yaml>` | Sibling process: rotate declared AuthContexts (proactive + reactive) |
 
 ### Troubleshooting
 

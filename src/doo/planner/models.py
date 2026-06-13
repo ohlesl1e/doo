@@ -41,7 +41,11 @@ from doo.ids import (
 # the `source` provenance tag on a committed deterministic TestCase
 # (`deterministic-c1`, ADR-0036). LLM-proposing generators (slice-3 tracers,
 # slice 4) commit `source = "llm-planner"` instead.
-GeneratorId = Literal["c1", "c2", "c2b", "c3", "c4", "tenant", "sink"]
+# `interpreter` is the slice-4 follow-up *source* (ADR-0045/S8): the confirm loop
+# surfaces a genuinely-new test, committed via this same Validator path. It is a
+# valid `generator` provenance value but NOT a runnable planner generator, so it is
+# deliberately absent from `GENERATOR_IDS` (the config default + planner registry).
+GeneratorId = Literal["c1", "c2", "c2b", "c3", "c4", "tenant", "sink", "interpreter"]
 GENERATOR_IDS: tuple[GeneratorId, ...] = ("c1", "c2", "c2b", "c3", "c4", "tenant", "sink")
 
 # A replay-breaking request-field role (ADR-0041). A field bound to the original

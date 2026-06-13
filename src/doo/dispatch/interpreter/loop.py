@@ -23,6 +23,7 @@ from typing import Any, Protocol
 
 from doo.dispatch.interpreter.models import (
     EMIT_VERDICT_TOOL,
+    FollowUpProposal,
     InterpreterVerdict,
     interpreter_tools,
 )
@@ -378,6 +379,20 @@ def _parse_verdict(args: dict[str, Any], *, ctx: ToolContext) -> InterpreterVerd
     # `affected_refs` is constrained to the single target handle the prompt named.
     if args.get("affected_refs"):
         args["affected_refs"] = [r for r in args["affected_refs"] if r == "TARGET"]
+    # Parse `follow_ups` defensively: a malformed one is dropped + logged, never
+    # fatal to the verdict (the run driver re-validates the survivors, ADR-0045).
+    if args.get("follow_ups"):
+        good: list[FollowUpProposal] = []
+        for raw in args["follow_ups"]:
+            try:
+                good.append(FollowUpProposal.model_validate(raw))
+            except Exception as exc:  # noqa: BLE001 - drop the bad follow-up
+                log.warning(
+                    "interpreter.follow_up_unparseable",
+                    key_hash=ctx.testcase.key_hash,
+                    error=str(exc),
+                )
+        args["follow_ups"] = good
     try:
         return InterpreterVerdict.model_validate(args)
     except Exception as exc:  # noqa: BLE001 - any validation failure → inconclusive
