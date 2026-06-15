@@ -38,7 +38,7 @@ def neo4j_container() -> Iterator[object]:
     except Exception:
         pytest.skip("testcontainers[neo4j] not installed; skipping testcontainer-backed test")
 
-    container = Neo4jContainer("neo4j:5-community")
+    container = Neo4jContainer("neo4j:5.26-community")
     try:
         container.start()
     except Exception as exc:  # docker not running, etc.
@@ -69,7 +69,7 @@ def redis_url() -> Iterator[str]:
             "(pip install 'testcontainers[redis]')"
         )
 
-    container = RedisContainer("redis:7-alpine")
+    container = RedisContainer("redis:7.4-alpine")
     try:
         container.start()
     except Exception as exc:
@@ -102,7 +102,7 @@ def minio_config() -> Iterator[dict[str, str]]:
             "(pip install 'testcontainers[minio]')"
         )
 
-    container = MinioContainer("minio/minio:latest")
+    container = MinioContainer("minio/minio:RELEASE.2024-12-18T13-15-44Z")
     try:
         container.start()
     except Exception as exc:
