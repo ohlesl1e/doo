@@ -55,4 +55,8 @@ jobs:
         run: mypy src
 
       - name: Tests (unit + testcontainer integration + dual-path)
-        run: pytest -q
+        # `-n auto` = one xdist worker per runner core (4 on ubuntu-latest); each
+        # worker starts its own session-scoped testcontainer set. Local default
+        # stays serial (no `-n` in addopts) so a dev box with many cores doesn't
+        # spawn N×3 containers.
+        run: pytest -q -n auto
