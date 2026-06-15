@@ -48,6 +48,14 @@ jobs:
           chmod +x /usr/local/bin/opa
           opa version
 
+      - name: Pre-pull testcontainer images
+        # Pull the pinned images in an explicit step so the cold-pull cost is
+        # visible here rather than charged to a test's container setup time (#99).
+        run: |
+          docker pull neo4j:5.26-community
+          docker pull redis:7.4-alpine
+          docker pull minio/minio:RELEASE.2024-12-18T13-15-44Z
+
       - name: Lint (ruff)
         run: ruff check src tests
 
