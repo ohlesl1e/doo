@@ -295,7 +295,13 @@ def register_worker(app: typer.Typer) -> None:
             "(for piping / debugging / non-interactive runs).",
         ),
     ) -> None:
-        """Consume `ingest` -> `l2-events` -> `l3-events`, building the graph."""
+        """Consume `ingest` -> `l2-events` -> `l3-events`, building the graph.
+
+        Drains the L2 (extraction) and L3 (commit) streams, then runs the
+        post-drain settle step (endpoint templating + value promotion). `--once`
+        drains what is currently queued and exits; without it the worker runs
+        until interrupted. `--json` keeps the structured logs instead of the bar.
+        """
 
         # Interactive default: a live progress bar + quiet logs. `--json` (or a
         # non-TTY stderr) keeps the full per-event structured logs as before.

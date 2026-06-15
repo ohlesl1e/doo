@@ -48,9 +48,9 @@ def _rotation_path() -> Path:
     return Path(os.path.expanduser("~")) / ".doo" / "secret_rotation.json"
 
 dispatch_app = typer.Typer(
-    help="Dispatch: arm and drain a budget-bounded run over approved TestCases "
-    "(slice 4, ADR-0042). The first command that SENDS traffic — kill-switch "
-    "lease must be live (`doo engagement keepalive`).",
+    help="Dispatch: arm and drain a budget-bounded run over approved TestCases. "
+    "The first command that SENDS traffic — kill-switch lease must be live "
+    "(`doo engagement keepalive`).",
     no_args_is_help=True,
 )
 
@@ -287,21 +287,21 @@ def run_cmd(
     arming: ArmingMode | None = typer.Option(
         None,
         "--arming",
-        help="Override dispatch.arming (review|auto). auto refuses on production (ADR-0042).",
+        help="Override dispatch.arming (review|auto). auto refuses on production.",
     ),
     unsafe_stub_opa: bool = typer.Option(
         False,
         "--unsafe-stub-opa",
         help="STAGING ONLY: fall back to an always-allow OPA stub when `opa` is "
-        "not on PATH. Refuses on production (ADR-0046).",
+        "not on PATH. Refuses on production.",
     ),
     actor: str = typer.Option(
         os.environ.get("USER", "unknown"),
         "--actor",
-        help="Tester identity for the dispatch ledger (ADR-0040: stays out of the graph).",
+        help="Tester identity for the dispatch ledger (stays out of the graph).",
     ),
 ) -> None:
-    """Arm and drain one dispatch run over approved TestCases (ADR-0042).
+    """Arm and drain one dispatch run over approved TestCases.
 
     The kill-switch lease (`doo engagement keepalive --engagement …`) MUST be
     running in another terminal — every send checks it; a dead lease is
@@ -420,7 +420,7 @@ _REVIEWABLE_OUTCOMES = frozenset(
 
 @dispatch_app.command("review")
 def review_cmd(
-    engagement: str = typer.Option(..., "--engagement", "-e"),
+    engagement: str = typer.Option(..., "--engagement", "-e", help="Engagement id."),
     as_json: bool = typer.Option(False, "--json", help="Emit the reviewable outcomes as JSON."),
     set_hint: tuple[str, str, str] = typer.Option(
         ("", "", ""),
@@ -433,7 +433,7 @@ def review_cmd(
         help="Send anyway despite a hazard: <key_hash> <kind> (accepts replay_invalid risk).",
     ),
 ) -> None:
-    """List refused/blocked TestCases from the dispatch ledger; set hazard overrides (ADR-0041).
+    """List refused/blocked TestCases from the dispatch ledger; set hazard overrides.
 
     The latest non-`executed` `RunOutcome` per TestCase (`hazard_unresolved` with
     its `{kind, param, reason}`, `dispatcher_blocked`, `constructor_missing`).
@@ -505,7 +505,7 @@ def review_cmd(
 # ---------------------------------------------------------------------------
 
 finding_app = typer.Typer(
-    help="Finding lifecycle: review proposed Findings (slice 4, ADR-0045). "
+    help="Finding lifecycle: review proposed Findings. "
     "Only `confirmed` Findings feed reporting.",
     no_args_is_help=True,
 )
@@ -523,17 +523,29 @@ def _default_finding_ledger() -> object:
 
 @finding_app.command("review")
 def finding_review_cmd(
-    engagement: str = typer.Option(..., "--engagement", "-e"),
+    engagement: str = typer.Option(..., "--engagement", "-e", help="Engagement id."),
     confirm: str | None = typer.Option(
         None, "--confirm", help="Confirm one Finding by its finding_key (or 12-char prefix)."
     ),
     reject: str | None = typer.Option(
         None, "--reject", help="Reject one Finding by its finding_key (or 12-char prefix)."
     ),
-    reason: str | None = typer.Option(None, "--reason"),
-    actor: str = typer.Option(os.environ.get("USER", "unknown"), "--actor"),
+    reason: str | None = typer.Option(
+        None, "--reason", help="Why (recorded in the audit ledger)."
+    ),
+    actor: str = typer.Option(
+        os.environ.get("USER", "unknown"),
+        "--actor",
+        help="Who is making this decision (recorded in the audit ledger).",
+    ),
 ) -> None:
-    """List `proposed` Findings (with transcript link); confirm/reject one (ADR-0045)."""
+    """List `proposed` Findings (with transcript link); confirm/reject one.
+
+    With no action flag, lists the Findings a dispatch run committed at
+    `finding_status = proposed`, each with a link to its confirm-loop transcript.
+    `--confirm` / `--reject` (by finding_key or prefix) records the human
+    decision; only `confirmed` Findings feed reporting.
+    """
 
     from doo.dispatch.finding import list_proposed_findings, review_finding
     from doo.ids import FindingId
@@ -600,22 +612,24 @@ def finding_review_cmd(
 # ---------------------------------------------------------------------------
 
 auth_helper_app = typer.Typer(
-    help="Auth-helper: rotate declared AuthContexts (proactive + reactive, "
-    "ADR-0014). A SIBLING process — holds refresh creds in its OWN env; the "
-    "dispatcher never does. Run alongside `doo engagement keepalive`.",
+    help="Auth-helper: rotate declared AuthContexts (proactive + reactive). "
+    "A SIBLING process — holds refresh creds in its OWN env; the dispatcher "
+    "never does. Run alongside `doo engagement keepalive`.",
     no_args_is_help=True,
 )
 
 
 @auth_helper_app.command("run")
 def auth_helper_run_cmd(
-    engagement: str = typer.Option(..., "--engagement", "-e"),
+    engagement: str = typer.Option(
+        ..., "--engagement", "-e", help="Engagement id (must match the YAML)."
+    ),
     config: Path = typer.Option(
         ..., "--config", "-c", exists=True, readable=True, resolve_path=True,
         help="Engagement YAML (auth_contexts[].refresh blocks + ${VAR} token refs).",
     ),
 ) -> None:
-    """Rotate declared AuthContexts until SIGTERM (ADR-0014: never the agent process).
+    """Rotate declared AuthContexts until SIGTERM (never the agent process).
 
     Proactive (per `validity_window_s`) + reactive (consumes the `auth_invalid`
     events the dispatcher emits) rotation, rate-limited per AuthContext. Refresh

@@ -32,8 +32,8 @@ from doo.ids import EngagementId
 from doo.infra.neo4j_driver import Neo4jClient
 
 coverage_app = typer.Typer(
-    help="Coverage analysis: deterministic read-only queries over the graph "
-    "(slice 2, ADR-0033/0034). Run after ingestion settles.",
+    help="Coverage analysis: deterministic read-only queries over the graph. "
+    "Run after ingestion settles.",
     no_args_is_help=True,
 )
 
@@ -81,7 +81,12 @@ def c1(
         help="Emit the typed result models as JSON (round-trippable) instead of a table.",
     ),
 ) -> None:
-    """C1: in-scope endpoints with no `HIT` edge of any kind (dead endpoints)."""
+    """C1: in-scope endpoints with no `HIT` edge of any kind (dead endpoints).
+
+    Endpoints that exist in scope but were never exercised by any principal in
+    the captured traffic — the untouched attack surface. `--min-confidence`
+    filters by decayed confidence; `--json` emits the typed rows.
+    """
 
     from doo.observability.ids import new_span_id, new_trace_id
     from doo.observability.logging import bind_correlation, configure_logging
@@ -155,7 +160,12 @@ def c2(
         help="Emit the typed result models as JSON (round-trippable) instead of a table.",
     ),
 ) -> None:
-    """C2: endpoints reached (2xx) as principal A but not as principal B."""
+    """C2: endpoints reached (2xx) as principal A but not as principal B.
+
+    Presence-differential authz gaps: a 2xx for A and a non-2xx (or absent) for
+    B is a candidate broken-access-control lead. Pin sides with `--as` /
+    `--not-as`; `--json` emits the typed rows.
+    """
 
     from doo.observability.ids import new_span_id, new_trace_id
     from doo.observability.logging import bind_correlation, configure_logging
@@ -219,7 +229,12 @@ def c2b(
         help="Emit the typed result models as JSON (round-trippable) instead of a table.",
     ),
 ) -> None:
-    """C2b: endpoints reached (2xx) by ≥2 principals whose responses differ (body/size)."""
+    """C2b: endpoints reached (2xx) by ≥2 principals whose responses differ (body/size).
+
+    Content-differential gaps: multiple principals get a 2xx but the response
+    body or size differs by role — the handle on role-differentiated 200s.
+    `--json` emits the typed rows.
+    """
 
     from doo.observability.ids import new_span_id, new_trace_id
     from doo.observability.logging import bind_correlation, configure_logging
@@ -292,7 +307,12 @@ def c3(
         help="Emit the typed result models as JSON (round-trippable) instead of a table.",
     ),
 ) -> None:
-    """C3: values leaked in one endpoint's response and sent as input to another."""
+    """C3: values leaked in one endpoint's response and sent as input to another.
+
+    Leak-to-input pivots: a value observed in endpoint X's response later
+    appears as input to in-scope endpoint Y, ranked by shape specificity then
+    confidence. `--json` emits the typed rows.
+    """
 
     from doo.observability.ids import new_span_id, new_trace_id
     from doo.observability.logging import bind_correlation, configure_logging
@@ -357,7 +377,12 @@ def c4(
         help="Emit the typed result models as JSON (round-trippable) instead of a table.",
     ),
 ) -> None:
-    """C4: endpoints a principal's stronger token reached that its weaker token did not."""
+    """C4: endpoints a principal's stronger token reached that its weaker token did not.
+
+    Capability-tier gaps: the same principal's higher-capability AuthContext
+    reached an endpoint its lower-capability one did not — a privilege boundary
+    worth testing. `--json` emits the typed rows.
+    """
 
     from doo.observability.ids import new_span_id, new_trace_id
     from doo.observability.logging import bind_correlation, configure_logging
@@ -423,10 +448,24 @@ def _coverage_c5(
 @coverage_app.command("c5")
 def c5(
     engagement: str = typer.Option(..., "--engagement", "-e", help="Engagement id."),
-    min_confidence: float = typer.Option(0.0, "--min-confidence"),
-    as_json: bool = typer.Option(False, "--json"),
+    min_confidence: float = typer.Option(
+        0.0,
+        "--min-confidence",
+        help="Drop rows below this effective (decayed) confidence. Default 0 = "
+        "surface everything (low-confidence leads are never silently hidden).",
+    ),
+    as_json: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit the typed result models as JSON (round-trippable) instead of a table.",
+    ),
 ) -> None:
-    """C5: TrustBoundaries with no TestCase executed to an Interpreter verdict (ADR-0047)."""
+    """C5: TrustBoundaries with no TestCase executed to an Interpreter verdict.
+
+    Boundaries never tested to a conclusion: tested requires a targeting
+    TestCase that ran to `ok` AND a vulnerable/not_vulnerable verdict. An
+    inconclusive verdict counts as untested (fail-closed). `--json` emits rows.
+    """
 
     _coverage_c5("C5", engagement, min_confidence, as_json)
 
@@ -434,10 +473,23 @@ def c5(
 @coverage_app.command("c5a")
 def c5a(
     engagement: str = typer.Option(..., "--engagement", "-e", help="Engagement id."),
-    min_confidence: float = typer.Option(0.0, "--min-confidence"),
-    as_json: bool = typer.Option(False, "--json"),
+    min_confidence: float = typer.Option(
+        0.0,
+        "--min-confidence",
+        help="Drop rows below this effective (decayed) confidence. Default 0 = "
+        "surface everything (low-confidence leads are never silently hidden).",
+    ),
+    as_json: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit the typed result models as JSON (round-trippable) instead of a table.",
+    ),
 ) -> None:
-    """C5a: TrustBoundaries with no *proposed* TestCase (the Planner skipped them)."""
+    """C5a: TrustBoundaries with no *proposed* TestCase (the Planner skipped them).
+
+    The weaker sibling of C5: boundaries the Planner never even proposed a test
+    for — a gap in proposal coverage, not execution. `--json` emits the rows.
+    """
 
     _coverage_c5("C5a", engagement, min_confidence, as_json)
 
@@ -445,9 +497,22 @@ def c5a(
 @coverage_app.command("c5b")
 def c5b(
     engagement: str = typer.Option(..., "--engagement", "-e", help="Engagement id."),
-    min_confidence: float = typer.Option(0.0, "--min-confidence"),
-    as_json: bool = typer.Option(False, "--json"),
+    min_confidence: float = typer.Option(
+        0.0,
+        "--min-confidence",
+        help="Drop rows below this effective (decayed) confidence. Default 0 = "
+        "surface everything (low-confidence leads are never silently hidden).",
+    ),
+    as_json: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit the typed result models as JSON (round-trippable) instead of a table.",
+    ),
 ) -> None:
-    """C5b: TrustBoundaries with no *approved* TestCase (nothing armed-able)."""
+    """C5b: TrustBoundaries with no *approved* TestCase (nothing armed-able).
+
+    Boundaries with proposals but none approved for dispatch — nothing a run
+    could arm against them yet. `--json` emits the rows.
+    """
 
     _coverage_c5("C5b", engagement, min_confidence, as_json)

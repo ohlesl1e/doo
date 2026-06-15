@@ -1,0 +1,112 @@
+# Example engagement config.
+#
+# This is the file the dispatch walkthrough loads with `--config`. It exercises
+# every block a dispatch run reads: `environment`, `scope`, `auth`, `kill_switch`,
+# `llm`, `dispatch`, and declared `principals[]` with bearer tokens, a
+# `liveness_endpoint`, and an auth-helper `refresh` block.
+#
+# Field-by-field documentation lives in docs/engagement-config.md.
+#
+# Hard rules this file obeys:
+#   - tokens are ${ENV_VAR} references, never inline secrets
+#   - scope patterns are glob/segment, never regex
+#   - refresh creds live in the auth-helper's env, not the dispatcher's
+#
+# Load it with the matching env vars set:
+#   export DOO_TEST_TOKEN_A=...      # victim principal's bearer (dispatcher env)
+#   export DOO_TEST_TOKEN_B=...      # attacker principal's bearer (dispatcher env)
+#   .venv/bin/doo engagement start --config docs/examples/engagement.yaml
+
+engagement:
+  id: acme-test
+  name: Acme staging dispatch
+  description: Dispatch walkthrough against the Acme staging image.
+
+# REQUIRED, no default. `staging` permits the full arming × interpreter matrix;
+# `production` would force dispatch.arming=review + interpreter=confirm.
+environment: staging
+
+# Scope rules. Patterns are glob/segment, NOT regex. Hashed for the Scope content
+# id; the OPA bundle is built from this block.
+scope:
+  host_patterns:
+    - "api.example.com"          # exact host; "*.example.com" would match sub-domains
+  allowed_methods:
+    - GET
+    - POST
+    - PUT
+    - PATCH
+    - DELETE
+  allowed_path_patterns:
+    - "/**"                      # all paths; "/users/*" = one segment under /users
+  payload_class_denylist:
+    - destructive-sql            # program-prohibited PayloadClasses
+  # rate_limit:                  # optional per-host throttle (dispatcher-enforced)
+  #   requests_per_second: 5
+  #   burst: 10
+  # time_window:                 # optional program-allowed hours (UTC)
+  #   start_hour_utc: 9
+  #   end_hour_utc: 18
+  #   weekdays: [1, 2, 3, 4, 5]
+
+# Auth-identity hints for interpreting captured traffic.
+auth:
+  session_cookie_names:
+    - token                      # authoritative session-cookie allowlist
+  # identity_key: sub            # engagement-global user-id claim (optional)
+
+# External kill-switch lease. refresh_interval_seconds < lease_ttl_seconds.
+kill_switch:
+  lease_ttl_seconds: 60
+  refresh_interval_seconds: 30
+
+# Reserved for per-engagement model routing — NOT wired yet. The Planner and
+# Interpreter pick their model from the DOO_PLANNER_* env, not this block, so
+# `model:` here has no effect today. Safe to omit. See docs/engagement-config.md.
+llm:
+  provider: gateway
+  model: claude-opus-4-8
+
+# Dispatch defaults. On `production` only review+confirm loads.
+dispatch:
+  arming: review                 # human presses go before each run (`auto` = staging-only)
+  interpreter: confirm           # `freelance` is staging-only and not yet available
+  request_budget: 200            # every wire send counts (primary, baselines, warm-ups)
+  wallclock_budget_s: 1800
+  max_tool_calls: 6              # per-TestCase Interpreter tool-call cap
+  # Optional body-match overrides (regex; short-circuit the liveness probe):
+  # auth_invalid_match: "(?i)token (expired|invalid)"
+  # replay_invalid_match: "(?i)csrf token mismatch"
+
+# Declared test accounts the tester controls.
+principals:
+  # Victim: the principal whose resources an IDOR/authz test tries to reach.
+  - label: test-user-a
+    description: Primary victim account.
+    auth_contexts:
+      - kind: bearer
+        token: "${DOO_TEST_TOKEN_A}"   # env-ref only
+    known_signals:
+      jwt_sub: uuid-aaa                 # reconciles discovered traffic to this principal
+    liveness_endpoint:                  # warm-up probe: 2xx ⇒ token live
+      method: GET
+      path: /me
+
+  # Attacker: the principal the dispatcher acts AS. Its token is rotated by the
+  # auth-helper sibling; the refresh creds live in the HELPER's env, not here.
+  - label: test-user-b
+    description: Attacker account (rotated by the auth-helper).
+    auth_contexts:
+      - kind: bearer
+        token: "${DOO_TEST_TOKEN_B}"
+        refresh:
+          mechanism: command            # auth-helper shells out; fresh token on stdout
+          command: ./scripts/mint-token-b.sh
+          validity_window_s: 3600        # proactive refresh at now + window − margin
+          margin_s: 60
+          max_refreshes_per_hour: 3      # bounds the reactive (auth_invalid) path
+    known_signals:
+      jwt_sub: uuid-bbb
+    liveness_endpoint:
+      method: GET
+      path: /me

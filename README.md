@@ -13,7 +13,7 @@ doo ingests passive testing data (Burp traffic, HAR files, recon output), builds
 - **Slice 3 — the Planner (the first LLM).** `doo planner propose` turns coverage gaps into typed test **proposals** and `doo planner review` is the deterministically-prioritised human review queue. Deterministic candidate generators select targets (C1–C4, capability/tenant `TrustBoundary`s, and sink-shaped params); for gaps that need reasoning an LLM proposes a structured `TestCase` (enums + handle references, **never request bytes**); a deterministic Validator resolves/scopes/dedups it; survivors commit as content-addressed `TestCase`s at `review_status = proposed`. **Nothing is dispatched** — approved tests wait for slice 4.
 - **Slice 4 — bounded agent execution (the first traffic).** `doo dispatch run` arms a budget-bounded run that drains `approved` tests through one Dispatcher gate (kill-switch lease → real OPA → budget → wire); a deterministic Executor builds each request (the LLM never composes bytes) and an Interpreter confirm-loop judges the result into a verdict — the fourth `TestCase` axis — committing a `Finding@proposed` when `vulnerable`. Adds the ADR-0044 liveness `dispatch_status` classifier, replay-hazard resolution + `doo dispatch review`, the `doo auth-helper` token-rotation sibling, C5/C5a/C5b boundary coverage, and Interpreter `follow_ups` back to the Planner. `doo finding review` is the human gate before reporting.
 
-CI (lint + types + the full testcontainer suite) is in place. See [**Running doo**](#running-doo) below to run it.
+CI (lint + types + the full testcontainer suite) is in place. See [**Setup**](#setup) and [**Workflow**](#workflow) below to run it.
 
 ## Design principles
 
@@ -54,20 +54,20 @@ Code:
 - `src/doo/setup/` — `EngagementConfig` Pydantic model and the idempotent loader (ADR-0019).
 - `src/doo/ontology/` — Neo4j schema bootstrap (ADR-0017 constraints + indexes + property-existence).
 - `src/doo/observability/` — `structlog` config and W3C trace-context id generators (ADR-0018).
-- `src/doo/cli.py` + `cli_worker.py` — Typer CLI (`doo engagement start/status/keepalive`, `doo ingest har`, `doo worker run`).
+- `src/doo/cli.py` + `cli_worker.py` — Typer CLI root that mounts every command group: `engagement`, `ingest`, `worker`, `coverage`, `planner`, `dispatch`, `finding`, `auth-helper` (run `doo --help`).
 - `src/doo/ingestion/` (L1 intake + L2 worker), `src/doo/extraction/` (HAR parser + response-artifact extractors), `src/doo/ontology/` (L3 commit, entity resolution, path templating), `src/doo/policy/` (Scope evaluator + deny-all Rego), `src/doo/infra/` (Redis/MinIO/Neo4j clients), `src/doo/engagement/` (kill-switch keepalive).
 
 Design docs:
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — five-layer architecture, tech stack, build order, layer contracts.
 - [`ONTOLOGY.md`](ONTOLOGY.md) — graph schema (six-step draft, all done).
 - [`CONTEXT.md`](CONTEXT.md) — domain language.
-- [`docs/adr/`](docs/adr/) — architecture decision records (0001–0025).
+- [`docs/adr/`](docs/adr/) — architecture decision records (0001–0047).
 - [`docs/grill-queue.md`](docs/grill-queue.md) — open design decisions tracking.
 - [`docs/agents/`](docs/agents/) — agent skill docs (issue tracker, triage labels, domain docs).
 
-## Running doo
+## Setup
 
-Drop a HAR in, get an engagement-isolated Neo4j graph of the target. There is no active testing yet — this is the ingestion → graph half of the pipeline.
+Get doo running locally — the stack, the Python env, and the connection config.
 
 ### Prerequisites
 
@@ -81,7 +81,7 @@ python -m venv .venv
 
 `dev` is the test/lint toolchain; `llm` pulls in `litellm` for `doo planner propose` against a real model. CI installs `.[dev]` only — the planner tests use a fake caller and don't need `litellm`. (Examples call binaries as `.venv/bin/doo`; activate the venv if you prefer bare `doo`.)
 
-### 1. Start the stack
+### Start the stack
 
 ```sh
 docker compose up -d --wait      # Neo4j (7474/7687), Redis (6379), MinIO (9000/9001)
@@ -91,7 +91,7 @@ Web UIs:
 - **Neo4j Browser** — http://localhost:7474 — `neo4j` / `doo-dev-password`
 - **MinIO Console** — http://localhost:9001 — `doo-dev` / `doo-dev-password`
 
-### 2. Configure the connection env
+### Configure the connection env
 
 The CLI reads `DOO_*` env vars, and its built-in defaults do **not** match the compose credentials — so set them, easiest via the committed template:
 
@@ -101,7 +101,11 @@ cp .env.example .env
 
 `doo` auto-loads `.env` from the current directory, so running from the repo root needs no manual exports (an explicit `export` still wins).
 
-### 3. Ingest a HAR → graph
+## Workflow
+
+The end-to-end vertical: ingest a HAR into the graph, find coverage gaps, plan tests against them, then dispatch under human arming + kill-switch + policy. Each step builds on the previous one — and every command supports `--help` (`doo --help` lists the full surface).
+
+### 1. Ingest a HAR → graph
 
 ```sh
 # acme-test.yaml declares a Principal whose token is ${DOO_TEST_TOKEN_A}:
@@ -114,7 +118,7 @@ export DOO_TEST_TOKEN_A=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1dWlkLWF
 
 `engagement start` is idempotent (diff-and-confirm on a material change; `--apply` skips the prompt). `ingest har` is **L1 only** — it queues the HAR; `worker run` (L2+L3) builds the graph and prints a summary, including a grouped report of any entries that failed to parse. Drop in your own capture with `--engagement acme-test path/to.har` — scope does not gate ingestion, so out-of-scope hosts land too. `doo worker run` (no `--once`) leaves a daemon running; `doo engagement keepalive <id>` runs the external kill-switch lease.
 
-### Exploring the graph
+### 2. Explore the graph
 
 In **Neo4j Browser** (http://localhost:7474):
 
@@ -126,22 +130,28 @@ MATCH (:RequestObservation)-[:YIELDED_VALUE]->(v:ObservedValue) RETURN v.kind, v
 
 Request/response bodies live in MinIO; the graph holds `BlobRef`s.
 
-### Analyze coverage + plan tests (slices 2–3)
+### 3. Analyze coverage
 
 ```sh
-# Coverage: deterministic gaps over the graph (read-only).
+# Deterministic gaps over the graph, read-only — surfaced at query time, nothing written back.
 .venv/bin/doo coverage c2 --engagement acme-test        # presence-differential authz gaps
-.venv/bin/doo coverage c4 --engagement acme-test        # capability-tier gaps  (also: c1, c2b, c3)
+.venv/bin/doo coverage c4 --engagement acme-test        # capability-tier gaps  (also: c1, c2b, c3, c5/c5a/c5b)
+```
 
-# Planner: turn gaps into proposed TestCases (deterministic C1 needs no LLM; the
-# LLM generators need a model — see "Planner LLM config" below).
+Each query takes `--engagement` and `--json`; C2 also takes `--as` / `--not-as` to pin principals. The `c5*` queries are `TrustBoundary` test coverage — most meaningful after a dispatch run (step 5).
+
+### 4. Plan tests
+
+```sh
+# Turn gaps into proposed TestCases (deterministic C1 needs no LLM; the LLM
+# generators need a model — see "Planner LLM config" below).
 .venv/bin/doo planner propose --engagement acme-test                    # all enabled generators
 .venv/bin/doo planner propose --engagement acme-test -g c1              # one generator (C1 = no LLM)
 .venv/bin/doo planner review  --engagement acme-test                    # prioritised review queue
 .venv/bin/doo planner review  --engagement acme-test --approve <key> --actor you
 ```
 
-`propose` selects targets deterministically, has the LLM propose a structured `TestCase` for gaps that need reasoning (the Validator rejects any hallucinated handle / out-of-scope target), and commits survivors at `review_status = proposed`. `review` is the deterministically-prioritised queue; approve/reject is recorded in a provenanced audit ledger. **Nothing is dispatched** — `approved` means "cleared for consideration," not "authorized to send" (slice 4).
+`propose` selects targets deterministically, has the LLM propose a structured `TestCase` for gaps that need reasoning (the Validator rejects any hallucinated handle / out-of-scope target), and commits survivors at `review_status = proposed`. `review` is the deterministically-prioritised queue; approve/reject is recorded in a provenanced audit ledger. **Nothing is dispatched** — `approved` means "cleared for consideration," not "authorized to send" (dispatch is step 5).
 
 **Planner LLM config** (only for the LLM generators; C1 is deterministic). The model is reached through litellm — a lazy dep pulled in by the `llm` extra (see setup above). The model is **config, not code** — set in `.env`:
 
@@ -153,9 +163,11 @@ DOO_PLANNER_MODEL=anthropic/claude-sonnet-4-6   # default: claude-opus-4-8
 
 Per ADR-0037 the exact context pack + LLM request/response are persisted to object storage for every proposal (replayability); `DOO_S3_*` (already set for ingestion) is reused.
 
-### Dispatch + confirm + report (slice 4)
+### 5. Dispatch + confirm + report
 
 The first commands that **send traffic**. A dispatch run is the authorization unit (ADR-0042): one arming decision drains a budget-bounded selection of `approved` `TestCase`s, each through the Dispatcher gate (kill-switch lease → OPA → budget → wire). The kill-switch keepalive **must** be running in another terminal, and on `production` engagements only `arming=review` + `interpreter=confirm` is permitted.
+
+The `--config` YAML these commands read is the **engagement config** — the tester's declared scope, principals, kill-switch, and `dispatch`/`auth-helper` settings. The blocks each command consumes (`environment`, `dispatch`, `principals[].auth_contexts[].refresh`, `liveness_endpoint`, …) are documented field-by-field in **[docs/engagement-config.md](docs/engagement-config.md)**, with a copy-pasteable example at **[docs/examples/engagement.yaml](docs/examples/engagement.yaml)** (used verbatim below). Tokens are `${ENV_VAR}` refs, never inline.
 
 ```sh
 # 0. In a SEPARATE terminal — the kill switch the dispatcher reads on every send.
@@ -163,10 +175,10 @@ The first commands that **send traffic**. A dispatch run is the authorization un
 
 # (optional) token rotation sibling — proactive + reactive; holds refresh creds in
 # ITS env, never the dispatcher's. Rotated material lands where the Executor reads it.
-.venv/bin/doo auth-helper run --engagement acme-test --config engagement.yaml
+.venv/bin/doo auth-helper run --engagement acme-test --config docs/examples/engagement.yaml
 
 # 1. Arm + drain a run (real OPA needs `opa` on PATH; --unsafe-stub-opa is staging-only).
-.venv/bin/doo dispatch run -e acme-test -c engagement.yaml --select test_class=idor -n 20
+.venv/bin/doo dispatch run -e acme-test -c docs/examples/engagement.yaml --select test_class=idor -n 20
 #   per TestCase: deterministic constructor → Dispatcher gate → wire → EXECUTED_AS,
 #   then the Interpreter confirm loop judges it (verdict = the 4th TestCase axis).
 
@@ -185,7 +197,11 @@ The first commands that **send traffic**. A dispatch run is the authorization un
 
 The LLM never composes request bytes (constructors do) and never sets `dispatch_status` (a deterministic classifier does, ADR-0013/0044). The Interpreter picks request *roles* from a closed per-`test_class` enum and may surface `follow_ups` — new hypotheses that go back through the Planner's Validator to `review_status=proposed` (`source=llm-interpreter`), never dispatched in-run (`confirm` mode). The Interpreter uses the same `DOO_PLANNER_*` model config as the Planner.
 
+## Reference
+
 ### Command reference
+
+Every command supports `--help` (e.g. `doo dispatch run --help`); run `doo --help` for the full surface. The table below is a quick index.
 
 | Command | What it does |
 |---|---|
@@ -193,14 +209,18 @@ The LLM never composes request bytes (constructors do) and never sets `dispatch_
 | `doo engagement status <id>` | Print an engagement's properties + Scope hash |
 | `doo engagement keepalive <id>` | Run the external kill-switch lease keeper |
 | `doo ingest har --engagement <id> <har>` | L1: upload the HAR + queue an envelope |
-| `doo worker run [--once] [--batch N]` | L2+L3: drain the streams into the graph |
-| `doo coverage c1\|c2\|c2b\|c3\|c4\|c5\|c5a\|c5b --engagement <id>` | Deterministic coverage gaps (read-only; `--json` available). C5* are TrustBoundary test coverage |
-| `doo planner propose --engagement <id> [-g <gen>]` | Select gaps → propose + validate + commit `TestCase`s (no dispatch) |
-| `doo planner review --engagement <id> [--approve\|--reject <key> --actor <who>]` | Prioritised review queue; approve/reject into the audit ledger |
-| `doo dispatch run -e <id> -c <yaml> [--select k=v -n N]` | Arm + drain a budget-bounded run: gate → send → `EXECUTED_AS` → confirm-loop verdict |
-| `doo dispatch review -e <id> [--set-hint\|--ignore-hazard …]` | Triage refused/blocked TestCases; set hazard overrides the next run reads |
-| `doo finding review -e <id> [--confirm\|--reject <key> --actor <who>]` | Review `proposed` Findings; only `confirmed` feed reporting |
+| `doo worker run [--once] [--batch N] [--json]` | L2+L3: drain the streams into the graph |
+| `doo coverage c1\|c2\|c2b\|c3\|c4\|c5\|c5a\|c5b -e <id> [--min-confidence F] [--json]` | Deterministic coverage gaps (read-only). C2 also takes `--as`/`--not-as`; C5* are TrustBoundary test coverage |
+| `doo planner propose -e <id> [-g <gen>] [--json]` | Select gaps → propose + validate + commit `TestCase`s (no dispatch) |
+| `doo planner review -e <id> [--top N] [--approve\|--reject <key>] [--disposition permanent\|defer] [--actor <who>] [--reason <why>] [--json]` | Prioritised review queue; approve/reject into the audit ledger |
+| `doo dispatch run -e <id> -c <yaml> [--select k=v] [-n N] [--arming review\|auto] [--unsafe-stub-opa] [--actor <who>]` | Arm + drain a budget-bounded run: gate → send → `EXECUTED_AS` → confirm-loop verdict |
+| `doo dispatch review -e <id> [--set-hint <key> <kind> <url>] [--ignore-hazard <key> <kind>] [--json]` | Triage refused/blocked TestCases; set hazard overrides the next run reads |
+| `doo finding review -e <id> [--confirm\|--reject <key>] [--actor <who>] [--reason <why>]` | Review `proposed` Findings; only `confirmed` feed reporting |
 | `doo auth-helper run -e <id> -c <yaml>` | Sibling process: rotate declared AuthContexts (proactive + reactive) |
+
+### Engagement config
+
+The `--config` YAML that drives `dispatch` and `auth-helper` is documented field-by-field in [docs/engagement-config.md](docs/engagement-config.md), with a complete example at [docs/examples/engagement.yaml](docs/examples/engagement.yaml).
 
 ### Troubleshooting
 

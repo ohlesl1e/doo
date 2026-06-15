@@ -6,6 +6,10 @@ get-docker.sh
 # never committed). The directory is a scratch space for graph inspection.
 tests/test_har/
 
+# Per-target scratch space: test projects, captures, and engagement data
+# (real-target data; never committed).
+targets/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
