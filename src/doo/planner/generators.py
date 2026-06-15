@@ -37,6 +37,7 @@ from doo.planner.assemble import (
     assemble_c3_pack,
     assemble_sink_pack,
     fetch_reaching_observation_hazards,
+    fetch_reaching_observation_source_hints,
 )
 from doo.planner.llm import (
     DraftRejected,
@@ -436,7 +437,10 @@ class C2Generator:
                 update={
                     "replay_hazards": fetch_reaching_observation_hazards(
                         client, engagement_id, endpoint_id=g.endpoint_id
-                    )
+                    ),
+                    "hazard_source_hints": fetch_reaching_observation_source_hints(
+                        client, engagement_id, endpoint_id=g.endpoint_id
+                    ),
                 }
             ),
         )
@@ -493,7 +497,10 @@ class C2bGenerator:
                 update={
                     "replay_hazards": fetch_reaching_observation_hazards(
                         client, engagement_id, endpoint_id=g.endpoint_id
-                    )
+                    ),
+                    "hazard_source_hints": fetch_reaching_observation_source_hints(
+                        client, engagement_id, endpoint_id=g.endpoint_id
+                    ),
                 }
             ),
         )

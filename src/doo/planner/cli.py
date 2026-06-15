@@ -47,8 +47,7 @@ from doo.planner.service import propose, review_queue
 
 planner_app = typer.Typer(
     help="Planner: deterministic hypothesis generation + human review over the "
-    "graph (slice 3, ADRs 0036–0041). Nothing is dispatched. Run after ingestion "
-    "settles.",
+    "graph. Nothing is dispatched. Run after ingestion settles.",
     no_args_is_help=True,
 )
 
@@ -238,7 +237,13 @@ def propose_cmd(
         False, "--json", help="Emit the run summary as JSON instead of a table."
     ),
 ) -> None:
-    """Run the deterministic generators and commit proposed `TestCase`s (no dispatch)."""
+    """Run the deterministic generators and commit proposed `TestCase`s (no dispatch).
+
+    Selects targets with the candidate generators (C1 is deterministic; the
+    rest ask the LLM for a structured proposal), validates and scopes each, and
+    commits survivors at `review_status = proposed`. `-g` limits to specific
+    generators. Nothing is sent — approval happens in `doo planner review`.
+    """
 
     _configure()
     config = (
@@ -374,7 +379,14 @@ def review_cmd(
         False, "--json", help="Emit the queue / decision as JSON instead of a table."
     ),
 ) -> None:
-    """Show the prioritised review queue, or approve / reject a proposal (no dispatch)."""
+    """Show the prioritised review queue, or approve / reject a proposal (no dispatch).
+
+    With no action flag, prints the top proposals ranked by priority. `--approve`
+    / `--reject` (by key_hash or unambiguous prefix) record a provenanced
+    decision in the audit ledger; a rejection's `--disposition` controls whether
+    it can re-surface. `approved` means cleared for consideration, not authorized
+    to send.
+    """
 
     _configure()
     client = _build_client()

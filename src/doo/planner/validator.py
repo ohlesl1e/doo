@@ -353,13 +353,17 @@ def validate(
         payload_hash=payload_hash,
         auth_context_id=proposal.auth_context_id,
         source=source_for(proposal.generator, proposal.mode),
+        generator=proposal.generator,
         expected_yield=proposal.expected_yield,
         expected_yield_method=proposal.confidence_method,
         justification=proposal.justification,
         expected_outcome=proposal.expected_outcome,
-        # Replay-fidelity annotation (ADR-0041): code-set on the proposal, carried
-        # through verbatim. NOT an identity input (absent from `key_hash` above).
+        # Authz-replay execution intent + replay-fidelity annotation (ADR-0041):
+        # code-set on the proposal, carried through verbatim. NOT identity inputs
+        # (absent from `key_hash` above).
+        hold=proposal.hold,
         replay_hazards=proposal.replay_hazards,
+        hazard_source_hints=proposal.hazard_source_hints,
         llm_audit_key=proposal.llm_audit_key,
     )
 

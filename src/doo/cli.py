@@ -15,6 +15,7 @@ import typer
 
 from doo.cli_worker import register_worker
 from doo.coverage.cli import coverage_app
+from doo.dispatch.cli import auth_helper_app, dispatch_app, finding_app
 from doo.engagement.cli_keepalive import register_keepalive
 from doo.ingestion.cli_ingest import register_ingest
 from doo.observability.ids import new_span_id, new_trace_id
@@ -30,7 +31,8 @@ app = typer.Typer(
 )
 
 engagement_app = typer.Typer(
-    help="Engagement lifecycle commands (per ADR-0012 / ADR-0019).",
+    help="Engagement lifecycle: create/attach, inspect, and keep the "
+    "kill-switch lease alive.",
     no_args_is_help=True,
 )
 app.add_typer(engagement_app, name="engagement")
@@ -40,6 +42,15 @@ app.add_typer(coverage_app, name="coverage")
 
 # Slice-3: mount the planner sub-app (`doo planner propose|review`, ADR-0040).
 app.add_typer(planner_app, name="planner")
+
+# Slice-4: mount the dispatch sub-app (`doo dispatch run`, ADR-0042).
+app.add_typer(dispatch_app, name="dispatch")
+
+# Slice-4: mount the finding sub-app (`doo finding review`, ADR-0045).
+app.add_typer(finding_app, name="finding")
+
+# Slice-4: mount the auth-helper sub-app (`doo auth-helper run`, ADR-0014/#91).
+app.add_typer(auth_helper_app, name="auth-helper")
 
 log = get_logger(__name__)
 
@@ -111,7 +122,13 @@ def start(
         help="Skip the interactive confirm-prompt on material Scope diffs.",
     ),
 ) -> None:
-    """Create or re-attach an engagement (idempotent per ADR-0019)."""
+    """Create or re-attach an engagement (idempotent).
+
+    Loads the tester-side facts from the YAML (scope, principals, kill-switch,
+    dispatch settings) and reconciles them with the graph. On a material Scope
+    change it prints a diff and asks to confirm; `--apply` skips the prompt. A
+    cosmetic-only or unchanged config is a no-op.
+    """
 
     configure_logging()
     bind_correlation(trace_id=new_trace_id(), span_id=new_span_id())
@@ -152,7 +169,11 @@ def start(
 def status(
     engagement_id: str = typer.Argument(..., help="Engagement id to read."),
 ) -> None:
-    """Read-only: print Engagement properties + Scope content_hash."""
+    """Read-only: print an engagement's properties + Scope content_hash.
+
+    Reports the stored id, name, environment, and the Scope content hash so you
+    can confirm what is attached and spot drift from a config. Writes nothing.
+    """
 
     configure_logging()
     bind_correlation(trace_id=new_trace_id(), span_id=new_span_id())

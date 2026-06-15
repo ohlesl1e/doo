@@ -93,7 +93,12 @@ def register_ingest(app: typer.Typer) -> None:
             typer.Option("--engagement", "-e", help="Engagement id to ingest under."),
         ],
     ) -> None:
-        """Upload a HAR file: blob to storage, envelope onto the `ingest` stream."""
+        """Upload a HAR file: blob to storage, envelope onto the `ingest` stream.
+
+        L1 only — this stages the capture for processing; it does NOT build the
+        graph. Run `doo worker run` (L2+L3) afterwards to drain it. Scope does
+        not gate ingestion, so out-of-scope hosts in the capture are stored too.
+        """
 
         configure_logging()
         bind_correlation(trace_id=new_trace_id(), span_id=new_span_id())

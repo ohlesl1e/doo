@@ -52,7 +52,8 @@ class Neo4jGraphState:
                    s.content_hash AS scope_content_hash,
                    e.kill_switch AS kill_switch,
                    e.session_cookie_names AS session_cookie_names,
-                   e.identity_key AS identity_key
+                   e.identity_key AS identity_key,
+                   e.environment AS environment
             LIMIT 1
             """,
             engagement_id=engagement_id,
@@ -74,6 +75,7 @@ class Neo4jGraphState:
             kill_switch_refresh_seconds=int(kill_switch.get("refresh_interval_seconds", 30)),
             session_cookie_names=tuple(row.get("session_cookie_names") or ()),
             identity_key=row.get("identity_key"),
+            environment=row.get("environment"),
             declared_principals=self._fetch_declared_principals(engagement_id),
         )
 
@@ -261,6 +263,7 @@ def _engagement_update(client: Neo4jClient, m: PlannedMutation) -> None:
             e.kill_switch = $props.kill_switch,
             e.session_cookie_names = $props.session_cookie_names,
             e.identity_key = $props.identity_key,
+            e.environment = $props.environment,
             e.last_seen = $props.last_seen
         """,
         id=props["id"],

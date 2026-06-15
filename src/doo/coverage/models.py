@@ -197,6 +197,31 @@ class C4Result(CoverageResult):
     effective_confidence: float
 
 
+class C5Result(CoverageResult):
+    """One `TrustBoundary` not yet covered to the queried stage (ADR-0034/0047, S7).
+
+    The boundary analog of the C1–C4 gaps, over inferred `TrustBoundary`s
+    (capability / tenant, ADR-0039). `query_id` discriminates the stage:
+
+    - `C5`  — no `TARGETS_BOUNDARY` TestCase executed-to-verdict (an
+      `EXECUTED_AS(dispatch_status='ok')` AND `interpreter_verdict ∈ {vulnerable,
+      not_vulnerable}`); i.e. the boundary has not been *tested to a conclusion*.
+    - `C5a` — no `proposed` TestCase targets it (the Planner never proposed one).
+    - `C5b` — no `approved` TestCase targets it (nothing armed-able).
+
+    Each row names the boundary `id` + `kind` (`capability`/`tenant`) and its two
+    `between` endpoint ids.
+    """
+
+    query_id: str = Field(default="C5", frozen=True)
+
+    boundary_id: str
+    kind: str
+    between_a_id: str
+    between_b_id: str
+    effective_confidence: float
+
+
 class C1Result(CoverageResult):
     """One in-scope `Endpoint` with no `HIT` edge of any kind (a dead endpoint).
 

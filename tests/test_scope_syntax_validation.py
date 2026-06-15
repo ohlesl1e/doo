@@ -24,6 +24,7 @@ from doo.setup.config import EngagementConfig
 def _config_dict(*, host_patterns: list[str], allowed_path_patterns: list[str]) -> dict:
     return {
         "engagement": {"id": "acme-2026", "name": "Acme"},
+        "environment": "staging",
         "scope": {
             "host_patterns": host_patterns,
             "allowed_methods": ["GET", "POST"],

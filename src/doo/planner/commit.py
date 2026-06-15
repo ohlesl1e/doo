@@ -49,6 +49,9 @@ _SOURCE_BY_GENERATOR = {"c1": "deterministic-c1"}
 # proposing *mode*, not the generator id, is what distinguishes an LLM contribution
 # from a deterministic one (CLAUDE.md: `source: "llm-<task>"`).
 LLM_PLANNER_SOURCE = "llm-planner"
+# The Interpreter's follow-up proposals commit a distinct source (ADR-0045/S8) so
+# provenance separates them from the Planner's, though they share this path.
+LLM_INTERPRETER_SOURCE = "llm-interpreter"
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,15 +72,27 @@ class ValidatedTestCase:
     payload_hash: Sha256Hex
     auth_context_id: AuthContextId
     source: str
+    # The deterministic generator that selected this target (ADR-0036). Persisted
+    # for the slice-4 selection predicate (`--select generator=c2`). NOT part of
+    # `key_hash` (ADR-0007: same content via different generators is one test).
+    generator: str
     expected_yield: float
     expected_yield_method: str
     justification: str
     expected_outcome: str
+    # Authz-replay execution intent (ADR-0041): the param names held verbatim from
+    # the evidence observation while auth is swapped. Persisted so the slice-4
+    # constructor (ADR-0043) can apply it deterministically. Like `replay_hazards`,
+    # a derivable execution-fidelity annotation — NOT part of `key_hash`.
+    hold: tuple[str, ...] = ()
     # Replay-fidelity annotation (ADR-0041): the deterministically-detected
     # replay-breaker roles in the evidencing observation. Set by code, never the LLM,
     # and **not** part of `key_hash` (a derivable execution-fidelity annotation, like
     # `hold`). Persisted as a node property for the review surface.
     replay_hazards: tuple[str, ...] = ()
+    # Resolvable-hazard `source_hint`s (`"<kind>=<url>"`, ADR-0041): where the
+    # slice-4 resolver fetches a fresh token (csrf). Code-set, not in `key_hash`.
+    hazard_source_hints: tuple[str, ...] = ()
     # Object-storage key of the proposing LLM call (ADR-0037), or None for a
     # deterministic proposal. Committed onto the node as replay provenance.
     llm_audit_key: str | None = None
@@ -113,6 +128,7 @@ def commit_testcase(
     vtc: ValidatedTestCase,
     *,
     now: datetime | None = None,
+    code_version: str | None = None,
 ) -> CommitOutcome:
     """Idempotently commit a validated `TestCase` at `review_status = proposed`.
 
@@ -161,7 +177,10 @@ def commit_testcase(
             t.expected_yield_method = $expected_yield_method,
             t.justification = $justification,
             t.expected_outcome = $expected_outcome,
+            t.hold = $hold,
             t.replay_hazards = $replay_hazards,
+            t.hazard_source_hints = $hazard_source_hints,
+            t.generator = $generator,
             t.source = $source,
             t.source_id = $source_id,
             t.llm_audit_key = $llm_audit_key,
@@ -197,13 +216,16 @@ def commit_testcase(
         expected_yield_method=vtc.expected_yield_method,
         justification=vtc.justification,
         expected_outcome=vtc.expected_outcome,
+        hold=list(vtc.hold),
         replay_hazards=list(vtc.replay_hazards),
+        hazard_source_hints=list(vtc.hazard_source_hints),
+        generator=vtc.generator,
         source=vtc.source,
         source_id=None,
         llm_audit_key=vtc.llm_audit_key,
         confidence=VALIDATED_CONFIDENCE,
         now=run_at,
-        code_version=__version__,
+        code_version=code_version or __version__,
         target_id=target_id,
     )
     # The target MATCH is guaranteed to succeed: the validator resolved the target
@@ -238,7 +260,7 @@ def source_for(generator: str, mode: str) -> str:
     """
 
     if mode == "llm":
-        return LLM_PLANNER_SOURCE
+        return LLM_INTERPRETER_SOURCE if generator == "interpreter" else LLM_PLANNER_SOURCE
     return source_for_generator(generator)
 
 

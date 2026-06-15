@@ -44,6 +44,7 @@ from doo.coverage.models import (
     C2Result,
     C3Result,
     C4Result,
+    C5Result,
     PrincipalEvidence,
 )
 from doo.coverage.reached import ReachedEvidence, reached_by_auth_map, reached_map
@@ -1059,3 +1060,131 @@ def run_c4(
         min_confidence=min_confidence,
     )
     return results
+
+
+# ---------------------------------------------------------------------------
+# C5 / C5a / C5b — TrustBoundary test coverage (ADR-0034/0047, S7/#92).
+# ---------------------------------------------------------------------------
+
+# The per-stage "is this boundary covered?" predicate, evaluated per boundary as
+# an OPTIONAL-MATCH count. C5 = executed-to-verdict; C5a = a proposed TestCase
+# exists; C5b = an approved TestCase exists. A boundary is a *gap* when the count
+# is zero.
+_C5_COVERED = {
+    "C5": (
+        "OPTIONAL MATCH (t:TestCase)-[:TARGETS_BOUNDARY]->(tb) "
+        "WHERE t.status = 'active' "
+        "AND t.interpreter_verdict IN ['vulnerable', 'not_vulnerable'] "
+        "AND EXISTS { MATCH (t)-[x:EXECUTED_AS]->() WHERE x.dispatch_status = 'ok' }"
+    ),
+    "C5a": (
+        # No TestCase targets it at all — the Planner never proposed one. (Any
+        # active TC, in any review state, counts as "proposed"; the lifecycle is
+        # proposed → approved, so this nests under C5b ⊆ C5.)
+        "OPTIONAL MATCH (t:TestCase)-[:TARGETS_BOUNDARY]->(tb) "
+        "WHERE t.status = 'active'"
+    ),
+    "C5b": (
+        "OPTIONAL MATCH (t:TestCase)-[:TARGETS_BOUNDARY]->(tb) "
+        "WHERE t.status = 'active' AND t.review_status = 'approved'"
+    ),
+}
+
+
+def _run_c5_stage(
+    client: Neo4jClient,
+    engagement_id: EngagementId,
+    *,
+    query_id: str,
+    min_confidence: float,
+    now: datetime | None,
+) -> list[C5Result]:
+    """Shared driver for C5 / C5a / C5b — uncovered `TrustBoundary`s (ADR-0047)."""
+
+    run_at = now or datetime.now(UTC)
+    frag = for_engagement(engagement_id, var="tb")
+    rows = client.execute_read(
+        f"""
+        MATCH (tb:TrustBoundary)
+        {frag.and_("tb.status = 'active'")}
+        {_C5_COVERED[query_id]}
+        WITH tb, count(t) AS covered
+        WHERE covered = 0
+        RETURN tb.id AS boundary_id, tb.kind AS kind,
+               tb.between_a_id AS between_a_id, tb.between_b_id AS between_b_id,
+               coalesce(tb.confidence, 1.0) AS confidence, tb.last_seen AS last_seen
+        ORDER BY kind, boundary_id
+        """,
+        **frag.parameters,
+    )
+    results: list[C5Result] = []
+    for r in rows:
+        eff = effective_confidence(
+            float(r["confidence"]),
+            _to_aware(r.get("last_seen"), fallback=run_at),
+            now=run_at,
+        )
+        if eff < min_confidence:
+            continue
+        results.append(
+            C5Result(
+                engagement_id=engagement_id,
+                query_id=query_id,
+                generated_at=run_at,
+                boundary_id=str(r["boundary_id"]),
+                kind=str(r["kind"]),
+                between_a_id=str(r["between_a_id"]),
+                between_b_id=str(r["between_b_id"]),
+                effective_confidence=eff,
+            )
+        )
+    log.info(
+        "coverage.c5.complete",
+        engagement_id=engagement_id,
+        query_id=query_id,
+        gaps=len(results),
+        min_confidence=min_confidence,
+    )
+    return results
+
+
+def run_c5(
+    client: Neo4jClient,
+    engagement_id: EngagementId,
+    *,
+    min_confidence: float = 0.0,
+    now: datetime | None = None,
+) -> list[C5Result]:
+    """C5 — `TrustBoundary`s with no TestCase executed-to-verdict (ADR-0047)."""
+
+    return _run_c5_stage(
+        client, engagement_id, query_id="C5", min_confidence=min_confidence, now=now
+    )
+
+
+def run_c5a(
+    client: Neo4jClient,
+    engagement_id: EngagementId,
+    *,
+    min_confidence: float = 0.0,
+    now: datetime | None = None,
+) -> list[C5Result]:
+    """C5a — `TrustBoundary`s with no *proposed* TestCase (the Planner skipped them)."""
+
+    return _run_c5_stage(
+        client, engagement_id, query_id="C5a", min_confidence=min_confidence, now=now
+    )
+
+
+def run_c5b(
+    client: Neo4jClient,
+    engagement_id: EngagementId,
+    *,
+    min_confidence: float = 0.0,
+    now: datetime | None = None,
+) -> list[C5Result]:
+    """C5b — `TrustBoundary`s with no *approved* TestCase (nothing armed-able)."""
+
+    return _run_c5_stage(
+        client, engagement_id, query_id="C5b", min_confidence=min_confidence, now=now
+    )

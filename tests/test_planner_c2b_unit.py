@@ -30,6 +30,7 @@ from doo.planner.replay_hazards import (
     HazardField,
     detect_replay_hazards,
     hazards_for_value_candidates,
+    source_hints_for_value_candidates,
 )
 
 # ---------------------------------------------------------------------------
@@ -149,6 +150,51 @@ def test_hazards_from_value_candidates_reads_header_input() -> None:
         ),
     )
     assert hazards_for_value_candidates(candidates) == ("csrf_token",)
+
+
+def test_source_hint_emitted_from_referer_for_csrf() -> None:
+    # A CSRF token + a Referer header → the hint is the page that minted it (S5/#90).
+    candidates = (
+        ValueCandidate(
+            value_hash="a" * 64,
+            kind="token",
+            extractor="request-param:hazard_v1",
+            role="input",
+            section="body",
+            value=None,
+            value_length=40,
+            parameter_name="_csrf",
+        ),
+        ValueCandidate(
+            value_hash="b" * 64,
+            kind="url",
+            extractor="request-header:referer_v1",
+            role="input",
+            section="header",
+            value="https://shop.example.com/orders/new",
+            header_name="Referer",
+            parameter_name="Referer",
+        ),
+    )
+    assert source_hints_for_value_candidates(candidates) == (
+        "csrf_token=https://shop.example.com/orders/new",
+    )
+
+
+def test_no_source_hint_without_referer() -> None:
+    candidates = (
+        ValueCandidate(
+            value_hash="a" * 64,
+            kind="token",
+            extractor="request-param:hazard_v1",
+            role="input",
+            section="body",
+            value=None,
+            value_length=40,
+            parameter_name="_csrf",
+        ),
+    )
+    assert source_hints_for_value_candidates(candidates) == ()
 
 
 # ---------------------------------------------------------------------------

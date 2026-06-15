@@ -29,6 +29,7 @@ dependencies = [
     "pyjwt>=2.8",
     "pyyaml>=6.0",
     "rich>=13",
+    "httpx>=0.27",
 ]
 
 [project.optional-dependencies]
@@ -37,8 +38,11 @@ dev = [
     "pytest-asyncio>=0.23",
     "testcontainers[neo4j,redis,minio]>=4.0",
     "httpx>=0.27",
-    "mypy>=1.9",
-    "ruff>=0.4",
+    # Pin the CI-gating linters to exact versions so a new release can't silently
+    # turn a green branch red (e.g. mypy 2.x flagging stale `# type: ignore`s).
+    # Bump deliberately in its own PR. Runtime deps stay ranged.
+    "mypy==2.1.0",
+    "ruff==0.15.15",
     "types-PyYAML>=6.0",
 ]
 # Production-only: the planner's real LLM caller lazy-imports litellm; CI/tests

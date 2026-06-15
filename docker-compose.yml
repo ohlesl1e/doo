@@ -1,7 +1,8 @@
-# Local-dev stack for DOO slice 1.
+# Local-dev stack for DOO.
 #
-# Three services: Neo4j (graph), Redis (queue + kill-switch lease), MinIO (blobs).
-# Configured for laptop use; tighten for staging/production.
+# Four services: Neo4j (graph), Redis (queue + kill-switch lease), MinIO
+# (blobs), OPA (dispatcher policy sidecar — slice 4, ADR-0046). Configured for
+# laptop use; tighten for staging/production.
 
 services:
   neo4j:
@@ -53,6 +54,39 @@ services:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 10s
       timeout: 5s
+      retries: 5
+
+  # OPA policy sidecar (slice 4, ADR-0046). Loads the fixed Rego ruleset
+  # (`policy/scope.rego`) at start; the per-engagement `data.scope` document is
+  # generated from the `Scope` node at run-arm time and pushed via the data API
+  # (`PUT /v1/data/scope`). The dispatcher's authoritative policy check.
+  #
+  # Two ways to use it from the host:
+  #   1. HTTP server on :8181 — `POST /v1/data/doo/scope` with `{"input": …}`.
+  #      Set `DOO_OPA_URL=http://localhost:8181` for an `OpaHttpClient` (S2+).
+  #   2. CLI via the same image — the current `OpaEvalClient` shells out to
+  #      `opa eval`; either install the static binary on PATH (recommended for
+  #      tests: `opa test src/doo/policy/`), or set
+  #      `DOO_OPA_BIN='docker compose run --rm -T opa'` as a wrapper.
+  opa:
+    image: openpolicyagent/opa:latest
+    container_name: doo-opa
+    ports:
+      - "8181:8181"
+    command:
+      - "run"
+      - "--server"
+      - "--addr=0.0.0.0:8181"
+      - "--log-level=info"
+      # The fixed ruleset (ADR-0046). The test rego is excluded — `opa test`
+      # runs against the source tree, not this server.
+      - "/policy/scope.rego"
+    volumes:
+      - ./src/doo/policy:/policy:ro
+    healthcheck:
+      test: ["CMD", "/opa", "eval", "--fail", "true"]
+      interval: 5s
+      timeout: 3s
       retries: 5
 
 volumes:

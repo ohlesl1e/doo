@@ -41,7 +41,11 @@ from doo.ids import (
 # the `source` provenance tag on a committed deterministic TestCase
 # (`deterministic-c1`, ADR-0036). LLM-proposing generators (slice-3 tracers,
 # slice 4) commit `source = "llm-planner"` instead.
-GeneratorId = Literal["c1", "c2", "c2b", "c3", "c4", "tenant", "sink"]
+# `interpreter` is the slice-4 follow-up *source* (ADR-0045/S8): the confirm loop
+# surfaces a genuinely-new test, committed via this same Validator path. It is a
+# valid `generator` provenance value but NOT a runnable planner generator, so it is
+# deliberately absent from `GENERATOR_IDS` (the config default + planner registry).
+GeneratorId = Literal["c1", "c2", "c2b", "c3", "c4", "tenant", "sink", "interpreter"]
 GENERATOR_IDS: tuple[GeneratorId, ...] = ("c1", "c2", "c2b", "c3", "c4", "tenant", "sink")
 
 # A replay-breaking request-field role (ADR-0041). A field bound to the original
@@ -200,6 +204,13 @@ class PlannerProposal(BaseModel):
     # *flags* a naive-replay false-negative risk; the refresh + the `replay_invalid`
     # dispatch_status land in slice 4.
     replay_hazards: tuple[str, ...] = ()
+
+    # Resolvable-hazard `source_hint`s (`"<kind>=<url>"`, ADR-0041): for a
+    # `csrf_token`, the page the token was minted on (the observed `Referer`), so
+    # the slice-4 resolver can fetch a fresh token under the test's auth. Set by
+    # CODE alongside `replay_hazards`; like it, NOT part of the key_hash. Empty when
+    # no hint applies (nonce/timestamp need none; no observed Referer).
+    hazard_source_hints: tuple[str, ...] = ()
 
     # Object-storage key of the verbatim LLM request/response that produced this
     # proposal (ADR-0037 replayability). Set only for `mode == "llm"` proposals —

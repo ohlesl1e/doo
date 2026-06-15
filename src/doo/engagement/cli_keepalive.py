@@ -99,7 +99,7 @@ def register_keepalive(engagement_app: typer.Typer) -> None:
             ..., help="Engagement id whose kill-switch lease to keep alive."
         ),
     ) -> None:
-        """Hold the kill-switch lease alive until SIGTERM (ADR-0014).
+        """Hold the kill-switch lease alive until SIGTERM.
 
         Started explicitly by the tester after `doo engagement start`. SIGTERM
         releases the lease and exits 0; SIGKILL lets it expire within the TTL.
