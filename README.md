@@ -1,4 +1,4 @@
-# doo
+# DoO
 
 **Department of Offense** — a security testing copilot for black-box web application testing.
 
