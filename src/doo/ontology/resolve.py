@@ -194,7 +194,9 @@ def resolve_auth_context(
         )
 
     # Path 3: reconcile a fresh discovered AuthContext against declared signals.
-    matched = _match_declared_principal(client, engagement_id=engagement_id, cue=cue)
+    matched = _match_declared_principal(
+        client, engagement_id=engagement_id, cue=cue, preferred_claim=preferred_claim
+    )
     token_kind = _cue_primary_kind(cue)
 
     if matched is not None:
@@ -354,28 +356,48 @@ def _touch_auth_context(
 
 
 def _match_declared_principal(
-    client: Neo4jClient, *, engagement_id: EngagementId, cue: AuthContextCue
+    client: Neo4jClient,
+    *,
+    engagement_id: EngagementId,
+    cue: AuthContextCue,
+    preferred_claim: str | None = None,
 ) -> dict[str, object] | None:
     """Walk ADR-0010's reconciliation priority list against declared Principals.
 
-    Priority (slice-1): (1) JWT `sub` -> `known_signals.jwt_sub`,
-    (2) identifying header -> `known_signals.headers`, (3) email tied to the
-    AuthContext -> `known_signals.email`.
+    **Priority 0 (ADR-0048):** the cue's decoded `identity_claims` are matched
+    against each declared `AuthContext`'s own decoded `identity_claims` (loaded
+    by the engagement loader / written by the auth-helper on rotation), via
+    `match_identity_claims` — the same ADR-0030 walk-and-intersect the
+    discovered-key resolver uses, with `preferred_claim` (`auth.identity_key`,
+    ADR-0032) first. Expired declared ACs are included: a rotated-out token's
+    claims remain valid identity evidence for its Principal. A per-AC
+    `DISAGREE` (highest shared claim differs) skips that AC; `None` (no shared
+    claim) leaves the AC undecided and falls through to the `known_signals`
+    priorities — so an opaque declared token (empty claims) still reconciles
+    via the tester-supplied fallback signals.
 
-    Step 4 (the `/me` observed-user-id match) is deferred until response-body
-    extraction lands in T6 — see the TODO below. Step 5 (synthetic fallback) is
-    handled by the caller when this returns None.
+    Lower priorities (the slice-1 `known_signals` opaque-token fallback) are
+    unchanged: (1) JWT `sub` → `known_signals.jwt_sub`, (2) identifying header →
+    `known_signals.headers`, (3) email → `known_signals.email`. Step 4 (the
+    `/me` observed-user-id match) is deferred — see the TODO below. Step 5
+    (synthetic fallback) is handled by the caller when this returns None.
 
     Returns the matched declared Principal's `{id, identity_key}` or None.
     """
 
     import json
 
+    from doo.canonical.identity import DISAGREE, match_identity_claims
+
     declared = client.execute_read(
         """
         MATCH (p:Principal {engagement_id: $engagement_id, tier: 'declared'})
         WHERE p.status = 'active'
-        RETURN p.id AS id, p.identity_key AS identity_key, p.known_signals AS known_signals
+        OPTIONAL MATCH (ac:AuthContext {tier: 'declared'})-[:OF_PRINCIPAL]->(p)
+        WHERE ac.status IN ['active', 'expired']
+        RETURN p.id AS id, p.identity_key AS identity_key,
+               p.known_signals AS known_signals,
+               collect(ac.identity_claims) AS ac_identity_claims
         """,
         engagement_id=engagement_id,
     )
@@ -386,6 +408,34 @@ def _match_declared_principal(
         if isinstance(ks, str):
             ks = json.loads(ks)
         parsed.append((row, ks))
+
+    # Priority 0 (ADR-0048): cue claims vs each declared AuthContext's own
+    # decoded claims, walk-and-intersect over the ADR-0030 list. A shared
+    # agreeing claim is the strongest possible reconciliation signal — the
+    # declared credential itself proves the actor.
+    if cue.identity_claims:
+        for row, _ks in parsed:
+            ac_claims_raw = row.get("ac_identity_claims")
+            if not isinstance(ac_claims_raw, list):
+                continue
+            for raw_claims in ac_claims_raw:
+                if not raw_claims:
+                    continue
+                try:
+                    decl_claims = json.loads(str(raw_claims))
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if not isinstance(decl_claims, dict) or not decl_claims:
+                    continue
+                outcome = match_identity_claims(
+                    cue.identity_claims, decl_claims, preferred_claim=preferred_claim
+                )
+                if outcome is None or outcome == DISAGREE:
+                    # No shared claim, or a both-present disagreement: this AC
+                    # is not evidence either way → try the Principal's other
+                    # ACs / other Principals; fall through to known_signals.
+                    continue
+                return {"id": row["id"], "identity_key": row["identity_key"]}
 
     # Priority 1: JWT `sub` claim from the cue's decoded identity_claims.
     cue_sub = cue.identity_claims.get("sub")
@@ -442,9 +492,8 @@ def _discovered_ac_props(
             {"exp": datetime.fromtimestamp(float(exp), tz=UTC).isoformat()}, sort_keys=True
         )
     return {
-        # Graph property name kept as `bearer_claims` (persisted schema unchanged);
-        # the source is now the source-agnostic cue field (ADR-0027).
-        "bearer_claims": json.dumps(dict(cue.identity_claims), sort_keys=True),
+        # Source-agnostic cue claims persisted as `identity_claims` (ADR-0027/0048).
+        "identity_claims": json.dumps(dict(cue.identity_claims), sort_keys=True),
         "validity_window": validity_window,
         "confidence": confidence,
     }
@@ -478,7 +527,7 @@ def _write_discovered_auth_context(
         MERGE (ac:AuthContext {engagement_id: $engagement_id, auth_hash: $auth_hash})
         ON CREATE SET ac.id = $auth_context_id, ac.token_kind = $token_kind,
                       ac.tier = 'discovered', ac.is_anonymous = false,
-                      ac.bearer_claims = $derived.bearer_claims,
+                      ac.identity_claims = $derived.identity_claims,
                       ac.validity_window = $derived.validity_window,
                       ac += $props
         ON MATCH SET ac.last_seen = $props.last_seen
@@ -533,7 +582,7 @@ def _write_discovered_principal_and_auth_context(
         MERGE (ac:AuthContext {engagement_id: $engagement_id, auth_hash: $auth_hash})
         ON CREATE SET ac.id = $auth_context_id, ac.token_kind = $token_kind,
                       ac.tier = 'discovered', ac.is_anonymous = false,
-                      ac.bearer_claims = $derived.bearer_claims,
+                      ac.identity_claims = $derived.identity_claims,
                       ac.validity_window = $derived.validity_window,
                       ac += $ac_props
         ON MATCH SET ac.last_seen = $ac_props.last_seen

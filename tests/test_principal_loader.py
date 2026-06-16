@@ -165,6 +165,26 @@ def test_principal_removal_retracts() -> None:
     assert any(m.kind == "principal_retract" for m in result.mutations)
 
 
+def test_loader_runs_retroactive_declared_sweep_after_writes() -> None:
+    """ADR-0048: `engagement start` runs `reconcile_discovered_to_declared`
+    after declared writes (create + noop + update paths), threading
+    `auth.identity_key` as `preferred_claim`."""
+
+    state = FakeGraphState()
+    d = _base_config_dict()
+    d["auth"] = {"identity_key": "_id"}
+    config = EngagementConfig.model_validate(d)
+    # Create.
+    load_engagement(config, state, env={})
+    # Noop reload.
+    result = load_engagement(config, state, env={})
+    assert result.noop is True
+    assert state.reconcile_calls == [
+        (config.engagement.id, "_id"),
+        (config.engagement.id, "_id"),
+    ]
+
+
 def test_declared_quoted_cookie_jwt_hashes_on_canonical_form() -> None:
     """A `kind: cookie` declared token whose env value is DQUOTE-wrapped (#103).
 
@@ -196,7 +216,7 @@ def test_declared_quoted_cookie_jwt_hashes_on_canonical_form() -> None:
     assert ac.properties["auth_hash"] == compute_auth_hash("cookie", bare)
     assert ac.properties["auth_hash"] != compute_auth_hash("cookie", wire)
     # Cookie JWT claims decoded over the normalised value.
-    assert ac.properties["bearer_claims"]["_id"] == "u-cookie"
+    assert ac.properties["identity_claims"]["_id"] == "u-cookie"
     assert ac.properties["validity_window"]["exp"].startswith("2100-01-01")
     # The wire-form raw token never escapes the loader (ADR-0015 still holds).
     blob = json.dumps([m.properties for m in result.mutations], default=str)

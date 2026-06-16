@@ -41,6 +41,14 @@ class FakeGraphState:
     applied: list[PlannedMutation] = field(default_factory=list)
     # engagement_id -> {label -> _principal_view-shaped dict}
     principals: dict[EngagementId, dict[str, dict]] = field(default_factory=dict)
+    reconcile_calls: list[tuple[EngagementId, str | None]] = field(default_factory=list)
+
+    def reconcile_discovered_to_declared(
+        self, engagement_id: EngagementId, *, preferred_claim: str | None
+    ) -> int:
+        """ADR-0048 retroactive sweep — no graph in the fake, just record the call."""
+        self.reconcile_calls.append((engagement_id, preferred_claim))
+        return 0
 
     def fetch_engagement_state(
         self, engagement_id: EngagementId

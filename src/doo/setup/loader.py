@@ -136,6 +136,17 @@ class GraphState(Protocol):
 
     def apply_mutations(self, mutations: tuple[PlannedMutation, ...]) -> None: ...
 
+    def reconcile_discovered_to_declared(
+        self, engagement_id: EngagementId, *, preferred_claim: str | None
+    ) -> int:
+        """Retroactive declared↔discovered Principal sweep (ADR-0048).
+
+        Called after declared-state writes so an ingest-then-declare sequence
+        converges. Returns the number of discovered Principals re-pointed.
+        Implementations without a graph (test fakes) return ``0``.
+        """
+        ...
+
 
 # ---------------------------------------------------------------------------
 # YAML file -> EngagementConfig with the id-immutability ledger.
@@ -205,6 +216,7 @@ class EngagementLoadResult:
     cosmetic_only: bool
     material_changes_applied: bool
     mutations: tuple[PlannedMutation, ...]
+    discovered_reconciled: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +249,7 @@ class _ResolvedAuthContext:
 
     auth_hash: Sha256Hex
     kind: str
-    bearer_claims: dict[str, str | int | float | bool | None]
+    identity_claims: dict[str, str | int | float | bool | None]
     validity_window: dict[str, Any] | None
 
 
@@ -281,7 +293,7 @@ def _resolve_auth_context(
     canonical = canonical_credential_value(decl.kind, token)
     auth_hash = compute_auth_hash(decl.kind, canonical)
 
-    bearer_claims: dict[str, str | int | float | bool | None] = {}
+    identity_claims: dict[str, str | int | float | bool | None] = {}
     validity_window: dict[str, Any] | None = None
 
     if decl.kind in ("bearer", "cookie"):
@@ -298,7 +310,7 @@ def _resolve_auth_context(
         # Keep only scalar claims (cue/graph carry scalars only).
         for key, value in decoded.items():
             if isinstance(value, str | int | float | bool) or value is None:
-                bearer_claims[str(key)] = value
+                identity_claims[str(key)] = value
         exp = decoded.get("exp")
         if isinstance(exp, int | float):
             validity_window = {
@@ -309,7 +321,7 @@ def _resolve_auth_context(
     return _ResolvedAuthContext(
         auth_hash=auth_hash,
         kind=decl.kind,
-        bearer_claims=bearer_claims,
+        identity_claims=identity_claims,
         validity_window=validity_window,
     )
 
@@ -523,7 +535,7 @@ def _principal_mutations(
                     "tier": "declared",
                     "is_anonymous": False,
                     "validity_window": r.validity_window,
-                    "bearer_claims": r.bearer_claims,
+                    "identity_claims": r.identity_claims,
                     "principal_identity_key": identity_key,
                     **cross,
                 },
@@ -656,11 +668,18 @@ def load_engagement(
                 )
             )
         state.apply_mutations(tuple(mutations))
+        # ADR-0048: retroactive sweep after declared writes — folds any
+        # already-ingested claim-keyed discovered Principals onto their
+        # declared counterparts (ingest-then-declare order). Idempotent.
+        reconciled = state.reconcile_discovered_to_declared(
+            config.engagement.id, preferred_claim=config.auth.identity_key
+        )
         log.info(
             "engagement.created",
             engagement_id=config.engagement.id,
             scope_content_hash=scope_content_hash,
             declared_principals=len(resolved_principals),
+            discovered_reconciled=reconciled,
         )
         return EngagementLoadResult(
             engagement_id=config.engagement.id,
@@ -670,6 +689,7 @@ def load_engagement(
             cosmetic_only=False,
             material_changes_applied=False,
             mutations=tuple(mutations),
+            discovered_reconciled=reconciled,
         )
 
     # Re-attach path. Decide what kind of change this is.
@@ -715,7 +735,18 @@ def load_engagement(
     cosmetic = name_changed or description_changed
 
     if not material and not cosmetic:
-        log.info("engagement.noop", engagement_id=config.engagement.id)
+        # ADR-0048: the retroactive sweep runs on EVERY `engagement start`,
+        # including a config noop — declared state hasn't changed but
+        # ingestion since the last load may have produced phantom discovered
+        # twins. Idempotent (status='active' filter), so a true noop reports 0.
+        reconciled = state.reconcile_discovered_to_declared(
+            config.engagement.id, preferred_claim=config.auth.identity_key
+        )
+        log.info(
+            "engagement.noop",
+            engagement_id=config.engagement.id,
+            discovered_reconciled=reconciled,
+        )
         return EngagementLoadResult(
             engagement_id=config.engagement.id,
             scope_content_hash=scope_content_hash,
@@ -724,6 +755,7 @@ def load_engagement(
             cosmetic_only=False,
             material_changes_applied=False,
             mutations=(),
+            discovered_reconciled=reconciled,
         )
 
     if material:
@@ -831,12 +863,16 @@ def load_engagement(
         )
 
     state.apply_mutations(tuple(mutations))
+    reconciled = state.reconcile_discovered_to_declared(
+        config.engagement.id, preferred_claim=config.auth.identity_key
+    )
     log.info(
         "engagement.updated",
         engagement_id=config.engagement.id,
         material=material,
         cosmetic_only=not material and cosmetic,
         scope_content_hash=scope_content_hash,
+        discovered_reconciled=reconciled,
     )
     return EngagementLoadResult(
         engagement_id=config.engagement.id,
@@ -846,4 +882,5 @@ def load_engagement(
         cosmetic_only=not material and cosmetic,
         material_changes_applied=material,
         mutations=tuple(mutations),
+        discovered_reconciled=reconciled,
     )

@@ -41,7 +41,10 @@ from doo.infra.neo4j_driver import Neo4jClient
 from doo.infra.streams import L3_EVENTS_STREAM, StreamClient
 from doo.observability.ids import new_span_id, new_trace_id
 from doo.observability.logging import bind_correlation, get_logger
-from doo.ontology.identity_reconcile import reconcile_observed_identities
+from doo.ontology.identity_reconcile import (
+    reconcile_discovered_to_declared,
+    reconcile_observed_identities,
+)
 from doo.ontology.promotion import PromotionResult, promote_values
 from doo.ontology.resolve import (
     commit_parse_failure,
@@ -387,6 +390,16 @@ class CommitOrchestrator:
             identity_upgrades += reconcile.upgrades
             principals_retracted += reconcile.retracted
             identity_aliases += reconcile.aliases
+            # ADR-0048: retroactive declared↔discovered sweep. AFTER the
+            # synthetic→claim upgrade so a Principal upgraded just now is
+            # swept onto a matching declared Principal in the same pass.
+            decl_reconcile = reconcile_discovered_to_declared(
+                self._neo4j,
+                engagement_id=engagement_id,
+                preferred_claim=preferred_claim,
+            )
+            identity_upgrades += decl_reconcile.upgrades
+            principals_retracted += decl_reconcile.retracted
 
         # --- ADR-0008: infer Tenant nodes from URL-position tenant identifiers,
         # then ADR-0039: infer capability + tenant `TrustBoundary`s. Runs AFTER

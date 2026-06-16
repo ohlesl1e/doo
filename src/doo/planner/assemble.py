@@ -75,17 +75,17 @@ class _AuthView:
     claims_summary: str | None
 
 
-def _summarise_claims(bearer_claims_json: object) -> str | None:
+def _summarise_claims(identity_claims_json: object) -> str | None:
     """A secret-free one-liner of an AuthContext's bearer claims (names only).
 
     The token's *claim names* (e.g. `sub, role, org_id`) orient the LLM without
     ever leaking a value (ADR-0015). Returns None when there are no claims.
     """
 
-    if not bearer_claims_json:
+    if not identity_claims_json:
         return None
     try:
-        claims = json.loads(str(bearer_claims_json))
+        claims = json.loads(str(identity_claims_json))
     except (json.JSONDecodeError, TypeError):
         return None
     if not isinstance(claims, dict) or not claims:
@@ -112,7 +112,7 @@ def _fetch_principal_auth(
         RETURN ac.id AS id,
                ac.tier AS tier,
                ac.is_anonymous AS is_anonymous,
-               ac.bearer_claims AS bearer_claims
+               ac.identity_claims AS identity_claims
         ORDER BY coalesce(ac.is_anonymous, false) ASC, ac.tier ASC, ac.id ASC
         LIMIT 1
         """,
@@ -125,7 +125,7 @@ def _fetch_principal_auth(
     return _AuthView(
         auth_context_id=AuthContextId(str(row["id"])),
         tier=str(row["tier"]) if row["tier"] is not None else None,
-        claims_summary=_summarise_claims(row["bearer_claims"]),
+        claims_summary=_summarise_claims(row["identity_claims"]),
     )
 
 
@@ -148,7 +148,7 @@ def _fetch_send_as_auth(
         MATCH (r:RequestObservation)-[:HIT]->(e:Endpoint {{id: $endpoint_id}}),
               (r)-[:OBSERVED_UNDER]->(ac:AuthContext)-[:OF_PRINCIPAL]->(p:Principal)
         {frag.and_("r.status = 'active' AND e.status = 'active' AND ac.status = 'active' AND p.status = 'active'")}
-        RETURN ac.id AS id, ac.tier AS tier, ac.bearer_claims AS bearer_claims,
+        RETURN ac.id AS id, ac.tier AS tier, ac.identity_claims AS identity_claims,
                coalesce(ac.is_anonymous, false) AS ac_anon,
                p.is_anonymous AS p_anon, p.label AS label, p.identity_key AS identity_key
         ORDER BY ac_anon ASC, ac.id ASC
@@ -167,7 +167,7 @@ def _fetch_send_as_auth(
     view = _AuthView(
         auth_context_id=AuthContextId(str(row["id"])),
         tier=str(row["tier"]) if row["tier"] is not None else None,
-        claims_summary=_summarise_claims(row["bearer_claims"]),
+        claims_summary=_summarise_claims(row["identity_claims"]),
     )
     return view, label
 
@@ -643,7 +643,7 @@ def _capability_auth_contexts(
         f"""
         MATCH (tb:TrustBoundary {{id: $tbid}})-[:BETWEEN]->(ac:AuthContext)
         {frag.and_("(ac.status IS NULL OR ac.status = 'active')")}
-        RETURN ac.id AS id, ac.bearer_claims AS claims, ac.tier AS tier
+        RETURN ac.id AS id, ac.identity_claims AS claims, ac.tier AS tier
         ORDER BY ac.id
         """,
         tbid=boundary_id,
@@ -698,7 +698,7 @@ def _tenant_auth_contexts(
             f"""
             MATCH (t:Tenant {{id: $tid}})<-[:OF_TENANT]-(:Principal)<-[:OF_PRINCIPAL]-(ac:AuthContext)
             {afrag.and_("(ac.status IS NULL OR ac.status = 'active')")}
-            RETURN ac.id AS id, ac.tier AS tier, ac.bearer_claims AS claims
+            RETURN ac.id AS id, ac.tier AS tier, ac.identity_claims AS claims
             ORDER BY coalesce(ac.is_anonymous, false) ASC, ac.id ASC
             LIMIT 1
             """,

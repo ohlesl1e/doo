@@ -31,9 +31,11 @@ from typing import Any
 
 from doo.canonical.identity import (
     _IDENTITY_CLAIM_PRIORITY,
+    DISAGREE,
     _strip_source_prefix,
     discovered_principal_identity_key,
     is_synthetic_discovered_key,
+    match_identity_claims,
     principal_id,
 )
 from doo.extraction.identity_signals import IDENTITY_RESPONSE_HEADERS
@@ -356,3 +358,138 @@ def reconcile_observed_identities(
     )
     retracted = int(retracted_rows[0]["retracted"]) if retracted_rows else 0
     return ReconcileResult(upgrades=upgrades, retracted=retracted, aliases=aliases)
+
+
+def reconcile_discovered_to_declared(
+    client: Neo4jClient,
+    *,
+    engagement_id: EngagementId,
+    preferred_claim: str | None = None,
+) -> ReconcileResult:
+    """Retroactive declared↔discovered Principal reconciliation (ADR-0048).
+
+    The forward priority-0 match (`_match_declared_principal`) attaches a fresh
+    discovered AuthContext to its declared Principal at *resolve time*. This is
+    the **retroactive** counterpart: it sweeps existing claim-keyed discovered
+    Principals (`discovered:{claim}:{value}`) against declared `AuthContext`s'
+    own `identity_claims`, and on a match re-points every `OF_PRINCIPAL` edge
+    onto the declared Principal + marks the discovered one
+    `status='retracted'`/`retracted_into=…` (the ADR-0010 mechanic). So
+    declare-after-ingest converges without manual Cypher.
+
+    Called from `engagement start` (after declared writes) and from flush
+    (after `reconcile_observed_identities`, so a synthetic just upgraded to a
+    claim key is swept in the same pass). Idempotent: retracted Principals are
+    excluded by the `status='active'` filter, so re-running is a no-op.
+
+    Synthetic (`discovered:{auth_hash}`) Principals are out of scope here — no
+    claim to compare; the synthetic→claim upgrade is `reconcile_observed_
+    identities`' job, which feeds them into this sweep.
+    """
+
+    # Declared side: each active declared Principal with each of its declared
+    # AuthContexts' `identity_claims` (active OR expired — a rotated-out token's
+    # claims remain valid identity evidence for its Principal, ADR-0048).
+    decl_rows = client.execute_read(
+        """
+        MATCH (p:Principal {engagement_id: $eid, tier: 'declared'})
+        WHERE p.status = 'active'
+        OPTIONAL MATCH (ac:AuthContext {tier: 'declared'})-[:OF_PRINCIPAL]->(p)
+        WHERE ac.status IN ['active', 'expired']
+        RETURN p.id AS pid, p.identity_key AS identity_key,
+               collect(ac.identity_claims) AS ac_claims
+        """,
+        eid=engagement_id,
+    )
+    declared: list[tuple[str, str, list[dict[str, object]]]] = []
+    for row in decl_rows:
+        ac_claims: list[dict[str, object]] = []
+        for raw in row.get("ac_claims") or []:
+            if not raw:
+                continue
+            try:
+                parsed = json.loads(str(raw))
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if isinstance(parsed, dict) and parsed:
+                ac_claims.append(parsed)
+        if ac_claims:
+            declared.append((str(row["pid"]), str(row["identity_key"]), ac_claims))
+    if not declared:
+        return ReconcileResult()
+
+    # Discovered side: active, claim-keyed (NOT synthetic) discovered Principals,
+    # each with their AuthContexts' `identity_claims` so the same walk-and-
+    # intersect runs against them.
+    disc_rows = client.execute_read(
+        """
+        MATCH (dp:Principal {engagement_id: $eid, tier: 'discovered'})
+        WHERE coalesce(dp.status, 'active') = 'active'
+          AND dp.is_anonymous = false
+          AND NOT dp.identity_key =~ 'discovered:[0-9a-f]{64}'
+        OPTIONAL MATCH (ac:AuthContext)-[:OF_PRINCIPAL]->(dp)
+        RETURN dp.id AS dpid, dp.identity_key AS identity_key,
+               collect(ac.identity_claims) AS ac_claims
+        """,
+        eid=engagement_id,
+    )
+
+    upgrades = 0
+    for row in disc_rows:
+        if is_synthetic_discovered_key(str(row["identity_key"])):
+            continue  # belt-and-braces alongside the regex.
+        # First non-empty AuthContext claims dict for this discovered Principal.
+        # All of its ACs share the keying claim (that is what put them on this
+        # node), so any one is representative for the priority-0 match.
+        disc_claims: dict[str, object] | None = None
+        for raw in row.get("ac_claims") or []:
+            if not raw:
+                continue
+            try:
+                parsed = json.loads(str(raw))
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if isinstance(parsed, dict) and parsed:
+                disc_claims = parsed
+                break
+        if disc_claims is None:
+            continue
+
+        target_pid: str | None = None
+        for pid, _ikey, ac_claims_list in declared:
+            for decl_claims in ac_claims_list:
+                outcome = match_identity_claims(
+                    disc_claims, decl_claims, preferred_claim=preferred_claim
+                )
+                if outcome is None or outcome == DISAGREE:
+                    continue
+                target_pid = pid
+                break
+            if target_pid is not None:
+                break
+        if target_pid is None:
+            continue
+
+        # Re-point every OF_PRINCIPAL onto the declared Principal; retract the
+        # discovered twin (ADR-0010 mechanic — flag, never delete). Guarded on
+        # the discovered Principal's current status='active' inside the write so
+        # a concurrent sweep cannot double-apply.
+        client.execute_write(
+            """
+            MATCH (dp:Principal {engagement_id: $eid, id: $dpid})
+            WHERE coalesce(dp.status, 'active') = 'active'
+            MATCH (target:Principal {engagement_id: $eid, id: $target_pid})
+            OPTIONAL MATCH (ac:AuthContext)-[old:OF_PRINCIPAL]->(dp)
+            DELETE old
+            WITH dp, target, collect(ac) AS acs
+            FOREACH (a IN acs | MERGE (a)-[:OF_PRINCIPAL]->(target))
+            SET dp.status = 'retracted', dp.unmerged = false,
+                dp.retracted_into = $target_pid
+            """,
+            eid=engagement_id,
+            dpid=str(row["dpid"]),
+            target_pid=target_pid,
+        )
+        upgrades += 1
+
+    return ReconcileResult(upgrades=upgrades, retracted=upgrades, aliases=0)

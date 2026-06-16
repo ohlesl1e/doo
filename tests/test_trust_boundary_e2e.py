@@ -5,7 +5,7 @@ mirroring `test_coverage_c2_e2e.py` / `test_observed_value_e2e.py`) and asserts 
 the graph after flush:
 
 - **capability** boundaries are drawn only between same-`Principal` `AuthContext`s
-  with a claim delta in the decoded `bearer_claims` (`scope`); a same-Principal
+  with a claim delta in the decoded `identity_claims` (`scope`); a same-Principal
   pair with no distinguishing claim yields **no** boundary (evidence-gated);
 - **tenant** boundaries are drawn only between `Tenant`s that share ≥1 `Endpoint`
   (one undirected node per unordered pair); two tenants that share no endpoint get

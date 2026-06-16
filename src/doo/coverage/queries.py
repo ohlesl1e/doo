@@ -915,9 +915,9 @@ class _AuthCtxView:
 def _load_auth_contexts_with_claims(
     client: Neo4jClient, engagement_id: EngagementId
 ) -> list[_AuthCtxView]:
-    """Read each active non-anonymous AuthContext with its decoded `bearer_claims`.
+    """Read each active non-anonymous AuthContext with its decoded `identity_claims`.
 
-    `bearer_claims` is stored as a JSON string (ADR-0025); parsed in Python. Used by
+    `identity_claims` is stored as a JSON string (ADR-0025); parsed in Python. Used by
     C4 to find capability-differing token pairs of the same Principal.
     """
 
@@ -928,7 +928,7 @@ def _load_auth_contexts_with_claims(
         WHERE (ac.is_anonymous IS NULL OR ac.is_anonymous = false)
           AND (ac.status IS NULL OR ac.status = 'active')
           AND (p.status IS NULL OR p.status = 'active')
-        RETURN ac.id AS acid, ac.bearer_claims AS claims, p.id AS pid,
+        RETURN ac.id AS acid, ac.identity_claims AS claims, p.id AS pid,
                p.is_anonymous AS p_anon, p.label AS label, p.identity_key AS ikey
         ORDER BY ac.id
         """,

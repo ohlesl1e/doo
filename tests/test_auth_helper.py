@@ -110,6 +110,38 @@ def test_rotate_writes_rotation_file_and_graph(tmp_path: Path) -> None:
     assert new_id in helper.managed
 
 
+def test_rotate_writes_identity_claims_and_validity_window(tmp_path: Path) -> None:
+    """A rotated bearer JWT's claims + `exp` are decoded and written on the new
+    `AuthContext` node (ADR-0048), so priority-0 reconciliation sees the
+    rotated token's identity. Opaque tokens degrade to `{}` / `None`."""
+
+    import jwt as pyjwt
+
+    box = {"t": 0.0}
+    rotated = pyjwt.encode(
+        {"_id": "u-rot", "exp": 4102444800}, "k" * 32, algorithm="HS256"
+    )
+    helper = _helper(tmp_path, clock_box=box)
+    helper.mechanisms["command"] = lambda rc, env: rotated
+    assert helper.rotate(AC, reason="proactive") is True
+
+    write = helper.neo4j.writes[0]  # type: ignore[attr-defined]
+    import json as _json
+
+    claims = _json.loads(write["identity_claims"])
+    assert claims["_id"] == "u-rot"
+    vw = _json.loads(write["validity_window"])
+    assert vw["exp"].startswith("2100-01-01")
+
+    # Opaque (non-JWT) credential → empty claims, no window; non-fatal.
+    helper2 = _helper(tmp_path, clock_box=box)
+    helper2.mechanisms["command"] = lambda rc, env: "opaque-not-a-jwt"
+    assert helper2.rotate(AC, reason="proactive") is True
+    write2 = helper2.neo4j.writes[0]  # type: ignore[attr-defined]
+    assert _json.loads(write2["identity_claims"]) == {}
+    assert write2["validity_window"] is None
+
+
 def test_rotate_quoted_cookie_hashes_canonical_writes_wire_raw(tmp_path: Path) -> None:
     """A `kind: cookie` rotation whose mechanism emits a DQUOTE-wrapped value (#103).
 
