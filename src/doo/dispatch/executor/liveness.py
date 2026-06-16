@@ -25,6 +25,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from doo.canonical.cookies import canonical_credential_value
 from doo.canonical.identity import auth_context_id, compute_auth_hash
 from doo.dispatch.executor.classify import BodyMatchers, LivenessResult, is_auth_negative
 from doo.dispatch.executor.constructors import _splice_auth
@@ -100,7 +101,12 @@ class LivenessPolicy:
                     # The secret store is the authority for missing tokens; here a
                     # missing env var just means no declared endpoint for this id.
                     continue
-                ac_id = auth_context_id(eid, compute_auth_hash(decl.kind, raw))
+                ac_id = auth_context_id(
+                    eid,
+                    compute_auth_hash(
+                        decl.kind, canonical_credential_value(decl.kind, raw)
+                    ),
+                )
                 declared[ac_id] = spec
 
         d = config.dispatch

@@ -33,6 +33,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import FrameType
 
+from doo.canonical.cookies import canonical_credential_value
 from doo.canonical.identity import auth_context_id, compute_auth_hash
 from doo.dispatch.reactive import AUTH_REACTIVE_STREAM, REACTIVE_AUTH_INVALID
 from doo.dispatch.secrets import write_rotation_entry
@@ -207,7 +208,12 @@ class AuthHelper:
                 raw = e.get(decl.env_var_name)
                 if not raw:
                     continue  # no current material → nothing to track yet
-                ac_id = auth_context_id(eid, compute_auth_hash(decl.kind, raw))
+                ac_id = auth_context_id(
+                    eid,
+                    compute_auth_hash(
+                        decl.kind, canonical_credential_value(decl.kind, raw)
+                    ),
+                )
                 managed[ac_id] = ManagedAuthContext(
                     auth_context_id=ac_id,
                     kind=decl.kind,
@@ -281,7 +287,11 @@ class AuthHelper:
             return False
 
         self.rate_limiter.record(str(ac_id))
-        new_hash = compute_auth_hash(m.kind, new_raw)
+        # Hash the canonical credential form (#103); `new_raw` itself stays the
+        # wire-form value written to the rotation file for the Executor to send.
+        new_hash = compute_auth_hash(
+            m.kind, canonical_credential_value(m.kind, new_raw)
+        )
         new_id = auth_context_id(self.engagement_id, new_hash)
         self._rotate_graph(old_id=ac_id, new_id=new_id, new_hash=new_hash, kind=m.kind)
         write_rotation_entry(

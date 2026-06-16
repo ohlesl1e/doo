@@ -33,6 +33,7 @@ from typing import IO, Any, Protocol
 
 import jwt
 
+from doo.canonical.cookies import canonical_credential_value
 from doo.canonical.identity import (
     auth_context_id,
     compute_auth_hash,
@@ -274,13 +275,17 @@ def _resolve_auth_context(
     """
 
     token = _resolve_env_token(decl.env_var_name, principal_label=principal.label, env=env)
-    auth_hash = compute_auth_hash(decl.kind, token)
+    # Hash and decode the canonical credential form (#103: a DQUOTE-wrapped /
+    # percent-encoded cookie token must hash the same as L2's normalised form);
+    # the raw `token` itself is the wire form and is dropped after this function.
+    canonical = canonical_credential_value(decl.kind, token)
+    auth_hash = compute_auth_hash(decl.kind, canonical)
 
     bearer_claims: dict[str, str | int | float | bool | None] = {}
     validity_window: dict[str, Any] | None = None
 
-    if decl.kind == "bearer":
-        decoded = _decode_jwt_unverified(token)
+    if decl.kind in ("bearer", "cookie"):
+        decoded = _decode_jwt_unverified(canonical)
         # Cross-check decoded `sub` vs declared `known_signals.jwt_sub`.
         declared_sub = principal.known_signals.jwt_sub
         token_sub = decoded.get("sub")

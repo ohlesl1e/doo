@@ -33,6 +33,7 @@ are not integers or booleans.
 from __future__ import annotations
 
 import re
+from urllib.parse import unquote
 
 # Matches a JWT: header begins with 'eyJ' ({"  base64url-encoded), followed by
 # two more base64url segments of at least 6 chars each.
@@ -93,3 +94,48 @@ def cookie_feeds_identity(
 
     # Default: include (include-biased).
     return True
+
+
+def normalize_cookie_value(value: str) -> str:
+    """Normalise a cookie value: percent-decode, then strip the RFC 6265 ``DQUOTE``
+    wrapper.
+
+    RFC 6265's ``cookie-octet`` excludes ``DQUOTE``/comma/semicolon, so an app that
+    needs to send such content (e.g. a *quoted* JWT) percent-encodes it — a real
+    capture carried its session JWT as ``%22eyJ…%22``. Both the encoding and the
+    surrounding quotes are transport syntax, not credential material: leaving them
+    on breaks JWT claim decoding (ADR-0027) and splits an otherwise-identical
+    credential into distinct ``auth_hash``es. Decode, then remove one matching
+    leading+trailing ``"`` pair.
+
+    This is the **canonical credential form** of a cookie value (#103). Every
+    ``compute_auth_hash("cookie", …)`` caller — L2 ingestion (``extraction/har.py``)
+    *and* the declared side (``setup/loader.py``, ``dispatch/auth_helper.py``,
+    ``dispatch/secrets.py``, ``dispatch/executor/liveness.py``) — passes the value
+    through here first, so a quoted/encoded credential hashes identically wherever
+    it is seen. The wire-form value (``material.raw`` / the rotation file) is **not**
+    normalised; the request constructor's job is to send what the server expects.
+    """
+
+    decoded = unquote(value)
+    if len(decoded) >= 2 and decoded[0] == '"' and decoded[-1] == '"':
+        return decoded[1:-1]
+    return decoded
+
+
+def canonical_credential_value(kind: str, raw: str) -> str:
+    """The canonical (hash-input) form of a credential value, by ``kind`` (#103).
+
+    For ``kind == "cookie"`` returns :func:`normalize_cookie_value` (percent-decode
+    + DQUOTE-strip). For every other kind (``bearer`` / ``api_key`` / ``basic_auth``
+    / ``anonymous``) returns ``raw`` unchanged — those carriers have no
+    DQUOTE-wrapping convention and a literal ``"`` is credential material there.
+
+    Pure; never mutates its input. Callers feed the result to
+    ``compute_auth_hash(kind, …)`` and to JWT claim decoding, but persist / send the
+    untouched ``raw`` (``AuthMaterial.raw``, ``write_rotation_entry(..., raw=...)``).
+    """
+
+    if kind == "cookie":
+        return normalize_cookie_value(raw)
+    return raw

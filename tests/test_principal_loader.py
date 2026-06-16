@@ -165,6 +165,44 @@ def test_principal_removal_retracts() -> None:
     assert any(m.kind == "principal_retract" for m in result.mutations)
 
 
+def test_declared_quoted_cookie_jwt_hashes_on_canonical_form() -> None:
+    """A `kind: cookie` declared token whose env value is DQUOTE-wrapped (#103).
+
+    The loader's `auth_hash` is over the percent-decoded + DQUOTE-stripped value
+    — the same per-cookie hash L2 ingestion computes — so the declared
+    `AuthContext` and the one observed in traffic converge to one node. The
+    cookie JWT's claims are decoded (over the *normalised* value) so a declared
+    cookie-JWT contributes identity claims like a bearer token (ADR-0048
+    priority-0 reconciliation).
+    """
+
+    bare = jwt.encode(
+        {"_id": "u-cookie", "exp": 4102444800}, "k" * 32, algorithm="HS256"
+    )
+    wire = f'"{bare}"'  # the refresh script emits the JSON-stringified wire form
+
+    d = _base_config_dict()
+    d["principals"] = [
+        {
+            "label": "cookie-user",
+            "auth_contexts": [{"kind": "cookie", "token": "${TOK_COOKIE}"}],
+        }
+    ]
+    config = EngagementConfig.model_validate(d)
+    result = load_engagement(config, FakeGraphState(), env={"TOK_COOKIE": wire})
+
+    ac = next(m for m in result.mutations if m.kind == "auth_context_declare")
+    # Declared hash == L2's normalised per-cookie hash (the bare JWT, not `"…"`).
+    assert ac.properties["auth_hash"] == compute_auth_hash("cookie", bare)
+    assert ac.properties["auth_hash"] != compute_auth_hash("cookie", wire)
+    # Cookie JWT claims decoded over the normalised value.
+    assert ac.properties["bearer_claims"]["_id"] == "u-cookie"
+    assert ac.properties["validity_window"]["exp"].startswith("2100-01-01")
+    # The wire-form raw token never escapes the loader (ADR-0015 still holds).
+    blob = json.dumps([m.properties for m in result.mutations], default=str)
+    assert wire not in blob and bare not in blob
+
+
 def test_unrelated_principal_unchanged_on_other_principal_edit() -> None:
     """Editing one principal does not re-emit mutations for an unrelated one."""
 
