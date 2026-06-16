@@ -22,6 +22,7 @@ the Executor's `RotatableSecretStore` reads. No LLM, deterministic control.
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import subprocess
@@ -33,6 +34,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import FrameType
 
+from doo.canonical.cookies import canonical_credential_value
 from doo.canonical.identity import auth_context_id, compute_auth_hash
 from doo.dispatch.reactive import AUTH_REACTIVE_STREAM, REACTIVE_AUTH_INVALID
 from doo.dispatch.secrets import write_rotation_entry
@@ -131,6 +133,44 @@ _MECHANISMS: dict[str, RefreshMechanismFn] = {
 }
 
 
+def _decode_credential_claims(
+    kind: str, canonical: str
+) -> tuple[dict[str, object], dict[str, str] | None]:
+    """Best-effort decode of a rotated credential's identity claims (ADR-0048).
+
+    `canonical` is the already-normalised credential value (#103). For
+    `kind ∈ {bearer, cookie}` attempts an unverified JWT decode; an opaque /
+    non-JWT credential is non-fatal and yields `({}, None)`. Mirrors the
+    loader's `_resolve_auth_context`: scalar claims only, `validity_window`
+    derived from `exp`. The raw token never escapes this function.
+    """
+
+    if kind not in ("bearer", "cookie"):
+        return {}, None
+    try:
+        import jwt
+
+        decoded = jwt.decode(
+            canonical, options={"verify_signature": False, "verify_exp": False}
+        )
+    except Exception:  # noqa: BLE001 - any decode failure is opaque-token
+        return {}, None
+    if not isinstance(decoded, dict):
+        return {}, None
+    claims: dict[str, object] = {
+        str(k): v
+        for k, v in decoded.items()
+        if isinstance(v, str | int | float | bool) or v is None
+    }
+    validity_window: dict[str, str] | None = None
+    exp = decoded.get("exp")
+    if isinstance(exp, int | float):
+        validity_window = {
+            "exp": datetime.fromtimestamp(float(exp), tz=UTC).isoformat()
+        }
+    return claims, validity_window
+
+
 # ---------------------------------------------------------------------------
 # Managed AuthContext + rate limiter.
 # ---------------------------------------------------------------------------
@@ -207,7 +247,12 @@ class AuthHelper:
                 raw = e.get(decl.env_var_name)
                 if not raw:
                     continue  # no current material → nothing to track yet
-                ac_id = auth_context_id(eid, compute_auth_hash(decl.kind, raw))
+                ac_id = auth_context_id(
+                    eid,
+                    compute_auth_hash(
+                        decl.kind, canonical_credential_value(decl.kind, raw)
+                    ),
+                )
                 managed[ac_id] = ManagedAuthContext(
                     auth_context_id=ac_id,
                     kind=decl.kind,
@@ -281,9 +326,25 @@ class AuthHelper:
             return False
 
         self.rate_limiter.record(str(ac_id))
-        new_hash = compute_auth_hash(m.kind, new_raw)
+        # Hash the canonical credential form (#103); `new_raw` itself stays the
+        # wire-form value written to the rotation file for the Executor to send.
+        canonical = canonical_credential_value(m.kind, new_raw)
+        new_hash = compute_auth_hash(m.kind, canonical)
         new_id = auth_context_id(self.engagement_id, new_hash)
-        self._rotate_graph(old_id=ac_id, new_id=new_id, new_hash=new_hash, kind=m.kind)
+        # Decode the rotated credential's identity claims (ADR-0048): the new
+        # declared AuthContext carries `identity_claims` + `validity_window`
+        # exactly like a loader-written one, so priority-0 reconciliation and
+        # the retroactive sweep see the rotated token's identity. Non-fatal on
+        # an opaque (non-JWT) credential — empty claims, no window.
+        identity_claims, validity_window = _decode_credential_claims(m.kind, canonical)
+        self._rotate_graph(
+            old_id=ac_id,
+            new_id=new_id,
+            new_hash=new_hash,
+            kind=m.kind,
+            identity_claims=identity_claims,
+            validity_window=validity_window,
+        )
         write_rotation_entry(
             self.rotation_path,
             auth_context_id=new_id,
@@ -328,6 +389,8 @@ class AuthHelper:
         new_id: AuthContextId,
         new_hash: str,
         kind: AuthContextKind,
+        identity_claims: dict[str, object],
+        validity_window: dict[str, str] | None,
     ) -> None:
         now = datetime.now(UTC)
         self.neo4j.execute_write(
@@ -340,7 +403,9 @@ class AuthHelper:
                           new.is_anonymous = false, new.source = 'auth-helper',
                           new.confidence = 1.0, new.confidence_method = 'heuristic',
                           new.first_seen = $now, new.ingested_at = $now
-            SET new.last_seen = $now, new.status = 'active'
+            SET new.last_seen = $now, new.status = 'active',
+                new.identity_claims = $identity_claims,
+                new.validity_window = $validity_window
             MERGE (new)-[:OF_PRINCIPAL]->(p)
             """,
             eid=self.engagement_id,
@@ -349,6 +414,12 @@ class AuthHelper:
             new_hash=new_hash,
             kind=kind,
             now=now,
+            identity_claims=json.dumps(identity_claims, sort_keys=True),
+            validity_window=(
+                json.dumps(validity_window, sort_keys=True)
+                if validity_window is not None
+                else None
+            ),
         )
 
     def poll_reactive(self, *, block_ms: int = 1000) -> int:

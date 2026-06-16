@@ -8,7 +8,7 @@ alongside the rest of the inference layer. No LLM (CLAUDE.md hard rule).
 Two boundary kinds are inferred (ADR-0039); both are **evidence-gated**:
 
 - **capability** (`scope` / `mfa` / `freshness`) — between two `AuthContext`s of
-  the *same* `Principal` whose decoded `bearer_claims` (ADR-0025) show a claim
+  the *same* `Principal` whose decoded `identity_claims` (ADR-0025) show a claim
   delta in `scope` / `acr` / `amr` / `auth_time`. The pure delta decision lives
   in `canonical/trust_boundary.py`. Absent any distinguishing claim → no boundary
   (no synthesised tiers).
@@ -204,7 +204,7 @@ def _read_auth_contexts(
 ) -> list[_AuthContextRow]:
     """Read each non-anonymous AuthContext, its Principal, decoded claims + evidence.
 
-    `bearer_claims` is stored as a JSON string on the AuthContext (ADR-0025); it is
+    `identity_claims` is stored as a JSON string on the AuthContext (ADR-0025); it is
     parsed in Python. The evidence observations are the `RequestObservation`s made
     under that AuthContext — capped per side downstream so a boundary test can
     recover a concrete endpoint (ADR-0039).
@@ -222,13 +222,13 @@ def _read_auth_contexts(
                        -[:OBSERVED_UNDER]->(ac)
         WITH ac, p, collect(DISTINCT r.id) AS obs
         RETURN ac.id AS auth_context_id, p.id AS principal_id,
-               ac.bearer_claims AS bearer_claims, obs AS evidence
+               ac.identity_claims AS identity_claims, obs AS evidence
         """,
         engagement_id=engagement_id,
     )
     out: list[_AuthContextRow] = []
     for row in rows:
-        raw = row["bearer_claims"]
+        raw = row["identity_claims"]
         claims: dict[str, object] = {}
         if raw:
             parsed = json.loads(str(raw))

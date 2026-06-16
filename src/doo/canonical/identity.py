@@ -32,6 +32,7 @@ import hashlib
 import ipaddress
 import re
 from collections.abc import Mapping
+from typing import Literal
 from urllib.parse import quote, unquote
 
 from doo.canonical.value_objects import AuthContextCue, HostRef, Scheme
@@ -370,6 +371,92 @@ def _strip_source_prefix(name: str) -> str:
         if name.startswith(prefix):
             return name[len(prefix):]
     return name
+
+
+def _scalar_claim(claims: Mapping[str, object], name: str) -> str | None:
+    """The normalised scalar string value of one claim, or ``None``.
+
+    Scalar (str/int, not bool), stripped, non-empty. ``email`` is lowercased
+    (case-insensitive in practice; ADR-0027). Shared by the discovered-key
+    resolver and the declared↔discovered claim matcher (ADR-0048).
+    """
+
+    raw = claims.get(name)
+    if not isinstance(raw, str | int) or isinstance(raw, bool):
+        return None
+    value = str(raw).strip()
+    if not value:
+        return None
+    if name == "email":
+        value = value.lower()
+    return value
+
+
+# Sentinel returned by `match_identity_claims` when the highest-priority claim
+# present on both sides DISAGREES — the two credentials provably belong to
+# different actors, so the caller must not fall through to a weaker match
+# against THIS declared AuthContext (merge-safety, ADR-0048).
+DISAGREE: Literal["disagree"] = "disagree"
+
+IdentityClaimMatch = tuple[str, str]
+
+
+def match_identity_claims(
+    a: Mapping[str, object],
+    b: Mapping[str, object],
+    *,
+    preferred_claim: str | None = None,
+) -> IdentityClaimMatch | Literal["disagree"] | None:
+    """Walk-and-intersect two `identity_claims` dicts (ADR-0048 priority-0).
+
+    Walks the ADR-0030 claim priority — `preferred_claim` (ADR-0032,
+    source-prefix stripped) first when set, then `_IDENTITY_CLAIM_PRIORITY`
+    (`sub` issuer-scoped → … → `email` last). For each claim K in order:
+
+    - both sides carry K (scalar, non-empty) and the values **agree** →
+      return ``(K, value)`` — same actor by the strongest shared signal.
+    - both carry K and values **disagree** → return ``DISAGREE`` — provably
+      different actors; the caller stops considering this pair (no fall-through
+      to a weaker claim that might coincidentally agree).
+    - only one side carries K → continue to the next claim.
+
+    Returns ``None`` when no claim is present on both sides — undecidable from
+    claims alone; the caller falls through to `known_signals` (the opaque-token
+    fallback) or the synthetic key.
+
+    For ``sub``: when both sides also carry ``iss`` and the issuers disagree,
+    the result is ``DISAGREE`` even if the ``sub`` values match (OIDC ``sub`` is
+    unique only within its issuer; ADR-0030/0031). A missing ``iss`` on either
+    side is treated as compatible (single-issuer engagement).
+
+    Pure + deterministic; the same function backs the resolve-time forward match
+    (`_match_declared_principal`) and the flush/loader retroactive sweep
+    (`reconcile_discovered_to_declared`), so both directions reconcile via the
+    same priority — the CONTEXT.md "declared and discovered reconcile via the
+    same priority" property made literal.
+    """
+
+    order: list[str] = []
+    if preferred_claim is not None:
+        order.append(_strip_source_prefix(preferred_claim))
+    for claim in _IDENTITY_CLAIM_PRIORITY:
+        if claim not in order:
+            order.append(claim)
+
+    for claim in order:
+        va = _scalar_claim(a, claim)
+        vb = _scalar_claim(b, claim)
+        if va is None or vb is None:
+            continue
+        if claim == "sub":
+            iss_a = _scalar_claim(a, "iss")
+            iss_b = _scalar_claim(b, "iss")
+            if iss_a is not None and iss_b is not None and iss_a != iss_b:
+                return DISAGREE
+        if va == vb:
+            return claim, va
+        return DISAGREE
+    return None
 
 
 def discovered_principal_identity_key(

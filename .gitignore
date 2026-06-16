@@ -7,8 +7,9 @@ get-docker.sh
 tests/test_har/
 
 # Per-target scratch space: test projects, captures, and engagement data
-# (real-target data; never committed).
-targets/
+# (real-target data; never committed). Keep the directory, ignore its contents.
+targets/*
+!targets/.gitkeep
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

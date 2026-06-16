@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from doo.canonical.cookies import canonical_credential_value
 from doo.canonical.identity import auth_context_id, compute_auth_hash
 from doo.ids import AuthContextId, EngagementId
 from doo.setup.config import AuthContextKind, EngagementConfig
@@ -84,7 +85,12 @@ class EnvSecretStore:
                         f"${{{decl.env_var_name}}} is unset at dispatch time "
                         "(ADR-0012: tokens come from the environment)"
                     )
-                ah = compute_auth_hash(decl.kind, raw)
+                # Hash the canonical credential form so the id matches the
+                # loader's (and L2's) `AuthContext` (#103); `raw` stays the
+                # wire-form value the Executor splices into the request.
+                ah = compute_auth_hash(
+                    decl.kind, canonical_credential_value(decl.kind, raw)
+                )
                 ac_id = auth_context_id(eid, ah)
                 by_id[ac_id] = AuthMaterial(
                     kind=decl.kind, raw=raw, principal_label=principal.label

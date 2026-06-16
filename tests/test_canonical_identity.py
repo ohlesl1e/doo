@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from doo.canonical.identity import (
+    DISAGREE,
     _strip_source_prefix,
     canonicalize_host,
     canonicalize_path,
@@ -15,6 +16,7 @@ from doo.canonical.identity import (
     endpoint_id,
     host_id,
     is_synthetic_discovered_key,
+    match_identity_claims,
 )
 from doo.ids import EngagementId, Sha256Hex
 
@@ -342,3 +344,76 @@ def test_strip_source_prefix_removes_known_prefixes() -> None:
     assert _strip_source_prefix("body:accountRef") == "accountRef"
     assert _strip_source_prefix("_id") == "_id"
     assert _strip_source_prefix("sub") == "sub"
+
+
+# ---------------------------------------------------------------------------
+# match_identity_claims (ADR-0048 priority-0 walk-and-intersect)
+# ---------------------------------------------------------------------------
+
+
+def test_match_agrees_on_first_shared_claim() -> None:
+    """Both carry `_id` (no higher-priority claim shared) → match on `_id`."""
+    a = {"_id": "u_42", "iat": 1}
+    b = {"_id": "u_42", "exp": 99}
+    assert match_identity_claims(a, b) == ("_id", "u_42")
+
+
+def test_match_full_list_walk_no_identity_key() -> None:
+    """No `sub`/`email`, both carry `uid` → matches via the full ADR-0030 list
+    even with no `preferred_claim` set (the #104 gap)."""
+    assert match_identity_claims({"uid": 42}, {"uid": "42"}) == ("uid", "42")
+
+
+def test_match_disagree_stops_on_first_both_present_mismatch() -> None:
+    """`sub` present on both and disagrees → DISAGREE even though `_id` agrees.
+    Stop-on-first-disagreement: a weaker coincidental match must not override
+    a stronger proven mismatch (merge-safety, ADR-0048)."""
+    a = {"sub": "X", "_id": "u_42"}
+    b = {"sub": "Y", "_id": "u_42"}
+    assert match_identity_claims(a, b) == DISAGREE
+
+
+def test_match_one_side_only_continues() -> None:
+    """`sub` only on one side → continue past it to the next shared claim."""
+    a = {"sub": "X", "_id": "u_42"}
+    b = {"_id": "u_42"}
+    assert match_identity_claims(a, b) == ("_id", "u_42")
+
+
+def test_match_no_shared_claim_returns_none() -> None:
+    assert match_identity_claims({"sub": "X"}, {"uid": "Y"}) is None
+    assert match_identity_claims({}, {"sub": "X"}) is None
+    assert match_identity_claims({"iat": 1}, {"exp": 2}) is None
+
+
+def test_match_preferred_claim_overrides_priority() -> None:
+    """`auth.identity_key` (ADR-0032) is walked first, source-prefix stripped."""
+    a = {"sub": "X", "accountRef": "ar-1"}
+    b = {"sub": "Y", "accountRef": "ar-1"}
+    # Without preferred_claim, `sub` (highest priority) disagrees → DISAGREE.
+    assert match_identity_claims(a, b) == DISAGREE
+    # With preferred_claim, `accountRef` is checked first → match.
+    assert match_identity_claims(a, b, preferred_claim="claim:accountRef") == (
+        "accountRef", "ar-1",
+    )
+
+
+def test_match_email_compared_case_insensitive() -> None:
+    assert match_identity_claims(
+        {"email": "Alice@Example.COM"}, {"email": "alice@example.com"}
+    ) == ("email", "alice@example.com")
+
+
+def test_match_sub_issuer_scoped() -> None:
+    """Same `sub`, different `iss` → DISAGREE (OIDC `sub` is per-issuer)."""
+    a = {"sub": "u-1", "iss": "https://idp-a"}
+    b = {"sub": "u-1", "iss": "https://idp-b"}
+    assert match_identity_claims(a, b) == DISAGREE
+    # Missing `iss` on one side → compatible (single-issuer engagement).
+    assert match_identity_claims({"sub": "u-1"}, b) == ("sub", "u-1")
+
+
+def test_match_ignores_non_scalar_and_bool_claims() -> None:
+    """List/dict/bool claim values are not identity material."""
+    assert match_identity_claims({"sub": ["x"]}, {"sub": ["x"]}) is None
+    assert match_identity_claims({"sub": True}, {"sub": True}) is None

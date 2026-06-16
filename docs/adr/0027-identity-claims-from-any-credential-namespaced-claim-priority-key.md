@@ -34,3 +34,7 @@ This is why the list can be generous (`uuid`, `uname`, …) without risk: each a
 - A claim-priority key collapses cleanly when a user's tokens consistently expose the same highest-priority claim, and fragments (honestly) when claim presence varies across their tokens — never wrongly merging.
 - **Out of scope (separate tracer):** observed-response identity reconciliation — a user-id seen in a `/me`/`/whoami` response body or a stable `X-User-*` header, correlated back to the AuthContext (ADR-0010 levels 2–3). This is what would collapse an **opaque, non-JWT** rotating credential (the ~13-Principal residual in the capture), and it is a different mechanism (response-side correlation, value-extraction plumbing).
 - Existing graphs are replaced by re-ingest; no automated migration.
+
+## Amendment (#103) — declared-side cookie-JWT decode
+
+The loader's JWT decode extends to `kind == "cookie"` (previously bearer-only) and runs over the **canonical credential value** (percent-decoded + DQUOTE-stripped, ADR-0026 amendment), so a declared cookie-JWT contributes its `identity_claims` to the priority-0 reconciliation walk (ADR-0048) the same way a bearer token does. The wire-form raw stays un-normalised in the secret store / rotation file.

@@ -58,7 +58,7 @@ class _FakeClient:
             return [{"rules": json.dumps(_SCOPE_RULES)}]
         if "ac.id AS auth_context_id" in cypher:  # reached_by_auth_map
             return self._reached
-        if "bearer_claims AS claims" in cypher:  # _load_auth_contexts_with_claims
+        if "identity_claims AS claims" in cypher:  # _load_auth_contexts_with_claims
             return self._auths
         if "MATCH (e:Endpoint)-[:ON_HOST]" in cypher:
             return self._endpoints

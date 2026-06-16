@@ -188,6 +188,22 @@ class Neo4jGraphState:
                 raise ValueError(f"unknown loader mutation kind {mutation.kind!r}")
             handler(self._client, mutation)
 
+    def reconcile_discovered_to_declared(
+        self, engagement_id: EngagementId, *, preferred_claim: str | None
+    ) -> int:
+        """Retroactive declared↔discovered Principal sweep (ADR-0048).
+
+        Delegates to `ontology.identity_reconcile`; called by the loader after
+        declared-state writes so an ingest-then-declare sequence converges.
+        """
+
+        from doo.ontology.identity_reconcile import reconcile_discovered_to_declared
+
+        result = reconcile_discovered_to_declared(
+            self._client, engagement_id=engagement_id, preferred_claim=preferred_claim
+        )
+        return result.upgrades
+
 
 def _scope_create(client: Neo4jClient, m: PlannedMutation) -> None:
     import json
@@ -305,7 +321,7 @@ def _auth_context_declare(client: Neo4jClient, m: PlannedMutation) -> None:
     """Upsert a declared AuthContext + its `OF_PRINCIPAL` edge (ADR-0010).
 
     Engagement-scoped on `(engagement_id, auth_hash)`. `validity_window` and
-    `bearer_claims` are JSON-encoded. Carries only secret-free derived material.
+    `identity_claims` are JSON-encoded. Carries only secret-free derived material.
     """
 
     import json
@@ -313,7 +329,7 @@ def _auth_context_declare(client: Neo4jClient, m: PlannedMutation) -> None:
     props = dict(m.properties)
     vw = props.get("validity_window")
     props["validity_window"] = json.dumps(vw, sort_keys=True) if vw is not None else None
-    props["bearer_claims"] = json.dumps(props.get("bearer_claims") or {}, sort_keys=True)
+    props["identity_claims"] = json.dumps(props.get("identity_claims") or {}, sort_keys=True)
     client.execute_write(
         """
         MATCH (p:Principal {engagement_id: $engagement_id,
@@ -321,7 +337,7 @@ def _auth_context_declare(client: Neo4jClient, m: PlannedMutation) -> None:
         MERGE (ac:AuthContext {engagement_id: $engagement_id, auth_hash: $auth_hash})
         SET ac.id = $props.id, ac.token_kind = $props.token_kind, ac.tier = $props.tier,
             ac.is_anonymous = false, ac.validity_window = $props.validity_window,
-            ac.bearer_claims = $props.bearer_claims,
+            ac.identity_claims = $props.identity_claims,
             ac.source = $props.source, ac.source_id = $props.source_id,
             ac.confidence = $props.confidence, ac.confidence_method = $props.confidence_method,
             ac.first_seen = coalesce(ac.first_seen, $props.first_seen),

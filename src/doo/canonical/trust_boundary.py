@@ -11,7 +11,7 @@ sides, never synthesised:
 
 - **capability** (`scope` / `mfa` / `freshness`) — between two `AuthContext`s of
   the *same* `Principal` that show a **claim delta** in the decoded
-  `bearer_claims` (ADR-0025). The distinguishing claims are JWT `scope` (→
+  `identity_claims` (ADR-0025). The distinguishing claims are JWT `scope` (→
   `scope`), `acr` / `amr` (→ `mfa`), and `auth_time` (→ `freshness`). Absent any
   distinguishing claim → no boundary (no synthesised tiers).
 - **tenant** — between two `Tenant`s that share ≥1 `Endpoint`. The pairing /

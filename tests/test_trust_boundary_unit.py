@@ -2,7 +2,7 @@
 
 These exercise `canonical/trust_boundary.py` in isolation — no graph, no I/O —
 the evidence-gating rules a capability `TrustBoundary` rests on: a boundary is
-drawn only where the decoded `bearer_claims` actually distinguish two tiers, and
+drawn only where the decoded `identity_claims` actually distinguish two tiers, and
 the boundary `kind` is the highest-precedence axis the delta touches.
 """
 

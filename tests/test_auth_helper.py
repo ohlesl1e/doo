@@ -19,6 +19,7 @@ from doo.dispatch.auth_helper import AuthHelper, ManagedAuthContext, RateLimiter
 from doo.dispatch.reactive import AUTH_REACTIVE_STREAM, REACTIVE_AUTH_INVALID
 from doo.dispatch.secrets import (
     AuthMaterial,
+    EnvSecretStore,
     RotatableSecretStore,
     write_rotation_entry,
 )
@@ -109,6 +110,74 @@ def test_rotate_writes_rotation_file_and_graph(tmp_path: Path) -> None:
     assert new_id in helper.managed
 
 
+def test_rotate_writes_identity_claims_and_validity_window(tmp_path: Path) -> None:
+    """A rotated bearer JWT's claims + `exp` are decoded and written on the new
+    `AuthContext` node (ADR-0048), so priority-0 reconciliation sees the
+    rotated token's identity. Opaque tokens degrade to `{}` / `None`."""
+
+    import jwt as pyjwt
+
+    box = {"t": 0.0}
+    rotated = pyjwt.encode(
+        {"_id": "u-rot", "exp": 4102444800}, "k" * 32, algorithm="HS256"
+    )
+    helper = _helper(tmp_path, clock_box=box)
+    helper.mechanisms["command"] = lambda rc, env: rotated
+    assert helper.rotate(AC, reason="proactive") is True
+
+    write = helper.neo4j.writes[0]  # type: ignore[attr-defined]
+    import json as _json
+
+    claims = _json.loads(write["identity_claims"])
+    assert claims["_id"] == "u-rot"
+    vw = _json.loads(write["validity_window"])
+    assert vw["exp"].startswith("2100-01-01")
+
+    # Opaque (non-JWT) credential → empty claims, no window; non-fatal.
+    helper2 = _helper(tmp_path, clock_box=box)
+    helper2.mechanisms["command"] = lambda rc, env: "opaque-not-a-jwt"
+    assert helper2.rotate(AC, reason="proactive") is True
+    write2 = helper2.neo4j.writes[0]  # type: ignore[attr-defined]
+    assert _json.loads(write2["identity_claims"]) == {}
+    assert write2["validity_window"] is None
+
+
+def test_rotate_quoted_cookie_hashes_canonical_writes_wire_raw(tmp_path: Path) -> None:
+    """A `kind: cookie` rotation whose mechanism emits a DQUOTE-wrapped value (#103).
+
+    The new `AuthContext` id is computed over the *canonical* (DQUOTE-stripped)
+    value so it matches the loader/L2; but the rotation file's `raw` is the
+    untouched wire-form value the Executor must send.
+    """
+
+    box = {"t": 0.0}
+    rc = _refresh()
+    ac_cookie = AuthContextId("ac-cookie")
+    bare = "deadbeefdeadbeef"
+    wire = f'"{bare}"'
+    helper = AuthHelper(
+        engagement_id=ENG,
+        neo4j=_FakeNeo4j(),  # type: ignore[arg-type]
+        rotation_path=tmp_path / "rotation.json",
+        managed={ac_cookie: ManagedAuthContext(ac_cookie, "cookie", "user-c", rc)},
+        env={},
+        clock=lambda: box["t"],
+        mechanisms={"command": lambda rc, env: wire},
+    )
+    helper._schedule_all()
+    assert helper.rotate(ac_cookie, reason="reactive") is True
+
+    import json
+
+    data = json.loads((tmp_path / "rotation.json").read_text())
+    new_id = auth_context_id(ENG, compute_auth_hash("cookie", bare))
+    # Hashed on the canonical (bare) form → same id the loader/L2 would compute.
+    assert str(new_id) in data
+    # Wire-form raw survives un-stripped, under both old and new ids.
+    assert data[str(new_id)]["raw"] == wire
+    assert data[str(ac_cookie)]["raw"] == wire
+
+
 def test_rotate_respects_rate_limit(tmp_path: Path) -> None:
     box = {"t": 0.0}
     helper = _helper(tmp_path, clock_box=box, max_refreshes_per_hour=2)
@@ -196,6 +265,31 @@ def test_rotatable_overlay_wins(tmp_path: Path) -> None:
     write_rotation_entry(path, auth_context_id=AC, raw="ROTATED", kind="bearer", principal_label="attacker-b")
     mat = store.material_for(AC)
     assert mat is not None and mat.raw == "ROTATED" and mat.kind == "bearer"
+
+
+def test_env_secret_store_quoted_cookie_keys_canonical_keeps_wire_raw() -> None:
+    """`EnvSecretStore` indexes a quoted cookie token on the canonical hash (#103)
+    while `AuthMaterial.raw` stays the wire-form value for `_splice_auth`."""
+
+    from doo.setup.config import EngagementConfig
+    from tests.test_loader import _base_config_dict
+
+    bare = "deadbeefdeadbeef"
+    wire = f'"{bare}"'
+    d = _base_config_dict()
+    d["principals"] = [
+        {"label": "user-c", "auth_contexts": [{"kind": "cookie", "token": "${C}"}]}
+    ]
+    config = EngagementConfig.model_validate(d)
+    store = EnvSecretStore.from_config(config, env={"C": wire})
+
+    ac_id = auth_context_id(
+        EngagementId(d["engagement"]["id"]), compute_auth_hash("cookie", bare)
+    )
+    mat = store.material_for(ac_id)
+    assert mat is not None
+    assert mat.kind == "cookie"
+    assert mat.raw == wire  # un-stripped: this is what the Executor sends.
 
 
 def test_rotatable_falls_back_when_no_entry(tmp_path: Path) -> None:

@@ -14,7 +14,11 @@ from __future__ import annotations
 
 import jwt as pyjwt
 
-from doo.canonical.cookies import cookie_feeds_identity
+from doo.canonical.cookies import (
+    canonical_credential_value,
+    cookie_feeds_identity,
+    normalize_cookie_value,
+)
 from doo.canonical.identity import compute_auth_hash
 from doo.extraction.har import extract_auth_context_cue
 
@@ -316,3 +320,37 @@ def test_two_session_cookies_both_hashed() -> None:
         compute_auth_hash("cookie", val_b),
         compute_auth_hash("cookie", val_a),
     )
+
+
+# ---------------------------------------------------------------------------
+# normalize_cookie_value / canonical_credential_value (#103)
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_cookie_value_strips_dquote_and_percent_decode() -> None:
+    """`%22…%22` → bare value; one matching DQUOTE pair stripped after decode."""
+    assert normalize_cookie_value("%22eyJxxx%22") == "eyJxxx"
+    assert normalize_cookie_value('"eyJxxx"') == "eyJxxx"
+    # An unbalanced quote is credential material, not a wrapper.
+    assert normalize_cookie_value('"eyJxxx') == '"eyJxxx'
+    # No wrapper → unchanged (after percent-decode).
+    assert normalize_cookie_value("plain%2Fvalue") == "plain/value"
+
+
+def test_canonical_credential_value_only_normalises_cookie_kind() -> None:
+    """Bearer/api_key/basic_auth have no DQUOTE convention; `"` is material there."""
+    assert canonical_credential_value("cookie", '"eyJxxx"') == "eyJxxx"
+    for kind in ("bearer", "api_key", "basic_auth", "anonymous"):
+        assert canonical_credential_value(kind, '"eyJxxx"') == '"eyJxxx"'
+
+
+def test_l2_cue_hashes_quoted_cookie_jwt_on_bare_form() -> None:
+    """L2 ingestion's per-cookie hash is over the *normalised* value (#103).
+
+    A `%22<jwt>%22` cookie hashes as the bare `<jwt>` — the form the declared
+    side now also produces, so both converge to one `AuthContext`.
+    """
+    bare = pyjwt.encode({"_id": "u-42"}, "k" * 32, algorithm="HS256")
+    cue = extract_auth_context_cue(_request([("token", f"%22{bare}%22")]))
+    assert cue.cookie_session_hashes == (compute_auth_hash("cookie", bare),)
+    assert cue.identity_claims.get("_id") == "u-42"

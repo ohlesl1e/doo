@@ -30,3 +30,7 @@ The cookie *names* are discarded after L2 (`cookie_session_hashes` is a flat has
 - `extract_auth_context_cue` gains a dependency on the engagement's `session_cookie_names` config — the classifier + config must be threaded into a function that today takes only the request.
 - App-state cookies excluded from *identity* are no longer carried at all; whether any of them (e.g. `nw_creatorIdValue`) should surface as request-input *values* (leak-to-input) is a separate value-extraction concern, out of scope here.
 - A request bearing only app-state cookies (and no other credential) now resolves to **anonymous** — correct, since UI state does not identify an actor.
+
+## Amendment (#103) — canonical credential form
+
+The canonical cookie credential value (the input to `compute_auth_hash("cookie", …)`) is **percent-decoded + DQUOTE-stripped** (`canonical/cookies.normalize_cookie_value`). Every `compute_auth_hash("cookie", …)` caller — L2 ingestion *and* the declared side (`setup/loader.py`, `dispatch/auth_helper.py`, `dispatch/secrets.py`, `dispatch/executor/liveness.py`) — passes the value through `canonical_credential_value(kind, raw)` first. Wire form (what the Executor's `_splice_auth` sends) stays the *un-normalised* `raw`; canonicalisation is the hash/decode concern, not the request constructor's. `compute_auth_hash` itself remains `sha256(kind || ":" || value)` with no per-kind semantics — normalisation is the caller's responsibility, kept symmetric.
