@@ -14,11 +14,19 @@ Two halves, both docker/model-free:
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import cast
 
+import pytest
+import structlog
+
+from doo.coverage.models import C2bResult, PrincipalEvidence
 from doo.events.l2 import ValueCandidate
 from doo.events.slice4 import compute_testcase_key_hash
 from doo.ids import AuthContextId, EngagementId
-from doo.planner.llm import resolve_draft
+from doo.infra.neo4j_driver import Neo4jClient
+from doo.planner import assemble as assemble_mod
+from doo.planner.assemble import _AuthView, assemble_c2b_pack
+from doo.planner.llm import DraftRejected, resolve_draft
 from doo.planner.models import (
     ContextPack,
     LLMProposalDraft,
@@ -225,12 +233,14 @@ def _c2b_pack() -> ContextPack:
             PackAuthContext(
                 handle="A1",
                 principal_label="admin",
+                tier="declared",
                 is_attacker_candidate=True,
                 auth_context_id=AuthContextId("ac-admin"),
             ),
             PackAuthContext(
                 handle="A2",
                 principal_label="user",
+                tier="declared",
                 is_attacker_candidate=True,
                 auth_context_id=AuthContextId("ac-user"),
             ),
@@ -255,7 +265,7 @@ def _c2b_draft(**over: object) -> LLMProposalDraft:
 
 
 def test_c2b_resolve_builds_idor_proposal() -> None:
-    proposal = resolve_draft(_c2b_pack(), _c2b_draft())
+    proposal = resolve_draft(_c2b_pack(), _c2b_draft(), generator="c2b")
     assert isinstance(proposal, PlannerProposal)
     assert proposal.test_class == "idor"
     assert proposal.mode == "llm"
@@ -266,9 +276,154 @@ def test_c2b_resolve_builds_idor_proposal() -> None:
     assert proposal.replay_hazards == ()
 
 
+def test_c2b_proposal_is_stamped_generator_c2b() -> None:
+    """Regression for #109: c2b proposals were committed with generator='c2'.
+
+    The resolver has no default `generator` (a forgotten kwarg now fails at call
+    time), and the C2b generator passes its own id explicitly.
+    """
+
+    proposal = resolve_draft(_c2b_pack(), _c2b_draft(), generator="c2b")
+    assert isinstance(proposal, PlannerProposal)
+    assert proposal.generator == "c2b"
+
+
+# ---------------------------------------------------------------------------
+# 3. #110 resolver guard: the chosen attacker auth must be declared-tier.
+# ---------------------------------------------------------------------------
+
+
+def _c2b_pack_with_a2_tier(tier: str | None) -> ContextPack:
+    """A C2b pack whose A2 (the draft's attacker pick) carries the given `tier`."""
+
+    base = _c2b_pack()
+    a1, a2 = base.auth_contexts
+    return base.model_copy(
+        update={
+            "auth_contexts": (
+                a1,
+                a2.model_copy(update={"tier": tier, "is_attacker_candidate": False}),
+            )
+        }
+    )
+
+
+def test_resolve_draft_rejects_discovered_tier_attacker() -> None:
+    out = resolve_draft(
+        _c2b_pack_with_a2_tier("discovered"), _c2b_draft(), generator="c2b"
+    )
+    assert isinstance(out, DraftRejected)
+    assert out.code == "non_declared_attacker"
+    assert "'A2'" in out.reason and "'discovered'" in out.reason
+
+
+def test_resolve_draft_rejects_none_tier_attacker() -> None:
+    out = resolve_draft(_c2b_pack_with_a2_tier(None), _c2b_draft(), generator="c2b")
+    assert isinstance(out, DraftRejected)
+    assert out.code == "non_declared_attacker"
+
+
+def test_resolve_draft_accepts_declared_tier_attacker() -> None:
+    # The declared-tier happy path is unchanged.
+    out = resolve_draft(
+        _c2b_pack_with_a2_tier("declared"), _c2b_draft(), generator="c2b"
+    )
+    assert isinstance(out, PlannerProposal)
+
+
+# ---------------------------------------------------------------------------
+# 4. #110 assembly filter: only declared-tier ACs are offered as attacker
+#    candidates; an all-discovered gap is unproposable (None + structured warn).
+# ---------------------------------------------------------------------------
+
+
+def _c2b_gap(*labels: str) -> C2bResult:
+    return C2bResult(
+        engagement_id=EngagementId("eng-c2b"),
+        generated_at=datetime.now(UTC),
+        endpoint_id="ep-profile",
+        method="GET",
+        host="api.example.com",
+        path_template="/profile",
+        evidence=tuple(
+            PrincipalEvidence(principal_id=f"p-{label}", label=label, status=200)
+            for label in labels
+        ),
+        effective_confidence=1.0,
+    )
+
+
+def _patch_auth_by_tier(
+    monkeypatch: pytest.MonkeyPatch, tiers: dict[str, str | None]
+) -> None:
+    """Stub `_fetch_principal_auth` to return an `_AuthView` keyed by principal id.
+
+    The Neo4j client is never touched — `assemble_c2b_pack`'s only graph reads are
+    `_fetch_principal_auth` and `_fetch_exemplar`, both stubbed here.
+    """
+
+    def _fake_fetch(
+        client: object, engagement_id: object, principal_id: str
+    ) -> _AuthView | None:
+        if principal_id not in tiers:
+            return None
+        return _AuthView(
+            auth_context_id=AuthContextId(f"ac-{principal_id}"),
+            tier=tiers[principal_id],
+            claims_summary=None,
+        )
+
+    monkeypatch.setattr(assemble_mod, "_fetch_principal_auth", _fake_fetch)
+    monkeypatch.setattr(assemble_mod, "_fetch_exemplar", lambda *a, **k: None)
+
+
+def test_assemble_c2b_marks_only_declared_as_attacker_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # {declared: admin, discovered: outlier} -> both in pack; only admin is a
+    # candidate attacker.
+    _patch_auth_by_tier(
+        monkeypatch, {"p-admin": "declared", "p-outlier": "discovered"}
+    )
+    pack = assemble_c2b_pack(
+        cast("Neo4jClient", None),
+        gap=_c2b_gap("admin", "outlier"),
+        code_version="test",
+        now=datetime.now(UTC),
+    )
+    assert pack is not None
+    by_label = {a.principal_label: a for a in pack.auth_contexts}
+    assert set(by_label) == {"admin", "outlier"}
+    assert by_label["admin"].is_attacker_candidate is True
+    assert by_label["admin"].tier == "declared"
+    assert by_label["outlier"].is_attacker_candidate is False
+    assert by_label["outlier"].tier == "discovered"
+
+
+def test_assemble_c2b_returns_none_when_no_declared_attacker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # All reaching principals are discovered-tier -> no controlled credential to
+    # replay as -> unproposable (distinct warn, NOT `too_few_auth_contexts`).
+    _patch_auth_by_tier(
+        monkeypatch, {"p-x": "discovered", "p-y": "discovered"}
+    )
+    with structlog.testing.capture_logs() as logs:
+        pack = assemble_c2b_pack(
+            cast("Neo4jClient", None),
+            gap=_c2b_gap("x", "y"),
+            code_version="test",
+            now=datetime.now(UTC),
+        )
+    assert pack is None
+    events = {entry["event"] for entry in logs}
+    assert "planner.assemble.c2b.no_declared_attacker" in events
+    assert "planner.assemble.c2b.too_few_auth_contexts" not in events
+
+
 def test_c2b_proposal_carries_code_set_replay_hazards() -> None:
     # The generator copies detected hazards onto the frozen proposal.
-    proposal = resolve_draft(_c2b_pack(), _c2b_draft())
+    proposal = resolve_draft(_c2b_pack(), _c2b_draft(), generator="c2b")
     assert isinstance(proposal, PlannerProposal)
     annotated = proposal.model_copy(update={"replay_hazards": ("csrf_token",)})
     assert annotated.replay_hazards == ("csrf_token",)
@@ -277,7 +432,7 @@ def test_c2b_proposal_carries_code_set_replay_hazards() -> None:
 def test_replay_hazards_not_in_key_hash() -> None:
     """ADR-0041: replay_hazards is a derivable annotation, never an identity input."""
 
-    base = resolve_draft(_c2b_pack(), _c2b_draft())
+    base = resolve_draft(_c2b_pack(), _c2b_draft(), generator="c2b")
     assert isinstance(base, PlannerProposal)
     with_hazards = base.model_copy(update={"replay_hazards": ("csrf_token", "nonce")})
 

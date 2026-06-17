@@ -132,6 +132,14 @@ def _run(neo4j, redis_client, blob_client, eid: str) -> None:
     _seed(neo4j, eid)
     _run_pipeline(neo4j=neo4j, redis_client=redis_client, blob_client=blob_client,
                   engagement_id=eid, har_bytes=_boundary_har(), filename="boundary.har")
+    # #110: an authz replay only swaps in a credential the tester controls. The
+    # fixture takes the loader shortcut of ingesting the controlled tokens via HAR,
+    # so promote them to the declared tier the loader would have set.
+    neo4j.execute_write(
+        "MATCH (ac:AuthContext {engagement_id: $eid}) "
+        "WHERE coalesce(ac.is_anonymous, false) = false SET ac.tier = 'declared'",
+        eid=eid,
+    )
 
 
 def test_capability_boundary_proposal_targets_boundary(

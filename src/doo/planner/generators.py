@@ -430,7 +430,7 @@ class C2Generator:
                 now=run_at,
             ),
             describe=lambda g: f"{g.method} {g.host}{g.path_template}",
-            resolve=resolve_draft,
+            resolve=lambda pack, draft: resolve_draft(pack, draft, generator="c2"),
             # ADR-0041: deterministically annotate replay-breakers from a reaching
             # 2xx observation (code-set, never the LLM). A frozen proposal -> copy.
             finalize=lambda p, g: p.model_copy(
@@ -454,8 +454,9 @@ class C2bGenerator:
     C2b gap is an endpoint ≥2 principals ALL reached with a 2xx but whose response
     bodies differ (the role-differentiated-200 BOLA/IDOR hotspot). Each gap is
     deterministically assembled into a bounded, id-free `ContextPack`
-    (`assemble_c2b_pack`) carrying **every** reaching principal as a candidate
-    attacker (any of them could read another's differentiated resource); the LLM
+    (`assemble_c2b_pack`) carrying every reaching principal, with the
+    **declared-tier** ones marked as candidate attackers (any controlled credential
+    could read another's differentiated resource; ADR-0010/0048); the LLM
     proposes ONE authz replay by selecting handles and classifying (`llm.py`); the
     deterministic resolver maps the handles back to concrete ids and rejects any
     hallucinated handle. After resolution, the deterministic replay-hazard detector
@@ -490,7 +491,7 @@ class C2bGenerator:
                 client, gap=g, code_version=__version__, now=run_at
             ),
             describe=lambda g: f"{g.method} {g.host}{g.path_template}",
-            resolve=resolve_draft,
+            resolve=lambda pack, draft: resolve_draft(pack, draft, generator="c2b"),
             # ADR-0041: deterministically annotate replay-breakers (code-set, never
             # the LLM) from a reaching 2xx observation. A frozen proposal -> copy.
             finalize=lambda p, g: p.model_copy(

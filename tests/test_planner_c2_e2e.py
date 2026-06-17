@@ -180,6 +180,14 @@ def _seed_one_gap(neo4j_client, redis_client, blob_client, eid: str) -> None:
         har_bytes=har,
         filename="c2-planner.har",
     )
+    # #110: an authz replay only swaps in a credential the tester controls. The
+    # fixture takes the loader shortcut of ingesting the controlled tokens via HAR,
+    # so promote them to the declared tier the loader would have set.
+    neo4j_client.execute_write(
+        "MATCH (ac:AuthContext {engagement_id: $eid}) "
+        "WHERE coalesce(ac.is_anonymous, false) = false SET ac.tier = 'declared'",
+        eid=eid,
+    )
 
 
 def _draft(**over: object) -> LLMProposalDraft:

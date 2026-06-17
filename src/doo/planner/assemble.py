@@ -10,8 +10,10 @@ coverage gap into the typed, id-free `ContextPack` the LLM reasons over.
 - `assemble_c2b_pack` — a **C2b content-differential gap** (`C2bResult`: ≥2
   principals ALL reached the endpoint with a 2xx but their bodies differ — the
   BOLA/IDOR hotspot). Here *any* reaching principal could be attacker or victim, so
-  **every** reaching principal is a pack auth context marked
-  `is_attacker_candidate=True`, and the LLM picks which one to replay as.
+  **every** reaching principal is a pack auth context; the **declared-tier** ones
+  (credentials the tester controls — ADR-0010/0048) are marked
+  `is_attacker_candidate=True`, discovered-tier ones stay in the pack as
+  evidence/victim context only, and the LLM picks which declared one to replay as.
 
 The pack is bounded and secret-free (ADR-0015/0037): targets and auth contexts are
 addressed by pack-local handles (`T1`, `A1`) never raw node ids; response bodies
@@ -490,14 +492,17 @@ def assemble_c2b_pack(
     C2 (one reached, one did not), here there is no privileged "victim vs attacker"
     split a priori: any reaching principal could be the attacker reading another's
     differentiated resource. So **every** reaching principal becomes a
-    `PackAuthContext` marked `is_attacker_candidate=True`, and the LLM chooses which
-    to replay as. The endpoint is the single holdable target (`T1`).
+    `PackAuthContext`, but only the **declared-tier** ones (credentials the tester
+    controls — ADR-0010/0048) are marked `is_attacker_candidate=True`; discovered-
+    tier contexts remain in the pack as evidence/victim context, never offered as the
+    swap-in side. The endpoint is the single holdable target (`T1`).
 
     `gap.evidence` already carries every reaching principal (per ADR-0033). Each
     principal's AuthContext is resolved the same way `assemble_c2_pack` does
     (`_fetch_principal_auth`). Returns None when fewer than two principals have a
-    resolvable AuthContext (nothing differential left to replay) — the caller treats
-    that as a skipped gap, not a model call.
+    resolvable AuthContext (nothing differential left to replay) **or** when none of
+    the resolved contexts is declared-tier (no controlled credential to replay as) —
+    the caller treats either as a skipped gap, not a model call.
     """
 
     eid = gap.engagement_id
@@ -524,9 +529,13 @@ def assemble_c2b_pack(
                 principal_label=ev.label,
                 tier=auth.tier,
                 claims_summary=auth.claims_summary,
-                # Any reaching principal is a candidate attacker for the content
-                # differential — there is no a-priori victim/attacker split (ADR-0033).
-                is_attacker_candidate=True,
+                # Any reaching principal is a *potential* attacker for the content
+                # differential (no a-priori victim/attacker split, ADR-0033) — but an
+                # authz replay only swaps in a credential the tester controls, so
+                # only **declared-tier** contexts (ADR-0010/0048) are offered as
+                # attacker candidates. Discovered-tier contexts stay in the pack as
+                # evidence/victim context.
+                is_attacker_candidate=(auth.tier == "declared"),
                 auth_context_id=auth.auth_context_id,
             )
         )
@@ -539,6 +548,15 @@ def assemble_c2b_pack(
             engagement_id=eid,
             endpoint_id=gap.endpoint_id,
             resolved=len(auth_contexts),
+        )
+        return None
+    if not any(a.is_attacker_candidate for a in auth_contexts):
+        log.warning(
+            "planner.assemble.c2b.no_declared_attacker",
+            engagement_id=eid,
+            endpoint_id=gap.endpoint_id,
+            resolved=len(auth_contexts),
+            tiers=sorted({a.tier for a in auth_contexts if a.tier is not None}),
         )
         return None
 
