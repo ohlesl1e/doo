@@ -23,7 +23,9 @@ import os
 import sys
 from collections import Counter
 from collections.abc import Iterator
+from enum import StrEnum
 from pathlib import Path
+from typing import cast
 
 import typer
 
@@ -36,7 +38,7 @@ from doo.planner.generators import (
 )
 from doo.planner.llm import LiteLLMCaller, LLMCaller
 from doo.planner.llm_audit import BlobLLMAuditSink, LLMAuditSink
-from doo.planner.models import ProposedTestCaseView
+from doo.planner.models import GENERATOR_IDS, GeneratorId, ProposedTestCaseView
 from doo.planner.review import (
     JsonFileReviewLedger,
     ReviewError,
@@ -44,6 +46,15 @@ from doo.planner.review import (
     review_testcase,
 )
 from doo.planner.service import propose, review_queue
+
+# CLI-local choice enum for `-g/--generator`, generated from the canonical
+# `GENERATOR_IDS` tuple so it cannot drift (issue #111). Typer renders the
+# members in `--help` and rejects unknown values with a clean Click error
+# instead of a Pydantic traceback. `GeneratorId` itself stays a `Literal`.
+# mypy can't infer members from a non-literal mapping; the drift unit test
+# (`test_generator_opt_tracks_canonical_ids`) is the correctness guard.
+GeneratorOpt = StrEnum("GeneratorOpt", {g: g for g in GENERATOR_IDS})  # type: ignore[misc]
+
 
 planner_app = typer.Typer(
     help="Planner: deterministic hypothesis generation + human review over the "
@@ -226,12 +237,12 @@ def propose_cmd(
     engagement: str = typer.Option(
         ..., "--engagement", "-e", help="Engagement id to plan against."
     ),
-    generators: list[str] | None = typer.Option(
+    generators: list[GeneratorOpt] | None = typer.Option(
         None,
         "--generator",
         "-g",
         help="Enable only these candidate generators (repeatable). Default: all. "
-        "The S1 spine ships 'c1' (deterministic dead-endpoint probes).",
+        "See 'doo coverage --help' for per-id glosses.",
     ),
     as_json: bool = typer.Option(
         False, "--json", help="Emit the run summary as JSON instead of a table."
@@ -246,9 +257,16 @@ def propose_cmd(
     """
 
     _configure()
-    config = (
-        PlannerConfig(candidate_generators=tuple(generators))  # type: ignore[arg-type]
+    # `g.value` is `str`; the enum is built from `GENERATOR_IDS` so every value is a
+    # `GeneratorId` by construction (drift-tested) — mypy can't see that, hence cast.
+    requested = (
+        cast("tuple[GeneratorId, ...]", tuple(g.value for g in generators))
         if generators
+        else None
+    )
+    config = (
+        PlannerConfig(candidate_generators=requested)
+        if requested is not None
         else PlannerConfig()
     )
     # Build the model caller + audit sink only when an LLM generator (C2) is in the

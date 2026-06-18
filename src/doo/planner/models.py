@@ -302,6 +302,19 @@ class PackAuthContext(BaseModel):
     Carries the real `auth_context_id` for the resolver; `to_llm_dict()` excludes
     it. `is_attacker_candidate` marks the B side (the principal that did *not*
     reach the endpoint) for a C2 replay.
+
+    `holds_outlier_body` is an **advisory** signal for the C2b content-differential
+    case (#112): the principal already holds a response body that differs from the
+    baseline group, so replaying *as* it tests nothing (it reads its own resource —
+    no boundary crossed). It is a soft steer, NOT a filter — the principal stays an
+    `is_attacker_candidate` and the deterministic resolver never rejects an
+    outlier pick. Soft, not hard, on purpose: #110's discovered-tier exclusion is a
+    *dispatchability* constraint (the AC is physically un-armable), whereas the
+    outlier is a *meaningfulness* judgment, which ADR-0033 reserves for the LLM/human
+    ("assembly surfaces evidence, it does not adjudicate"). A wrong hard-exclude
+    would suppress a real attacker (missed vuln); a soft flag a weak model ignores
+    yields only a harmless, reviewable no-op proposal. `False` for every non-C2b
+    generator (C2 / boundary / tenant), which never set it.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -311,6 +324,7 @@ class PackAuthContext(BaseModel):
     tier: str | None = None
     claims_summary: str | None = None
     is_attacker_candidate: bool = False
+    holds_outlier_body: bool = False
     auth_context_id: AuthContextId
 
     def to_llm_dict(self) -> dict[str, object]:
@@ -323,6 +337,8 @@ class PackAuthContext(BaseModel):
             d["tier"] = self.tier
         if self.claims_summary is not None:
             d["claims_summary"] = self.claims_summary
+        if self.holds_outlier_body:
+            d["holds_outlier_body"] = True
         return d
 
 

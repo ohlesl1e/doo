@@ -10,8 +10,10 @@ coverage gap into the typed, id-free `ContextPack` the LLM reasons over.
 - `assemble_c2b_pack` — a **C2b content-differential gap** (`C2bResult`: ≥2
   principals ALL reached the endpoint with a 2xx but their bodies differ — the
   BOLA/IDOR hotspot). Here *any* reaching principal could be attacker or victim, so
-  **every** reaching principal is a pack auth context marked
-  `is_attacker_candidate=True`, and the LLM picks which one to replay as.
+  **every** reaching principal is a pack auth context; the **declared-tier** ones
+  (credentials the tester controls — ADR-0010/0048) are marked
+  `is_attacker_candidate=True`, discovered-tier ones stay in the pack as
+  evidence/victim context only, and the LLM picks which declared one to replay as.
 
 The pack is bounded and secret-free (ADR-0015/0037): targets and auth contexts are
 addressed by pack-local handles (`T1`, `A1`) never raw node ids; response bodies
@@ -34,12 +36,14 @@ detector runs once over a reaching observation, not per auth context.
 from __future__ import annotations
 
 import json
+from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, cast
 
 from doo.canonical.trust_boundary import CapabilityKind, stronger_capability_side
-from doo.coverage.models import C2bResult, C2Result, C3Result
+from doo.coverage.models import C2bResult, C2Result, C3Result, PrincipalEvidence
 from doo.events.l2 import ValueCandidate
 from doo.ids import (
     AuthContextId,
@@ -476,6 +480,36 @@ def assemble_c2_pack(
     )
 
 
+def _outlier_holders(evidence: Sequence[PrincipalEvidence]) -> set[str]:
+    """Principal ids holding an *outlier* body vs the baseline cluster (#112).
+
+    The per-principal signature is the same tuple C2b's divergence test keys on —
+    `(response_body_sha256, response_size_bytes)`, nulls included (mirrors
+    `coverage.queries._group_diverges`) — so planner and coverage never disagree on
+    what "differs." The **modal** signature is the one held by *strictly more*
+    principals than any other; every principal NOT holding it is an outlier (it
+    already holds a differentiated response, so replaying as it tests nothing).
+
+    When there is no strict plurality — a tie for most-common, which includes the
+    all-distinct case (every body unique) — there is no baseline to contrast
+    against, so nobody is an outlier and the set is empty. The deterministic layer
+    deliberately degrades to silence there and hands the LLM the full, un-steered
+    set (ADR-0033: surface, don't adjudicate the ambiguous case).
+    """
+
+    if len(evidence) < 2:
+        return set()
+    sig = {
+        ev.principal_id: (ev.response_body_sha256, ev.response_size_bytes)
+        for ev in evidence
+    }
+    ranked = Counter(sig.values()).most_common()
+    top_signature, top_count = ranked[0]
+    if len(ranked) > 1 and ranked[1][1] == top_count:
+        return set()  # tie for most-common → no baseline cluster → flag nobody
+    return {pid for pid, s in sig.items() if s != top_signature}
+
+
 def assemble_c2b_pack(
     client: Neo4jClient,
     *,
@@ -490,23 +524,31 @@ def assemble_c2b_pack(
     C2 (one reached, one did not), here there is no privileged "victim vs attacker"
     split a priori: any reaching principal could be the attacker reading another's
     differentiated resource. So **every** reaching principal becomes a
-    `PackAuthContext` marked `is_attacker_candidate=True`, and the LLM chooses which
-    to replay as. The endpoint is the single holdable target (`T1`).
+    `PackAuthContext`, but only the **declared-tier** ones (credentials the tester
+    controls — ADR-0010/0048) are marked `is_attacker_candidate=True`; discovered-
+    tier contexts remain in the pack as evidence/victim context, never offered as the
+    swap-in side. The endpoint is the single holdable target (`T1`).
 
     `gap.evidence` already carries every reaching principal (per ADR-0033). Each
     principal's AuthContext is resolved the same way `assemble_c2_pack` does
     (`_fetch_principal_auth`). Returns None when fewer than two principals have a
-    resolvable AuthContext (nothing differential left to replay) — the caller treats
-    that as a skipped gap, not a model call.
+    resolvable AuthContext (nothing differential left to replay) **or** when none of
+    the resolved contexts is declared-tier (no controlled credential to replay as) —
+    the caller treats either as a skipped gap, not a model call.
     """
 
     eid = gap.engagement_id
 
-    auth_contexts: list[PackAuthContext] = []
+    # The outlier set is computed over the FULL differential population (every
+    # reaching principal), not just the resolvable ones — the baseline cluster is
+    # defined by what was observed (#112).
+    outlier_holders = _outlier_holders(gap.evidence)
+
+    # Collect resolved (ev, auth) pairs in **evidence order** first; handles are
+    # assigned in a separate pass below so they can be ordered by attacker
+    # preference (#113) without disturbing exemplar selection.
+    resolved: list[tuple[PrincipalEvidence, _AuthView]] = []
     exemplar_principal_id: str | None = None
-    # A dedicated handle counter (not the evidence index) so resolved contexts are
-    # always contiguous A1, A2, ... even when a principal's auth fails to resolve.
-    handle_n = 0
     for ev in gap.evidence:
         auth = _fetch_principal_auth(client, eid, ev.principal_id)
         if auth is None:
@@ -517,21 +559,46 @@ def assemble_c2b_pack(
                 principal_label=ev.label,
             )
             continue
-        handle_n += 1
-        auth_contexts.append(
-            PackAuthContext(
-                handle=f"A{handle_n}",
-                principal_label=ev.label,
-                tier=auth.tier,
-                claims_summary=auth.claims_summary,
-                # Any reaching principal is a candidate attacker for the content
-                # differential — there is no a-priori victim/attacker split (ADR-0033).
-                is_attacker_candidate=True,
-                auth_context_id=auth.auth_context_id,
-            )
-        )
+        resolved.append((ev, auth))
         if exemplar_principal_id is None:
             exemplar_principal_id = ev.principal_id
+
+    # Assign A1, A2, ... in **preference order** (#113): a positionally-biased weak
+    # model defaults to A1, so put the most-meaningful pick there. Stable sort over
+    # evidence order by (¬is_attacker_candidate, holds_outlier_body) ascending →
+    #   1. declared ∧ ¬outlier   — preferred attacker (meaningful, dispatchable)
+    #   2. declared ∧  outlier   — dispatchable but no-op (#112 soft signal)
+    #   3. discovered            — evidence-only (#110: never an attacker candidate)
+    # Same entries, same flag values; only handle numbering / list position move.
+    resolved.sort(
+        key=lambda ea: (
+            ea[1].tier != "declared",
+            ea[0].principal_id in outlier_holders,
+        )
+    )
+    auth_contexts: list[PackAuthContext] = [
+        PackAuthContext(
+            handle=f"A{n}",
+            principal_label=ev.label,
+            tier=auth.tier,
+            claims_summary=auth.claims_summary,
+            # Any reaching principal is a *potential* attacker for the content
+            # differential (no a-priori victim/attacker split, ADR-0033) — but an
+            # authz replay only swaps in a credential the tester controls, so
+            # only **declared-tier** contexts (ADR-0010/0048) are offered as
+            # attacker candidates. Discovered-tier contexts stay in the pack as
+            # evidence/victim context.
+            is_attacker_candidate=(auth.tier == "declared"),
+            # Advisory soft steer (#112): this principal already holds a body
+            # that differs from the baseline group, so replaying as it is a
+            # no-op. It stays a candidate; only the prompt is nudged. See
+            # `PackAuthContext.holds_outlier_body` for why this is soft, not a
+            # filter.
+            holds_outlier_body=(ev.principal_id in outlier_holders),
+            auth_context_id=auth.auth_context_id,
+        )
+        for n, (ev, auth) in enumerate(resolved, start=1)
+    ]
 
     if len(auth_contexts) < 2:
         log.warning(
@@ -539,6 +606,15 @@ def assemble_c2b_pack(
             engagement_id=eid,
             endpoint_id=gap.endpoint_id,
             resolved=len(auth_contexts),
+        )
+        return None
+    if not any(a.is_attacker_candidate for a in auth_contexts):
+        log.warning(
+            "planner.assemble.c2b.no_declared_attacker",
+            engagement_id=eid,
+            endpoint_id=gap.endpoint_id,
+            resolved=len(auth_contexts),
+            tiers=sorted({a.tier for a in auth_contexts if a.tier is not None}),
         )
         return None
 

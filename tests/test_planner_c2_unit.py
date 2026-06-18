@@ -41,12 +41,14 @@ def _pack() -> ContextPack:
             PackAuthContext(
                 handle="A1",
                 principal_label="admin",
+                tier="declared",
                 is_attacker_candidate=False,
                 auth_context_id=AuthContextId("ac-admin"),
             ),
             PackAuthContext(
                 handle="A2",
                 principal_label="user_b",
+                tier="declared",
                 is_attacker_candidate=True,
                 auth_context_id=AuthContextId("ac-user-b"),
             ),
@@ -71,7 +73,7 @@ def _draft(**over: object) -> LLMProposalDraft:
 
 
 def test_resolve_draft_builds_concrete_proposal() -> None:
-    proposal = resolve_draft(_pack(), _draft())
+    proposal = resolve_draft(_pack(), _draft(), generator="c2")
     assert isinstance(proposal, PlannerProposal)
     assert proposal.generator == "c2"
     assert proposal.mode == "llm"
@@ -87,19 +89,19 @@ def test_resolve_draft_builds_concrete_proposal() -> None:
 
 
 def test_resolve_draft_rejects_hallucinated_target() -> None:
-    out = resolve_draft(_pack(), _draft(target_ref="T9"))
+    out = resolve_draft(_pack(), _draft(target_ref="T9"), generator="c2")
     assert isinstance(out, DraftRejected)
     assert out.code == "unknown_target"
 
 
 def test_resolve_draft_rejects_hallucinated_auth() -> None:
-    out = resolve_draft(_pack(), _draft(auth_context_ref="A9"))
+    out = resolve_draft(_pack(), _draft(auth_context_ref="A9"), generator="c2")
     assert isinstance(out, DraftRejected)
     assert out.code == "unknown_auth"
 
 
 def test_resolve_draft_rejects_hallucinated_hold() -> None:
-    out = resolve_draft(_pack(), _draft(hold=("T1", "T7")))
+    out = resolve_draft(_pack(), _draft(hold=("T1", "T7")), generator="c2")
     assert isinstance(out, DraftRejected)
     assert out.code == "unknown_hold"
 

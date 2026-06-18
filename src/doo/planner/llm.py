@@ -31,6 +31,7 @@ from doo.planner.models import (
     ContextPack,
     GeneratorId,
     LLMProposalDraft,
+    PackAuthContext,
     PayloadSpec,
     PlannerProposal,
 )
@@ -39,7 +40,7 @@ log = get_logger(__name__)
 
 # Prompt/algorithm version stamped on every proposal's provenance (ADR-0005); bump
 # when the prompt or tool schema changes so stale proposals are identifiable.
-PROMPT_VERSION = "planner-c2/3"
+PROMPT_VERSION = "planner-c2/4"
 
 SYSTEM_PROMPT = (
     "You are a black-box web application security tester proposing ONE "
@@ -62,6 +63,9 @@ SYSTEM_PROMPT = (
     "normally just that one target handle (e.g. ['T1']).\n"
     "- Choose `auth_context_ref` = the attacker side: the AUTH-CONTEXT handle ('A...') "
     "of the principal that did NOT reach the endpoint (marked is_attacker_candidate).\n"
+    "- An auth context marked `holds_outlier_body` already holds a response that "
+    "differs from the baseline group, so replaying as it tests nothing — prefer an "
+    "attacker context WITHOUT that flag when one is available.\n"
     "- Choose `test_class` by STRUCTURE, not reflex:\n"
     "    * `idor` / `bola` ONLY when the endpoint path carries an object/owner "
     "identifier the attacker would hold (a '{id}'-style segment, e.g. "
@@ -600,7 +604,8 @@ class DraftRejected:
     """A draft whose handles do not resolve against the pack (ADR-0037).
 
     `code` is a stable discriminator (`unknown_target`, `unknown_auth`,
-    `unknown_hold`); the proposal is discarded and logged, never committed.
+    `unknown_hold`, `non_declared_attacker`); the proposal is discarded and logged,
+    never committed.
     """
 
     code: str
@@ -608,16 +613,21 @@ class DraftRejected:
 
 
 def resolve_draft(
-    pack: ContextPack, draft: LLMProposalDraft, *, generator: GeneratorId = "c2"
+    pack: ContextPack, draft: LLMProposalDraft, *, generator: GeneratorId
 ) -> PlannerProposal | DraftRejected:
     """Resolve an authz-replay draft's pack handles to a `PlannerProposal` (ADR-0037).
 
     Shared by C2 / C2b (endpoint target) and the capability/tenant **boundary**
     generators (a `boundary` target → `TARGETS_BOUNDARY`, ADR-0039). Rejects any
-    handle absent from the pack (hallucination guard) before building the proposal.
+    handle absent from the pack (hallucination guard) before building the proposal,
+    and rejects an attacker `auth_context_ref` whose tier is not `"declared"`
+    (defense-in-depth: an authz replay only ever swaps in a credential the tester
+    controls — ADR-0010/0048; the assembler should already have withheld
+    `is_attacker_candidate`, this guard catches a model that picks one anyway).
     `payload_class`/`payload_spec` are fixed for an authz replay (`auth-token-swap` /
     `none`); `hold` handles resolve to human-readable labels. `generator` stamps the
-    proposal's provenance (the committed `source` is `llm-planner` for all of them).
+    proposal's provenance (the committed `source` is `llm-planner` for all of them);
+    there is **no default** so a caller cannot accidentally mis-stamp (issue #109).
     """
 
     targets = {t.handle: t for t in pack.targets}
@@ -629,6 +639,8 @@ def resolve_draft(
     auth = auths.get(draft.auth_context_ref)
     if auth is None:
         return _reject("unknown_auth", pack, draft, f"auth_context_ref {draft.auth_context_ref!r}")
+    if auth.tier != "declared":
+        return _reject_non_declared(pack, draft, auth)
 
     held: list[str] = []
     for h in draft.hold:
@@ -773,6 +785,25 @@ def _reject(
         auth_handles=sorted(pack.auth_handles()),
     )
     return DraftRejected(code=code, reason=reason)
+
+
+def _reject_non_declared(
+    pack: ContextPack, draft: LLMProposalDraft, auth: PackAuthContext
+) -> DraftRejected:
+    reason = (
+        f"auth_context_ref {draft.auth_context_ref!r} (tier={auth.tier!r}) is not a "
+        "declared-tier AuthContext; an authz replay only swaps in a credential the "
+        "tester controls"
+    )
+    log.warning(
+        "planner.llm.draft_rejected",
+        engagement_id=pack.engagement_id,
+        code="non_declared_attacker",
+        reason=reason,
+        auth_handle=auth.handle,
+        tier=auth.tier,
+    )
+    return DraftRejected(code="non_declared_attacker", reason=reason)
 
 
 # Structural type for `_hold_label` (a PackTarget); avoids importing the concrete
