@@ -93,6 +93,53 @@ def test_resolve_refuses_unknown_engagement() -> None:
         resolve_keepalive_config(EngagementId("nope"), reader)
 
 
+# --- Neo4j reader (json-string property) -------------------------------------
+# Regression: `e.kill_switch` is persisted as a JSON *string* (Neo4j cannot
+# store nested maps as node properties — see `ontology/graph_state.py` writer),
+# not a property map. The reader must decode it. Previously it subscripted the
+# raw string and raised `TypeError: string indices must be integers`.
+
+
+class _FakeSession:
+    """Minimal stand-in for a neo4j Session: `.run()` returns dict-records."""
+
+    def __init__(self, records: list[dict[str, object]]) -> None:
+        self._records = records
+
+    def run(self, *_a: object, **_k: object) -> list[dict[str, object]]:
+        return self._records
+
+
+def _neo4j_reader(records: list[dict[str, object]]):  # type: ignore[no-untyped-def]
+    from doo.engagement.cli_keepalive import _Neo4jLeaseConfigReader
+
+    return _Neo4jLeaseConfigReader(_FakeSession(records))
+
+
+def test_neo4j_reader_decodes_json_string_property() -> None:
+    import json
+
+    stored = json.dumps(
+        {"backend": "redis", "lease_ttl_seconds": 45, "refresh_interval_seconds": 20},
+        sort_keys=True,
+    )
+    ks = _neo4j_reader([{"kill_switch": stored}]).read_kill_switch_config(
+        EngagementId("eng-1")
+    )
+    assert ks == KillSwitchConfig(lease_ttl_seconds=45, refresh_interval_seconds=20)
+
+
+def test_neo4j_reader_missing_engagement_returns_none() -> None:
+    assert _neo4j_reader([]).read_kill_switch_config(EngagementId("nope")) is None
+
+
+def test_neo4j_reader_null_property_falls_back_to_defaults() -> None:
+    ks = _neo4j_reader([{"kill_switch": None}]).read_kill_switch_config(
+        EngagementId("eng-1")
+    )
+    assert ks == KillSwitchConfig()
+
+
 # --- Lease key shape ---------------------------------------------------------
 
 
