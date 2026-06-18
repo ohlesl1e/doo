@@ -421,6 +421,126 @@ def test_assemble_c2b_returns_none_when_no_declared_attacker(
     assert "planner.assemble.c2b.too_few_auth_contexts" not in events
 
 
+# ---------------------------------------------------------------------------
+# 4b. #112 outlier soft signal: the principal holding a body that differs from
+#     the baseline cluster is flagged `holds_outlier_body` (advisory — it stays
+#     an attacker candidate). Strict-plurality rule; ties flag nobody.
+# ---------------------------------------------------------------------------
+
+
+def _c2b_gap_bodies(bodies: dict[str, str | None]) -> C2bResult:
+    """A C2b gap where each label maps to a body-hash token (its signature).
+
+    `response_size_bytes` is left None so the `(sha256, size)` signature is driven
+    purely by the token; a None token shares the `(None, None)` signature.
+    """
+
+    return C2bResult(
+        engagement_id=EngagementId("eng-c2b"),
+        generated_at=datetime.now(UTC),
+        endpoint_id="ep-profile",
+        method="GET",
+        host="api.example.com",
+        path_template="/profile",
+        evidence=tuple(
+            PrincipalEvidence(
+                principal_id=f"p-{label}",
+                label=label,
+                status=200,
+                response_body_sha256=body,
+            )
+            for label, body in bodies.items()
+        ),
+        effective_confidence=1.0,
+    )
+
+
+def _assemble_flags(
+    monkeypatch: pytest.MonkeyPatch, bodies: dict[str, str | None]
+) -> dict[str, bool]:
+    """Assemble a c2b pack (all principals declared) → {label: holds_outlier_body}."""
+
+    _patch_auth_by_tier(monkeypatch, {f"p-{label}": "declared" for label in bodies})
+    pack = assemble_c2b_pack(
+        cast("Neo4jClient", None),
+        gap=_c2b_gap_bodies(bodies),
+        code_version="test",
+        now=datetime.now(UTC),
+    )
+    assert pack is not None
+    return {a.principal_label: a.holds_outlier_body for a in pack.auth_contexts}
+
+
+def test_outlier_single_holder_flagged(monkeypatch: pytest.MonkeyPatch) -> None:
+    # admin holds the unique body; v1/v2/guest share the baseline → only admin.
+    flags = _assemble_flags(
+        monkeypatch, {"admin": "X", "v1": "Y", "v2": "Y", "guest": "Y"}
+    )
+    assert flags == {"admin": True, "v1": False, "v2": False, "guest": False}
+
+
+def test_outlier_multiple_holders_flagged(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Two singletons (admin=X, mgr=Z) against a baseline plurality (Y) → both.
+    flags = _assemble_flags(
+        monkeypatch, {"admin": "X", "mgr": "Z", "v": "Y", "guest": "Y"}
+    )
+    assert flags == {"admin": True, "mgr": True, "v": False, "guest": False}
+
+
+def test_outlier_all_distinct_flags_nobody(monkeypatch: pytest.MonkeyPatch) -> None:
+    # No baseline cluster (every body unique) → flag nobody.
+    flags = _assemble_flags(monkeypatch, {"a": "W", "b": "X", "c": "Y", "d": "Z"})
+    assert flags == {"a": False, "b": False, "c": False, "d": False}
+
+
+def test_outlier_even_split_flags_nobody(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Tie for most-common (A,A,B,B) → no strict plurality → flag nobody.
+    flags = _assemble_flags(monkeypatch, {"a": "A", "b": "A", "c": "B", "d": "B"})
+    assert flags == {"a": False, "b": False, "c": False, "d": False}
+
+
+def test_outlier_holder_stays_attacker_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The flag is advisory: a flagged declared principal is STILL a candidate.
+    _patch_auth_by_tier(
+        monkeypatch, {"p-admin": "declared", "p-v1": "declared", "p-v2": "declared"}
+    )
+    pack = assemble_c2b_pack(
+        cast("Neo4jClient", None),
+        gap=_c2b_gap_bodies({"admin": "X", "v1": "Y", "v2": "Y"}),
+        code_version="test",
+        now=datetime.now(UTC),
+    )
+    assert pack is not None
+    by_label = {a.principal_label: a for a in pack.auth_contexts}
+    assert by_label["admin"].holds_outlier_body is True
+    assert by_label["admin"].is_attacker_candidate is True
+
+
+def test_holds_outlier_body_serialized_only_when_true() -> None:
+    # Advisory flag reaches the prompt JSON when set; omitted (and defaults False)
+    # otherwise — so C2 / boundary / tenant packs, which never set it, stay clean.
+    flagged = PackAuthContext(
+        handle="A1",
+        principal_label="admin",
+        tier="declared",
+        is_attacker_candidate=True,
+        holds_outlier_body=True,
+        auth_context_id=AuthContextId("ac-admin"),
+    )
+    plain = PackAuthContext(
+        handle="A2",
+        principal_label="viewer",
+        tier="declared",
+        is_attacker_candidate=True,
+        auth_context_id=AuthContextId("ac-viewer"),
+    )
+    assert plain.holds_outlier_body is False
+    assert flagged.to_llm_dict()["holds_outlier_body"] is True
+    assert "holds_outlier_body" not in plain.to_llm_dict()
+
+
 def test_c2b_proposal_carries_code_set_replay_hazards() -> None:
     # The generator copies detected hazards onto the frozen proposal.
     proposal = resolve_draft(_c2b_pack(), _c2b_draft(), generator="c2b")

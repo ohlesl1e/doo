@@ -36,12 +36,14 @@ detector runs once over a reaching observation, not per auth context.
 from __future__ import annotations
 
 import json
+from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, cast
 
 from doo.canonical.trust_boundary import CapabilityKind, stronger_capability_side
-from doo.coverage.models import C2bResult, C2Result, C3Result
+from doo.coverage.models import C2bResult, C2Result, C3Result, PrincipalEvidence
 from doo.events.l2 import ValueCandidate
 from doo.ids import (
     AuthContextId,
@@ -478,6 +480,36 @@ def assemble_c2_pack(
     )
 
 
+def _outlier_holders(evidence: Sequence[PrincipalEvidence]) -> set[str]:
+    """Principal ids holding an *outlier* body vs the baseline cluster (#112).
+
+    The per-principal signature is the same tuple C2b's divergence test keys on —
+    `(response_body_sha256, response_size_bytes)`, nulls included (mirrors
+    `coverage.queries._group_diverges`) — so planner and coverage never disagree on
+    what "differs." The **modal** signature is the one held by *strictly more*
+    principals than any other; every principal NOT holding it is an outlier (it
+    already holds a differentiated response, so replaying as it tests nothing).
+
+    When there is no strict plurality — a tie for most-common, which includes the
+    all-distinct case (every body unique) — there is no baseline to contrast
+    against, so nobody is an outlier and the set is empty. The deterministic layer
+    deliberately degrades to silence there and hands the LLM the full, un-steered
+    set (ADR-0033: surface, don't adjudicate the ambiguous case).
+    """
+
+    if len(evidence) < 2:
+        return set()
+    sig = {
+        ev.principal_id: (ev.response_body_sha256, ev.response_size_bytes)
+        for ev in evidence
+    }
+    ranked = Counter(sig.values()).most_common()
+    top_signature, top_count = ranked[0]
+    if len(ranked) > 1 and ranked[1][1] == top_count:
+        return set()  # tie for most-common → no baseline cluster → flag nobody
+    return {pid for pid, s in sig.items() if s != top_signature}
+
+
 def assemble_c2b_pack(
     client: Neo4jClient,
     *,
@@ -506,6 +538,11 @@ def assemble_c2b_pack(
     """
 
     eid = gap.engagement_id
+
+    # The outlier set is computed over the FULL differential population (every
+    # reaching principal), not just the resolvable ones — the baseline cluster is
+    # defined by what was observed (#112).
+    outlier_holders = _outlier_holders(gap.evidence)
 
     auth_contexts: list[PackAuthContext] = []
     exemplar_principal_id: str | None = None
@@ -536,6 +573,12 @@ def assemble_c2b_pack(
                 # attacker candidates. Discovered-tier contexts stay in the pack as
                 # evidence/victim context.
                 is_attacker_candidate=(auth.tier == "declared"),
+                # Advisory soft steer (#112): this principal already holds a body
+                # that differs from the baseline group, so replaying as it is a
+                # no-op. It stays a candidate; only the prompt is nudged. See
+                # `PackAuthContext.holds_outlier_body` for why this is soft, not a
+                # filter.
+                holds_outlier_body=(ev.principal_id in outlier_holders),
                 auth_context_id=auth.auth_context_id,
             )
         )

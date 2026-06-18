@@ -40,7 +40,7 @@ log = get_logger(__name__)
 
 # Prompt/algorithm version stamped on every proposal's provenance (ADR-0005); bump
 # when the prompt or tool schema changes so stale proposals are identifiable.
-PROMPT_VERSION = "planner-c2/3"
+PROMPT_VERSION = "planner-c2/4"
 
 SYSTEM_PROMPT = (
     "You are a black-box web application security tester proposing ONE "
@@ -63,6 +63,9 @@ SYSTEM_PROMPT = (
     "normally just that one target handle (e.g. ['T1']).\n"
     "- Choose `auth_context_ref` = the attacker side: the AUTH-CONTEXT handle ('A...') "
     "of the principal that did NOT reach the endpoint (marked is_attacker_candidate).\n"
+    "- An auth context marked `holds_outlier_body` already holds a response that "
+    "differs from the baseline group, so replaying as it tests nothing — prefer an "
+    "attacker context WITHOUT that flag when one is available.\n"
     "- Choose `test_class` by STRUCTURE, not reflex:\n"
     "    * `idor` / `bola` ONLY when the endpoint path carries an object/owner "
     "identifier the attacker would hold (a '{id}'-style segment, e.g. "
