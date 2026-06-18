@@ -25,6 +25,7 @@ from collections import Counter
 from collections.abc import Iterator
 from enum import StrEnum
 from pathlib import Path
+from typing import cast
 
 import typer
 
@@ -37,7 +38,7 @@ from doo.planner.generators import (
 )
 from doo.planner.llm import LiteLLMCaller, LLMCaller
 from doo.planner.llm_audit import BlobLLMAuditSink, LLMAuditSink
-from doo.planner.models import GENERATOR_IDS, ProposedTestCaseView
+from doo.planner.models import GENERATOR_IDS, GeneratorId, ProposedTestCaseView
 from doo.planner.review import (
     JsonFileReviewLedger,
     ReviewError,
@@ -50,7 +51,9 @@ from doo.planner.service import propose, review_queue
 # `GENERATOR_IDS` tuple so it cannot drift (issue #111). Typer renders the
 # members in `--help` and rejects unknown values with a clean Click error
 # instead of a Pydantic traceback. `GeneratorId` itself stays a `Literal`.
-GeneratorOpt = StrEnum("GeneratorOpt", {g: g for g in GENERATOR_IDS})
+# mypy can't infer members from a non-literal mapping; the drift unit test
+# (`test_generator_opt_tracks_canonical_ids`) is the correctness guard.
+GeneratorOpt = StrEnum("GeneratorOpt", {g: g for g in GENERATOR_IDS})  # type: ignore[misc]
 
 
 planner_app = typer.Typer(
@@ -254,9 +257,16 @@ def propose_cmd(
     """
 
     _configure()
-    config = (
-        PlannerConfig(candidate_generators=tuple(g.value for g in generators))  # type: ignore[arg-type]
+    # `g.value` is `str`; the enum is built from `GENERATOR_IDS` so every value is a
+    # `GeneratorId` by construction (drift-tested) — mypy can't see that, hence cast.
+    requested = (
+        cast("tuple[GeneratorId, ...]", tuple(g.value for g in generators))
         if generators
+        else None
+    )
+    config = (
+        PlannerConfig(candidate_generators=requested)
+        if requested is not None
         else PlannerConfig()
     )
     # Build the model caller + audit sink only when an LLM generator (C2) is in the
