@@ -544,11 +544,11 @@ def assemble_c2b_pack(
     # defined by what was observed (#112).
     outlier_holders = _outlier_holders(gap.evidence)
 
-    auth_contexts: list[PackAuthContext] = []
+    # Collect resolved (ev, auth) pairs in **evidence order** first; handles are
+    # assigned in a separate pass below so they can be ordered by attacker
+    # preference (#113) without disturbing exemplar selection.
+    resolved: list[tuple[PrincipalEvidence, _AuthView]] = []
     exemplar_principal_id: str | None = None
-    # A dedicated handle counter (not the evidence index) so resolved contexts are
-    # always contiguous A1, A2, ... even when a principal's auth fails to resolve.
-    handle_n = 0
     for ev in gap.evidence:
         auth = _fetch_principal_auth(client, eid, ev.principal_id)
         if auth is None:
@@ -559,31 +559,46 @@ def assemble_c2b_pack(
                 principal_label=ev.label,
             )
             continue
-        handle_n += 1
-        auth_contexts.append(
-            PackAuthContext(
-                handle=f"A{handle_n}",
-                principal_label=ev.label,
-                tier=auth.tier,
-                claims_summary=auth.claims_summary,
-                # Any reaching principal is a *potential* attacker for the content
-                # differential (no a-priori victim/attacker split, ADR-0033) — but an
-                # authz replay only swaps in a credential the tester controls, so
-                # only **declared-tier** contexts (ADR-0010/0048) are offered as
-                # attacker candidates. Discovered-tier contexts stay in the pack as
-                # evidence/victim context.
-                is_attacker_candidate=(auth.tier == "declared"),
-                # Advisory soft steer (#112): this principal already holds a body
-                # that differs from the baseline group, so replaying as it is a
-                # no-op. It stays a candidate; only the prompt is nudged. See
-                # `PackAuthContext.holds_outlier_body` for why this is soft, not a
-                # filter.
-                holds_outlier_body=(ev.principal_id in outlier_holders),
-                auth_context_id=auth.auth_context_id,
-            )
-        )
+        resolved.append((ev, auth))
         if exemplar_principal_id is None:
             exemplar_principal_id = ev.principal_id
+
+    # Assign A1, A2, ... in **preference order** (#113): a positionally-biased weak
+    # model defaults to A1, so put the most-meaningful pick there. Stable sort over
+    # evidence order by (¬is_attacker_candidate, holds_outlier_body) ascending →
+    #   1. declared ∧ ¬outlier   — preferred attacker (meaningful, dispatchable)
+    #   2. declared ∧  outlier   — dispatchable but no-op (#112 soft signal)
+    #   3. discovered            — evidence-only (#110: never an attacker candidate)
+    # Same entries, same flag values; only handle numbering / list position move.
+    resolved.sort(
+        key=lambda ea: (
+            ea[1].tier != "declared",
+            ea[0].principal_id in outlier_holders,
+        )
+    )
+    auth_contexts: list[PackAuthContext] = [
+        PackAuthContext(
+            handle=f"A{n}",
+            principal_label=ev.label,
+            tier=auth.tier,
+            claims_summary=auth.claims_summary,
+            # Any reaching principal is a *potential* attacker for the content
+            # differential (no a-priori victim/attacker split, ADR-0033) — but an
+            # authz replay only swaps in a credential the tester controls, so
+            # only **declared-tier** contexts (ADR-0010/0048) are offered as
+            # attacker candidates. Discovered-tier contexts stay in the pack as
+            # evidence/victim context.
+            is_attacker_candidate=(auth.tier == "declared"),
+            # Advisory soft steer (#112): this principal already holds a body
+            # that differs from the baseline group, so replaying as it is a
+            # no-op. It stays a candidate; only the prompt is nudged. See
+            # `PackAuthContext.holds_outlier_body` for why this is soft, not a
+            # filter.
+            holds_outlier_body=(ev.principal_id in outlier_holders),
+            auth_context_id=auth.auth_context_id,
+        )
+        for n, (ev, auth) in enumerate(resolved, start=1)
+    ]
 
     if len(auth_contexts) < 2:
         log.warning(

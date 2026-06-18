@@ -541,6 +541,132 @@ def test_holds_outlier_body_serialized_only_when_true() -> None:
     assert "holds_outlier_body" not in plain.to_llm_dict()
 
 
+# ---------------------------------------------------------------------------
+# 4c. #113 handle ordering: A1, A2, ... assigned in attacker-preference order
+#     (declared∧¬outlier → declared∧outlier → discovered), stable within a tier,
+#     so a positionally-biased weak model defaults to a meaningful pick. Pure
+#     reorder — same entries, same flag values; exemplar selection unaffected.
+# ---------------------------------------------------------------------------
+
+
+def _handle_order(
+    monkeypatch: pytest.MonkeyPatch,
+    bodies: dict[str, str | None],
+    tiers: dict[str, str],
+) -> list[tuple[str, str]]:
+    """Assemble a c2b pack → [(handle, principal_label), ...] in handle order."""
+
+    _patch_auth_by_tier(monkeypatch, {f"p-{label}": tiers[label] for label in bodies})
+    pack = assemble_c2b_pack(
+        cast("Neo4jClient", None),
+        gap=_c2b_gap_bodies(bodies),
+        code_version="test",
+        now=datetime.now(UTC),
+    )
+    assert pack is not None
+    return [(a.handle, a.principal_label) for a in pack.auth_contexts]
+
+
+def test_c2b_handles_prefer_non_outlier_declared(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # admin = declared+outlier, monitor/system-test = declared+baseline,
+    # disc = discovered+baseline. Evidence order: admin, monitor, system-test, disc.
+    # → A1/A2 = monitor,system-test (tier 1, evidence order); A3 = admin (tier 2);
+    #   A4 = disc (tier 3).
+    order = _handle_order(
+        monkeypatch,
+        bodies={"admin": "X", "monitor": "Y", "system-test": "Y", "disc": "Y"},
+        tiers={
+            "admin": "declared",
+            "monitor": "declared",
+            "system-test": "declared",
+            "disc": "discovered",
+        },
+    )
+    assert order == [
+        ("A1", "monitor"),
+        ("A2", "system-test"),
+        ("A3", "admin"),
+        ("A4", "disc"),
+    ]
+
+
+def test_c2b_handles_when_all_declared_are_outliers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Modal = Y (discovered pair); both declared (admin=X, viewer=Z) are outliers.
+    # No tier-1 entry exists → A1/A2 still the declared pair (tier 2 above tier 3).
+    order = _handle_order(
+        monkeypatch,
+        bodies={"admin": "X", "viewer": "Z", "d1": "Y", "d2": "Y"},
+        tiers={
+            "admin": "declared",
+            "viewer": "declared",
+            "d1": "discovered",
+            "d2": "discovered",
+        },
+    )
+    assert order == [
+        ("A1", "admin"),
+        ("A2", "viewer"),
+        ("A3", "d1"),
+        ("A4", "d2"),
+    ]
+
+
+def test_c2b_handles_stable_on_tie(monkeypatch: pytest.MonkeyPatch) -> None:
+    # All-distinct bodies → tie → nobody flagged → all declared land in tier 1 →
+    # stable sort preserves evidence order exactly.
+    order = _handle_order(
+        monkeypatch,
+        bodies={"admin": "W", "monitor": "X", "system-test": "Y", "guest": "Z"},
+        tiers={
+            "admin": "declared",
+            "monitor": "declared",
+            "system-test": "declared",
+            "guest": "declared",
+        },
+    )
+    assert order == [
+        ("A1", "admin"),
+        ("A2", "monitor"),
+        ("A3", "system-test"),
+        ("A4", "guest"),
+    ]
+
+
+def test_c2b_exemplar_independent_of_handle_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # admin is first in evidence order AND the outlier → after #113 admin is NOT A1,
+    # but the exemplar (the observation the replay is built from) must still derive
+    # from admin — exemplar selection is evidence-order, not handle-order.
+    _patch_auth_by_tier(
+        monkeypatch,
+        {"p-admin": "declared", "p-monitor": "declared", "p-system-test": "declared"},
+    )
+    captured: dict[str, str] = {}
+
+    def _capture_exemplar(
+        client: object, eid: object, *, endpoint_id: str, principal_id: str
+    ) -> None:
+        captured["principal_id"] = principal_id
+        return None
+
+    monkeypatch.setattr(assemble_mod, "_fetch_exemplar", _capture_exemplar)
+    pack = assemble_c2b_pack(
+        cast("Neo4jClient", None),
+        gap=_c2b_gap_bodies({"admin": "X", "monitor": "Y", "system-test": "Y"}),
+        code_version="test",
+        now=datetime.now(UTC),
+    )
+    assert pack is not None
+    by_label = {a.principal_label: a.handle for a in pack.auth_contexts}
+    assert by_label["admin"] != "A1"  # admin demoted by the sort
+    assert captured["principal_id"] == "p-admin"  # but still the exemplar
+
+
 def test_c2b_proposal_carries_code_set_replay_hazards() -> None:
     # The generator copies detected hazards onto the frozen proposal.
     proposal = resolve_draft(_c2b_pack(), _c2b_draft(), generator="c2b")
