@@ -71,7 +71,7 @@ Build vertically through one slice before broadening. Do not scaffold all five l
 
 ## What to do at the start of a session
 
-1. Read `ARCHITECTURE.md` (esp. "Build order (the slices)" — the canonical roadmap), `ONTOLOGY.md`, `CONTEXT.md` (domain language), and `docs/adr/` (decisions to date — 0001 through 0048).
+1. Read `ARCHITECTURE.md` (esp. "Build order (the slices)" — the canonical roadmap), `ONTOLOGY.md`, `CONTEXT.md` (domain language), and `docs/adr/` (decisions to date — 0001 through 0049).
 2. Check `docs/grill-queue.md` — open design decisions worth grilling, plus deliberate deferrals.
 3. Confirm which slice we're working on. **Slices 1–4 are shipped** (slice 4 = bounded agent execution: Executor + Interpreter). The MVP five-layer vertical is complete; if unclear what's next, ask before generating code.
 
@@ -88,7 +88,7 @@ Build vertically through one slice before broadening. Do not scaffold all five l
 
 The ontology (`ONTOLOGY.md`) design is complete: all six steps drafted, all three originally-open questions resolved (Asset / TrustBoundary / Payload), 47 ADRs recorded. `TrustBoundary` inference (capability + tenant) shipped in slice 3.
 
-**Slices 1–4 are shipped** (slice-2 coverage closed by ADR-0033/0034/0035; slice 3 / the Planner by ADR-0036–0041; **slice 4 / Executor + Interpreter by ADR-0042–0047**, tracers #86–#93: dispatch spine, real OPA, the confirm loop + Finding lifecycle, the ADR-0044 liveness classifier, replay-hazard resolvers + `doo dispatch review`, the auth-helper rotation sibling, all MVP authz classes + C5/C5a/C5b, and Interpreter follow-ups + the `InterpreterMode` seam). PRDs: slice-1 #2 (tracers #3–#10), slice-2 #49 (#50–#57), slice-3 #59 (tracers #61–#67), slice-4 #85 (tracers #86–#93).
+**Slices 1–4 are shipped** (slice-2 coverage closed by ADR-0033/0034/0035; slice 3 / the Planner by ADR-0036–0041; **slice 4 / Executor + Interpreter by ADR-0042–0047; G5 credential-slot re-key by ADR-0049**, tracers #86–#93: dispatch spine, real OPA, the confirm loop + Finding lifecycle, the ADR-0044 liveness classifier, replay-hazard resolvers + `doo dispatch review`, the auth-helper rotation sibling, all MVP authz classes + C5/C5a/C5b, and Interpreter follow-ups + the `InterpreterMode` seam). PRDs: slice-1 #2 (tracers #3–#10), slice-2 #49 (#50–#57), slice-3 #59 (tracers #61–#67), slice-4 #85 (tracers #86–#93).
 
 ## Agent skills
 

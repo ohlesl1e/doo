@@ -102,7 +102,7 @@ Marked **core** (essential), **probable** (likely needed), or **deferred** (late
 
 ### Testing — what we did and found
 
-- **`TestCase`** *(core)* — a proposed or executed test. Class (IDOR, SSRF, auth-bypass-variant), target (usually Endpoint + Parameter), payload reference, expected vs. observed outcome, status (proposed / approved / executed / completed).
+- **`TestCase`** *(core)* — a proposed or executed test. Class (IDOR, SSRF, auth-bypass-variant), target (usually Endpoint + Parameter), payload reference, expected vs. observed outcome, status (proposed / approved / executed / completed). Identity is content-addressed over `(engagement_id, test_class, target_*, payload_class, payload_hash, attacker_principal, attacker_slot)` — the rotation-stable credential **slot**, not `auth_context_id`, which is non-key evidence (ADR-0007 + ADR-0049).
 - **`Payload`** *(core — OPEN QUESTION 3)* — a specific input used in a test. Separated from TestCase to enable reasoning about payload classes for ROE enforcement.
 - **`Finding`** *(core)* — a confirmed vulnerability. Severity, category, references the TestCase(s) that demonstrated it, the Endpoint(s) affected.
 
@@ -532,7 +532,9 @@ class TestCase(Inferred):
     target_trust_boundary_id: str | None = None
     payload_class: str
     payload_hash: str
-    auth_context_id: str
+    attacker_principal: str  # ADR-0049: rotation-stable attacker identity
+    attacker_slot: str
+    auth_context_id: str  # non-key evidence; rotates per token
     key_hash: str
 
     @model_validator(mode="after")
@@ -608,7 +610,7 @@ Our dispatcher's outbound HTTP requests are stored as `RequestObservation` nodes
 
 ### Gap #4 — `TestCase` identity is content-addressed and Engagement-scoped (RESOLVED — ADR-0007)
 
-TestCase identity is `key_hash = sha256(canonicalized(engagement_id, test_class, target_endpoint_id?, target_parameter_id?, target_trust_boundary_id?, payload_class, payload_hash, auth_context_id))`, stored as a unique-indexed property. Same content + same Engagement → same node. The target is **three-way XOR**: exactly one of `target_endpoint_id` (route-level test), `target_parameter_id` (parameter-level test; the Endpoint is reachable via `HAS_PARAMETER`), or `target_trust_boundary_id` (boundary test); the unused two normalize to null and fall out of canonicalization. The matching graph edge is one of `TARGETS_ENDPOINT` / `TARGETS_PARAMETER` / `TARGETS_BOUNDARY`. `payload_hash` is over the concrete bytes the dispatcher will send (sentinel `sha256("")` for no-payload tests; never SQL null). C8 (dedup) reduces to `MATCH (tc:TestCase {key_hash}) WHERE EXISTS { (tc)-[:EXECUTED_AS]->() }`.
+TestCase identity is `key_hash = sha256(canonicalized(engagement_id, test_class, target_endpoint_id?, target_parameter_id?, target_trust_boundary_id?, payload_class, payload_hash, attacker_principal, attacker_slot))`, stored as a unique-indexed property. The attacker is keyed by **(principal, credential slot)** — the rotation-stable identity (ADR-0049); `auth_context_id` is carried as non-key evidence and updated `ON MATCH SET` when the same logical test is re-proposed under a fresh token. Same content + same Engagement → same node. The target is **three-way XOR**: exactly one of `target_endpoint_id` (route-level test), `target_parameter_id` (parameter-level test; the Endpoint is reachable via `HAS_PARAMETER`), or `target_trust_boundary_id` (boundary test); the unused two normalize to null and fall out of canonicalization. The matching graph edge is one of `TARGETS_ENDPOINT` / `TARGETS_PARAMETER` / `TARGETS_BOUNDARY`. `payload_hash` is over the concrete bytes the dispatcher will send (sentinel `sha256("")` for no-payload tests; never SQL null). C8 (dedup) reduces to `MATCH (tc:TestCase {key_hash}) WHERE EXISTS { (tc)-[:EXECUTED_AS]->() }`.
 
 Retries / re-runs add `EXECUTED_AS` edges to the same node. Payload sweeps (50 SQLi variants) create 50 different nodes (different `payload_hash`) — each is its own auditable test. Cross-Engagement reuse ("catalog of known tests") is a deferred concept (`TestTemplate`), not a TestCase.
 
