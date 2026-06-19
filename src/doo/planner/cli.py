@@ -47,13 +47,33 @@ from doo.planner.review import (
 )
 from doo.planner.service import propose, review_queue
 
+# Human-readable aliases for the coverage-derived generator ids. CLI sugar
+# only: the canonical ids (c1..c4) stay authoritative in the graph, the
+# coverage subcommands, and the ADRs; aliases normalise to them before
+# reaching `PlannerConfig`. `tenant`/`sink` are already descriptive.
+GENERATOR_ALIASES: dict[str, GeneratorId] = {
+    "dead": "c1",
+    "asym": "c2",
+    "diff": "c2b",
+    "leak": "c3",
+    "tier": "c4",
+}
+
 # CLI-local choice enum for `-g/--generator`, generated from the canonical
-# `GENERATOR_IDS` tuple so it cannot drift (issue #111). Typer renders the
-# members in `--help` and rejects unknown values with a clean Click error
-# instead of a Pydantic traceback. `GeneratorId` itself stays a `Literal`.
-# mypy can't infer members from a non-literal mapping; the drift unit test
-# (`test_generator_opt_tracks_canonical_ids`) is the correctness guard.
-GeneratorOpt = StrEnum("GeneratorOpt", {g: g for g in GENERATOR_IDS})  # type: ignore[misc]
+# `GENERATOR_IDS` tuple plus the alias keys so it cannot drift (issue #111).
+# Typer renders the members in `--help` and rejects unknown values with a
+# clean Click error instead of a Pydantic traceback. `GeneratorId` itself
+# stays a `Literal`. mypy can't infer members from a non-literal mapping; the
+# drift unit test (`test_generator_opt_tracks_canonical_ids`) is the guard.
+GeneratorOpt = StrEnum(  # type: ignore[misc]
+    "GeneratorOpt",
+    {g: g for g in (*GENERATOR_IDS, *GENERATOR_ALIASES)},
+)
+
+
+def _canonical_generator(opt: str) -> GeneratorId:
+    """Resolve a `-g` value (canonical id or alias) to its canonical `GeneratorId`."""
+    return GENERATOR_ALIASES.get(opt, cast("GeneratorId", opt))
 
 
 planner_app = typer.Typer(
@@ -241,11 +261,11 @@ def propose_cmd(
         None,
         "--generator",
         "-g",
-        help="Enable only these candidate generators (repeatable). Default: all. "
-        "See 'doo coverage --help' for per-id glosses.",
+        help="Enable only these candidate generators (repeatable; aliases in "
+        "parens above). Default: all.",
     ),
     as_json: bool = typer.Option(
-        False, "--json", help="Emit the run summary as JSON instead of a table."
+        False, "--json", help="Run-summary as JSON instead of a table."
     ),
 ) -> None:
     """Run the deterministic generators and commit proposed `TestCase`s (no dispatch).
@@ -254,13 +274,24 @@ def propose_cmd(
     rest ask the LLM for a structured proposal), validates and scopes each, and
     commits survivors at `review_status = proposed`. `-g` limits to specific
     generators. Nothing is sent — approval happens in `doo planner review`.
+
+    \b
+    Generators (canonical id / alias — c1-c4 mirror 'doo coverage' queries):
+      c1   (dead)  endpoints with no HIT edge of any kind
+      c2   (asym)  endpoints reached 2xx as principal A but not B
+      c2b  (diff)  endpoints reached 2xx by ≥2 principals, responses differ
+      c3   (leak)  values leaked in one response and sent as input to another
+      c4   (tier)  endpoints a stronger token reached that its weaker did not
+      tenant       cross-tenant TrustBoundary replay
+      sink         URL/path-shaped params (SSRF / open-redirect / path-traversal)
     """
 
     _configure()
-    # `g.value` is `str`; the enum is built from `GENERATOR_IDS` so every value is a
-    # `GeneratorId` by construction (drift-tested) — mypy can't see that, hence cast.
+    # Normalise aliases → canonical ids and dedupe (`-g dead -g c1` ⇒ one `c1`),
+    # preserving CLI order. Every surviving value is a `GeneratorId` by
+    # construction (drift-tested); mypy can't see that, hence the helper's cast.
     requested = (
-        cast("tuple[GeneratorId, ...]", tuple(g.value for g in generators))
+        tuple(dict.fromkeys(_canonical_generator(g.value) for g in generators))
         if generators
         else None
     )
