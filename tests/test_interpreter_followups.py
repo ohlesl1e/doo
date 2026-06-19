@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+from doo.dispatch.interpreter.loop import INTERPRETER_PROMPT_VERSION
 from doo.dispatch.interpreter.mode import (
     ConfirmMode,
     FreelanceMode,
@@ -149,7 +150,7 @@ def test_confirm_mode_commits_valid_discards_out_of_scope(neo4j_client: Neo4jCli
     assert rows[0]["rs"] == "proposed"
     assert rows[0]["src"] == "llm-interpreter"
     assert rows[0]["gen"] == "interpreter"
-    assert rows[0]["cv"] == "interpreter-confirm/2"
+    assert rows[0]["cv"] == INTERPRETER_PROMPT_VERSION
     # Nothing committed against the out-of-scope endpoint.
     oos = neo4j_client.execute_read(
         "MATCH (t:TestCase {engagement_id:$eid})-[:TARGETS_ENDPOINT]->(:Endpoint {id:'ep-out'}) "
