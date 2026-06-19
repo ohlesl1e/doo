@@ -331,7 +331,7 @@ def validate(
             proposal,
         )
 
-    # --- (5) identity (ADR-0007). ---
+    # --- (5) identity (ADR-0007 + ADR-0049). ---
     key_hash = compute_testcase_key_hash(
         engagement_id=eid,
         test_class=proposal.test_class,
@@ -340,7 +340,8 @@ def validate(
         target_trust_boundary_id=proposal.target_trust_boundary_id,
         payload_class=proposal.payload_class,
         payload_hash=payload_hash,
-        auth_context_id=proposal.auth_context_id,
+        attacker_principal=proposal.attacker_principal,
+        attacker_slot=proposal.attacker_slot,
     )
     return ValidatedTestCase(
         engagement_id=eid,
@@ -352,6 +353,8 @@ def validate(
         payload_class=proposal.payload_class,
         payload_hash=payload_hash,
         auth_context_id=proposal.auth_context_id,
+        attacker_principal=proposal.attacker_principal,
+        attacker_slot=proposal.attacker_slot,
         source=source_for(proposal.generator, proposal.mode),
         generator=proposal.generator,
         expected_yield=proposal.expected_yield,

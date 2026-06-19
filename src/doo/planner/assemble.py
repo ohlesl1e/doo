@@ -77,6 +77,9 @@ class _AuthView:
     auth_context_id: AuthContextId
     tier: str | None
     claims_summary: str | None
+    # ADR-0049: the credential slot (rotation-stable attacker-identity half).
+    # `None` for a discovered-tier / pre-ADR-0049 node.
+    slot: str | None = None
 
 
 def _summarise_claims(identity_claims_json: object) -> str | None:
@@ -116,7 +119,8 @@ def _fetch_principal_auth(
         RETURN ac.id AS id,
                ac.tier AS tier,
                ac.is_anonymous AS is_anonymous,
-               ac.identity_claims AS identity_claims
+               ac.identity_claims AS identity_claims,
+               coalesce(ac.slot, ac.token_kind) AS slot
         ORDER BY coalesce(ac.is_anonymous, false) ASC, ac.tier ASC, ac.id ASC
         LIMIT 1
         """,
@@ -130,6 +134,7 @@ def _fetch_principal_auth(
         auth_context_id=AuthContextId(str(row["id"])),
         tier=str(row["tier"]) if row["tier"] is not None else None,
         claims_summary=_summarise_claims(row["identity_claims"]),
+        slot=str(row["slot"]) if row["slot"] is not None else None,
     )
 
 
@@ -154,6 +159,7 @@ def _fetch_send_as_auth(
         {frag.and_("r.status = 'active' AND e.status = 'active' AND ac.status = 'active' AND p.status = 'active'")}
         RETURN ac.id AS id, ac.tier AS tier, ac.identity_claims AS identity_claims,
                coalesce(ac.is_anonymous, false) AS ac_anon,
+               coalesce(ac.slot, ac.token_kind) AS slot,
                p.is_anonymous AS p_anon, p.label AS label, p.identity_key AS identity_key
         ORDER BY ac_anon ASC, ac.id ASC
         LIMIT 1
@@ -172,6 +178,7 @@ def _fetch_send_as_auth(
         auth_context_id=AuthContextId(str(row["id"])),
         tier=str(row["tier"]) if row["tier"] is not None else None,
         claims_summary=_summarise_claims(row["identity_claims"]),
+        slot=str(row["slot"]) if row["slot"] is not None else None,
     )
     return view, label
 
@@ -250,6 +257,7 @@ def assemble_c3_pack(
         claims_summary=auth.claims_summary,
         is_attacker_candidate=False,
         auth_context_id=auth.auth_context_id,
+        slot=auth.slot,
     )
     preview = f" (preview {gap.value_preview!r})" if gap.value_preview is not None else ""
     reason = (
@@ -328,6 +336,7 @@ def assemble_sink_pack(
         claims_summary=auth.claims_summary,
         is_attacker_candidate=False,
         auth_context_id=auth.auth_context_id,
+        slot=auth.slot,
     )
     reason = (
         f"Sink parameter: {r['method']} {r['path']} consumes a caller-controlled "
@@ -452,6 +461,7 @@ def assemble_c2_pack(
         claims_summary=a_auth.claims_summary,
         is_attacker_candidate=False,
         auth_context_id=a_auth.auth_context_id,
+        slot=a_auth.slot,
     )
     b_ctx = PackAuthContext(
         handle="A2",
@@ -460,6 +470,7 @@ def assemble_c2_pack(
         claims_summary=b_auth.claims_summary,
         is_attacker_candidate=True,
         auth_context_id=b_auth.auth_context_id,
+        slot=b_auth.slot,
     )
     exemplar = _fetch_exemplar(client, eid, endpoint_id=gap.endpoint_id, principal_id=a_pid)
 
@@ -596,6 +607,7 @@ def assemble_c2b_pack(
             # filter.
             holds_outlier_body=(ev.principal_id in outlier_holders),
             auth_context_id=auth.auth_context_id,
+            slot=auth.slot,
         )
         for n, (ev, auth) in enumerate(resolved, start=1)
     ]
@@ -717,9 +729,11 @@ def _capability_auth_contexts(
     frag = for_engagement(engagement_id, var="tb")
     rows = client.execute_read(
         f"""
-        MATCH (tb:TrustBoundary {{id: $tbid}})-[:BETWEEN]->(ac:AuthContext)
+        MATCH (tb:TrustBoundary {{id: $tbid}})-[:BETWEEN]->
+              (ac:AuthContext)-[:OF_PRINCIPAL]->(p:Principal)
         {frag.and_("(ac.status IS NULL OR ac.status = 'active')")}
-        RETURN ac.id AS id, ac.identity_claims AS claims, ac.tier AS tier
+        RETURN ac.id AS id, ac.identity_claims AS claims, ac.tier AS tier,
+               p.label AS p_label, coalesce(ac.slot, ac.token_kind) AS slot
         ORDER BY ac.id
         """,
         tbid=boundary_id,
@@ -734,13 +748,18 @@ def _capability_auth_contexts(
     strong_i, weak_i = (0, 1) if direction == "a" else (1, 0)
 
     def _ctx(i: int, *, attacker: bool, label: str) -> PackAuthContext:
+        # ADR-0049: `principal_label` is the REAL `p.label` (the resolvable
+        # `attacker_principal`); the synthetic tier description moves to
+        # `display_label` (LLM-facing only).
         return PackAuthContext(
             handle="A2" if attacker else "A1",
-            principal_label=label,
+            principal_label=str(rows[i]["p_label"]),
             tier=str(rows[i]["tier"]) if rows[i]["tier"] is not None else None,
             claims_summary=_summarise_claims(rows[i]["claims"]),
             is_attacker_candidate=attacker,
             auth_context_id=AuthContextId(str(rows[i]["id"])),
+            slot=str(rows[i]["slot"]) if rows[i]["slot"] is not None else None,
+            display_label=label,
         )
 
     return (
@@ -772,9 +791,10 @@ def _tenant_auth_contexts(
         afrag = for_engagement(engagement_id, var="ac")
         rows = client.execute_read(
             f"""
-            MATCH (t:Tenant {{id: $tid}})<-[:OF_TENANT]-(:Principal)<-[:OF_PRINCIPAL]-(ac:AuthContext)
+            MATCH (t:Tenant {{id: $tid}})<-[:OF_TENANT]-(p:Principal)<-[:OF_PRINCIPAL]-(ac:AuthContext)
             {afrag.and_("(ac.status IS NULL OR ac.status = 'active')")}
-            RETURN ac.id AS id, ac.tier AS tier, ac.identity_claims AS claims
+            RETURN ac.id AS id, ac.tier AS tier, ac.identity_claims AS claims,
+                   p.label AS p_label, coalesce(ac.slot, ac.token_kind) AS slot
             ORDER BY coalesce(ac.is_anonymous, false) ASC, ac.id ASC
             LIMIT 1
             """,
@@ -788,13 +808,17 @@ def _tenant_auth_contexts(
         return None
 
     def _ctx(row: dict[str, object], tval: object, *, attacker: bool) -> PackAuthContext:
+        # ADR-0049: `principal_label` is the REAL `p.label`; the synthetic
+        # `tenant:<value>` description moves to `display_label` (LLM-facing only).
         return PackAuthContext(
             handle="A2" if attacker else "A1",
-            principal_label=f"tenant:{tval}",
+            principal_label=str(row["p_label"]),
             tier=str(row["tier"]) if row["tier"] is not None else None,
             claims_summary=_summarise_claims(row["claims"]),
             is_attacker_candidate=attacker,
             auth_context_id=AuthContextId(str(row["id"])),
+            slot=str(row["slot"]) if row["slot"] is not None else None,
+            display_label=f"tenant:{tval}",
         )
 
     return (

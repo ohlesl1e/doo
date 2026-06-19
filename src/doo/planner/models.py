@@ -175,6 +175,11 @@ class PlannerProposal(BaseModel):
     payload_class: PayloadClass
     payload_spec: PayloadSpec = Field(default_factory=PayloadSpec)
     auth_context_id: AuthContextId
+    # ADR-0049: the rotation-stable attacker identity that keys the TestCase
+    # `key_hash`. Required (no default) so every proposer — deterministic, LLM
+    # resolver, interpreter follow-up — must set them explicitly.
+    attacker_principal: str
+    attacker_slot: str
 
     # Target XOR (echoed from the candidate; the validator re-checks it).
     target_endpoint_id: str | None = None
@@ -326,11 +331,21 @@ class PackAuthContext(BaseModel):
     is_attacker_candidate: bool = False
     holds_outlier_body: bool = False
     auth_context_id: AuthContextId
+    # ADR-0049: the credential slot — the rotation-stable half of the attacker
+    # identity `(principal_label, slot)`. Resolver-side only; NEVER serialised to
+    # the LLM. `None` for a discovered-tier or pre-ADR-0049 AuthContext (the
+    # resolver rejects an attacker pick whose slot is None).
+    slot: str | None = None
+    # Optional human-readable label for the prompt (e.g. `"scope-weaker-tier"`,
+    # `"tenant:42"`) when the real `principal_label` would be opaque or repetitive.
+    # `to_llm_dict()` prefers it over `principal_label`; the resolver always reads
+    # the real `principal_label` for `attacker_principal`.
+    display_label: str | None = None
 
     def to_llm_dict(self) -> dict[str, object]:
         d: dict[str, object] = {
             "handle": self.handle,
-            "principal_label": self.principal_label,
+            "principal_label": self.display_label or self.principal_label,
             "is_attacker_candidate": self.is_attacker_candidate,
         }
         if self.tier is not None:

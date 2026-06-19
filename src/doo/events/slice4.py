@@ -104,13 +104,19 @@ def compute_testcase_key_hash(
     target_trust_boundary_id: TrustBoundaryId | None,
     payload_class: PayloadClass,
     payload_hash: Sha256Hex,
-    auth_context_id: AuthContextId,
+    attacker_principal: str,
+    attacker_slot: str,
 ) -> TestCaseKeyHash:
-    """Canonicalised content-address per ADR-0007.
+    """Canonicalised content-address per ADR-0007 + ADR-0049.
 
     Three-way XOR on the target: exactly one of the three target ids is set.
     Unused ids normalise to the empty string and fall out of canonicalisation.
     `payload_hash = sha256("")` for no-payload tests (sentinel, never null).
+
+    The attacker identity is `(attacker_principal, attacker_slot)` — the
+    rotation-stable credential *slot* (ADR-0049), NOT the `auth_context_id` (which
+    rotates on every fresh token and so would fracture identity across rotations).
+    `auth_context_id` is non-key evidence carried alongside.
     """
 
     targets = [
@@ -131,7 +137,8 @@ def compute_testcase_key_hash(
         target_trust_boundary_id or "",
         payload_class,
         payload_hash,
-        auth_context_id,
+        attacker_principal,
+        attacker_slot,
     ]
     canonical = "|".join(parts).encode("utf-8")
     return TestCaseKeyHash(hashlib.sha256(canonical).hexdigest())
@@ -158,6 +165,12 @@ class TestCase(Inferred):
     target_trust_boundary_id: TrustBoundaryId | None = None
     payload_class: PayloadClass
     payload_hash: Sha256Hex
+    # ADR-0049: the rotation-stable attacker identity that keys `key_hash`.
+    attacker_principal: str
+    attacker_slot: str
+    # Non-key evidence (ADR-0049): the AuthContext the test was last proposed/
+    # dispatched under. Updated `ON MATCH SET` when the same logical test is
+    # re-proposed after a credential rotation; never part of `key_hash`.
     auth_context_id: AuthContextId
     key_hash: TestCaseKeyHash
 
@@ -171,7 +184,8 @@ class TestCase(Inferred):
             target_trust_boundary_id=self.target_trust_boundary_id,
             payload_class=self.payload_class,
             payload_hash=self.payload_hash,
-            auth_context_id=self.auth_context_id,
+            attacker_principal=self.attacker_principal,
+            attacker_slot=self.attacker_slot,
         )
         if self.key_hash != expected:
             raise ValueError("key_hash does not match content per ADR-0007 canonicalisation")

@@ -50,6 +50,7 @@ def _pack(*, with_value: bool = True, target_kind: str = "parameter") -> Context
                 principal_label="user",
                 is_attacker_candidate=False,
                 auth_context_id=AuthContextId("ac-user"),
+                slot="cookie",
             ),
         ),
         observed_value_hash=_VALUE_HASH if with_value else None,
@@ -86,6 +87,9 @@ def test_resolve_c3_builds_parameter_targeted_observed_value_proposal() -> None:
     assert proposal.target_endpoint_id is None
     assert proposal.hold == ()
     assert proposal.auth_context_id == "ac-user"
+    # ADR-0049: the send-as identity threads as the rotation-stable attacker pair.
+    assert proposal.attacker_principal == "user"
+    assert proposal.attacker_slot == "cookie"
     assert proposal.confidence_method == "llm-self-reported"
 
 

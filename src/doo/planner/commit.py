@@ -71,6 +71,12 @@ class ValidatedTestCase:
     payload_class: PayloadClass
     payload_hash: Sha256Hex
     auth_context_id: AuthContextId
+    # ADR-0049: the rotation-stable attacker identity that keys `key_hash`.
+    # Persisted ON CREATE only (identity); `auth_context_id` is non-key
+    # evidence, refreshed ON MATCH when the same logical test is re-proposed
+    # after a credential rotation.
+    attacker_principal: str
+    attacker_slot: str
     source: str
     # The deterministic generator that selected this target (ADR-0036). Persisted
     # for the slice-4 selection predicate (`--select generator=c2`). NOT part of
@@ -172,6 +178,8 @@ def commit_testcase(
             t.payload_class = $payload_class,
             t.payload_hash = $payload_hash,
             t.auth_context_id = $auth_context_id,
+            t.attacker_principal = $attacker_principal,
+            t.attacker_slot = $attacker_slot,
             t.review_status = 'proposed',
             t.expected_yield = $expected_yield,
             t.expected_yield_method = $expected_yield_method,
@@ -195,6 +203,7 @@ def commit_testcase(
             t._created = true
         ON MATCH SET
             t.last_seen = $now,
+            t.auth_context_id = $auth_context_id,
             t._created = false
         WITH t, t._created AS created, t.review_status AS review_status
         REMOVE t._created
@@ -212,6 +221,8 @@ def commit_testcase(
         payload_class=vtc.payload_class,
         payload_hash=vtc.payload_hash,
         auth_context_id=str(vtc.auth_context_id),
+        attacker_principal=vtc.attacker_principal,
+        attacker_slot=vtc.attacker_slot,
         expected_yield=vtc.expected_yield,
         expected_yield_method=vtc.expected_yield_method,
         justification=vtc.justification,

@@ -282,6 +282,8 @@ def _proposal(eid: str, endpoint_id: str) -> PlannerProposal:
         payload_class="no-payload",
         payload_spec=PayloadSpec(kind="none"),
         auth_context_id=auth_context_id(EngagementId(eid), compute_anonymous_auth_hash()),
+        attacker_principal="anonymous",
+        attacker_slot="anonymous",
         target_endpoint_id=endpoint_id,
         expected_yield=0.4,
         justification="test",

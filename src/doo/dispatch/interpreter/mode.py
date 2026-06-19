@@ -22,6 +22,7 @@ from doo.dispatch.interpreter.models import FollowUpProposal
 from doo.ids import AuthContextId, EngagementId
 from doo.infra.neo4j_driver import Neo4jClient
 from doo.observability.logging import get_logger
+from doo.ontology.queries import for_engagement
 from doo.planner.commit import commit_testcase
 from doo.planner.models import PlannerProposal
 from doo.planner.validator import DiscardedProposal, validate
@@ -36,6 +37,38 @@ class FollowUpOutcome:
 
     committed: int
     discarded: int
+
+
+def _resolve_attacker_identity(
+    neo4j: Neo4jClient, engagement_id: EngagementId, ac_id: AuthContextId
+) -> tuple[str, str]:
+    """Resolve `(attacker_principal, attacker_slot)` from an `AuthContext` (ADR-0049).
+
+    Follow-ups inherit the parent TestCase's attacker identity via its
+    `auth_context_id`; the rotation-stable `(principal_label, slot)` pair is read
+    from the graph. Falls back to `("anonymous", "anonymous")` when the AC is
+    anonymous or unresolvable (the follow-up is then keyed as an anon test).
+    """
+
+    frag = for_engagement(engagement_id, var="ac")
+    rows = neo4j.execute_read(
+        f"""
+        MATCH (ac:AuthContext {{id: $acid}})-[:OF_PRINCIPAL]->(p:Principal)
+        {frag.where_clause}
+        RETURN coalesce(ac.is_anonymous, false) AS anon,
+               p.label AS p_label, p.identity_key AS identity_key,
+               coalesce(ac.slot, ac.token_kind) AS slot
+        LIMIT 1
+        """,
+        acid=str(ac_id),
+        **frag.parameters,
+    )
+    if not rows or bool(rows[0]["anon"]):
+        return "anonymous", "anonymous"
+    row = rows[0]
+    principal = str(row["p_label"]) if row["p_label"] else str(row["identity_key"])
+    slot = str(row["slot"]) if row["slot"] is not None else "anonymous"
+    return principal, slot
 
 
 class InterpreterMode(Protocol):
@@ -82,6 +115,9 @@ class ConfirmMode:
         now: datetime,
     ) -> FollowUpOutcome:
         committed = discarded = 0
+        attacker_principal, attacker_slot = _resolve_attacker_identity(
+            neo4j, engagement_id, auth_context_id
+        )
         for fu in follow_ups:
             target = (
                 default_target_endpoint_id
@@ -103,6 +139,8 @@ class ConfirmMode:
                 test_class=fu.test_class,
                 payload_class=fu.payload_class,
                 auth_context_id=auth_context_id,
+                attacker_principal=attacker_principal,
+                attacker_slot=attacker_slot,
                 target_endpoint_id=target,
                 expected_yield=0.5,
                 confidence_method="llm-self-reported",

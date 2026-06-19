@@ -209,7 +209,8 @@ def _seed_graph(neo4j: Neo4jClient, *, attacker_ac_id: str) -> str:
         target_trust_boundary_id=None,
         payload_class="auth-token-swap",
         payload_hash=payload_hash,  # type: ignore[arg-type]
-        auth_context_id=attacker_ac_id,  # type: ignore[arg-type]
+        attacker_principal="attacker",
+        attacker_slot="bearer",
     )
     neo4j.execute_write(
         """
@@ -217,6 +218,7 @@ def _seed_graph(neo4j: Neo4jClient, *, attacker_ac_id: str) -> str:
         MERGE (t:TestCase {engagement_id: $eid, key_hash: $kh})
         ON CREATE SET t.test_class = 'idor', t.payload_class = 'auth-token-swap',
                       t.payload_hash = $ph, t.auth_context_id = $ac_attacker,
+                      t.attacker_principal = 'attacker', t.attacker_slot = 'bearer',
                       t.target_endpoint_id = $epid,
                       t.review_status = 'approved', t.expected_yield = 0.9,
                       t.generator = 'c2', t.hold = ['order_id'],
@@ -289,7 +291,8 @@ def _seed_authz_graph(
         target_trust_boundary_id=None,
         payload_class="auth-token-swap",
         payload_hash=payload_hash,  # type: ignore[arg-type]
-        auth_context_id=attacker_ac_id,  # type: ignore[arg-type]
+        attacker_principal="attacker",
+        attacker_slot="bearer",
     )
     neo4j.execute_write(
         """
@@ -297,6 +300,7 @@ def _seed_authz_graph(
         MERGE (t:TestCase {engagement_id: $eid, key_hash: $kh})
         ON CREATE SET t.test_class = 'idor', t.payload_class = 'auth-token-swap',
                       t.payload_hash = $ph, t.auth_context_id = $ac_attacker,
+                      t.attacker_principal = 'attacker', t.attacker_slot = 'bearer',
                       t.target_endpoint_id = $epid, t.review_status = 'approved',
                       t.expected_yield = 0.9, t.generator = 'c2', t.hold = ['order_id'],
                       t.replay_hazards = [], t.source = 'llm-planner',
@@ -415,7 +419,9 @@ def test_authz_liveness_e2e(
         secrets=secrets,
         bodies=NoopBodyStore(),
         ledger=InMemoryDispatchLedger(),
-        liveness=LivenessPolicy.from_config(config, env=env),
+        liveness=LivenessPolicy.from_config(
+            config, graph_map={attacker_ac_id: ("attacker-b", "bearer")}
+        ),
         reactive=reactive,
     )
     result = execute_run(run, deps)
@@ -505,7 +511,7 @@ def _seed_csrf_graph(
         engagement_id=EngagementId(eng), test_class="idor",
         target_endpoint_id=EP_ID, target_parameter_id=None, target_trust_boundary_id=None,
         payload_class="auth-token-swap", payload_hash=payload_hash,  # type: ignore[arg-type]
-        auth_context_id=attacker_ac_id,  # type: ignore[arg-type]
+        attacker_principal="attacker", attacker_slot="bearer",
     )
     neo4j.execute_write(
         """
@@ -513,6 +519,7 @@ def _seed_csrf_graph(
         MERGE (t:TestCase {engagement_id: $eid, key_hash: $kh})
         ON CREATE SET t.test_class='idor', t.payload_class='auth-token-swap',
                       t.payload_hash=$ph, t.auth_context_id=$ac_attacker,
+                      t.attacker_principal='attacker', t.attacker_slot='bearer',
                       t.target_endpoint_id=$epid, t.review_status='approved',
                       t.expected_yield=0.9, t.generator='c2', t.hold=['order_id'],
                       t.replay_hazards=['csrf_token'], t.source='llm-planner',
@@ -569,7 +576,7 @@ def test_csrf_hazard_resolution_e2e(
         neo4j=neo4j_client, lease=RedisLeaseReader(lease=lease),
         opa=StubOpaClient(allow=True), sender=sender,  # type: ignore[arg-type]
         secrets=secrets, bodies=NoopBodyStore(), ledger=ledger,
-        liveness=LivenessPolicy.from_config(config, env=env),
+        liveness=LivenessPolicy.from_config(config),
     )
     result = execute_run(run, deps)
 
@@ -600,7 +607,7 @@ def test_csrf_hazard_resolution_e2e(
         neo4j=neo4j_client, lease=RedisLeaseReader(lease=lease_b),
         opa=StubOpaClient(allow=True), sender=_PathScriptedSender({}),  # type: ignore[arg-type]
         secrets=secrets_b, bodies=NoopBodyStore(), ledger=ledger_b,
-        liveness=LivenessPolicy.from_config(cfg_b, env=env),
+        liveness=LivenessPolicy.from_config(cfg_b),
     )
     result_b = execute_run(run_b, deps_b)
     outcome_b = result_b.outcomes[0]

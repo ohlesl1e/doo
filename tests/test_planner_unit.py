@@ -41,7 +41,6 @@ EID = EngagementId("eng-unit")
 
 
 def test_key_hash_is_deterministic_and_content_addressed() -> None:
-    anon = auth_context_id(EID, compute_anonymous_auth_hash())
     empty = hashlib.sha256(b"").hexdigest()
     args = dict(
         engagement_id=EID,
@@ -51,7 +50,8 @@ def test_key_hash_is_deterministic_and_content_addressed() -> None:
         target_trust_boundary_id=None,
         payload_class="no-payload",
         payload_hash=empty,  # type: ignore[arg-type]
-        auth_context_id=anon,
+        attacker_principal="anonymous",
+        attacker_slot="anonymous",
     )
     a = compute_testcase_key_hash(**args)  # type: ignore[arg-type]
     b = compute_testcase_key_hash(**args)  # type: ignore[arg-type]
@@ -63,14 +63,14 @@ def test_key_hash_is_deterministic_and_content_addressed() -> None:
 
 
 def test_key_hash_target_xor_is_enforced() -> None:
-    anon = auth_context_id(EID, compute_anonymous_auth_hash())
     empty = hashlib.sha256(b"").hexdigest()
     base = dict(
         engagement_id=EID,
         test_class="forced_browsing",
         payload_class="no-payload",
         payload_hash=empty,
-        auth_context_id=anon,
+        attacker_principal="anonymous",
+        attacker_slot="anonymous",
     )
     # Zero targets -> error.
     with pytest.raises(ValueError):
@@ -88,6 +88,81 @@ def test_key_hash_target_xor_is_enforced() -> None:
             target_trust_boundary_id=None,
             **base,
         )
+
+
+def test_key_hash_stable_across_auth_context_rotation() -> None:
+    """ADR-0049: same `(attacker_principal, slot)` → same key, regardless of which
+    `auth_context_id` it was proposed under. `auth_context_id` is no longer a key
+    input at all, so the key is rotation-stable by construction."""
+
+    empty = hashlib.sha256(b"").hexdigest()
+    base = dict(
+        engagement_id=EID,
+        test_class="idor",
+        target_endpoint_id="ep-1",
+        target_parameter_id=None,
+        target_trust_boundary_id=None,
+        payload_class="auth-token-swap",
+        payload_hash=empty,
+        attacker_principal="alice",
+        attacker_slot="cookie",
+    )
+    k1 = compute_testcase_key_hash(**base)  # type: ignore[arg-type]
+    k2 = compute_testcase_key_hash(**base)  # type: ignore[arg-type]
+    assert k1 == k2
+
+    # And a different attacker principal -> different key.
+    k_other = compute_testcase_key_hash(  # type: ignore[arg-type]
+        **{**base, "attacker_principal": "bob"}
+    )
+    assert k_other != k1
+
+
+def test_key_hash_distinct_per_slot() -> None:
+    """ADR-0007 intent preserved: weak vs strong credential slot of the SAME
+    principal are distinct auth states (e.g. session cookie vs step-up token)."""
+
+    empty = hashlib.sha256(b"").hexdigest()
+    base = dict(
+        engagement_id=EID,
+        test_class="privilege-escalation",
+        target_endpoint_id="ep-admin",
+        target_parameter_id=None,
+        target_trust_boundary_id=None,
+        payload_class="auth-token-swap",
+        payload_hash=empty,
+        attacker_principal="alice",
+    )
+    k_session = compute_testcase_key_hash(**base, attacker_slot="session")  # type: ignore[arg-type]
+    k_stepup = compute_testcase_key_hash(**base, attacker_slot="stepup")  # type: ignore[arg-type]
+    assert k_session != k_stepup
+
+
+def test_key_hash_anonymous_sentinel() -> None:
+    """ADR-0049: the anonymous attacker is `("anonymous", "anonymous")` — stable."""
+
+    empty = hashlib.sha256(b"").hexdigest()
+    k = compute_testcase_key_hash(
+        engagement_id=EID,
+        test_class="forced_browsing",
+        target_endpoint_id="ep-1",
+        target_parameter_id=None,
+        target_trust_boundary_id=None,
+        payload_class="no-payload",
+        payload_hash=empty,  # type: ignore[arg-type]
+        attacker_principal="anonymous",
+        attacker_slot="anonymous",
+    )
+    assert isinstance(k, str) and len(k) == 64
+    # The C1 generator emits exactly this attacker pair for its anon probe.
+    proposal = C1Generator().propose(
+        Candidate(
+            engagement_id=EID, generator="c1", reason="x", criticality=1.0,
+            target_confidence=1.0, target_endpoint_id="ep-1",
+        )
+    )
+    assert proposal.attacker_principal == "anonymous"
+    assert proposal.attacker_slot == "anonymous"
 
 
 def test_candidate_target_xor_invariant() -> None:

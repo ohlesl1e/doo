@@ -44,6 +44,7 @@ def _pack() -> ContextPack:
                 tier="declared",
                 is_attacker_candidate=False,
                 auth_context_id=AuthContextId("ac-admin"),
+                slot="cookie",
             ),
             PackAuthContext(
                 handle="A2",
@@ -51,6 +52,7 @@ def _pack() -> ContextPack:
                 tier="declared",
                 is_attacker_candidate=True,
                 auth_context_id=AuthContextId("ac-user-b"),
+                slot="cookie",
             ),
         ),
         code_version="planner-c2/1",
@@ -82,6 +84,9 @@ def test_resolve_draft_builds_concrete_proposal() -> None:
     assert proposal.payload_class == "auth-token-swap"
     assert proposal.payload_spec.kind == "none"
     assert proposal.auth_context_id == "ac-user-b"  # the attacker side (A2)
+    # ADR-0049: the rotation-stable attacker identity is threaded from the pack.
+    assert proposal.attacker_principal == "user_b"
+    assert proposal.attacker_slot == "cookie"
     assert proposal.target_endpoint_id == "ep-orders"
     assert proposal.confidence_method == "llm-self-reported"
     # hold handle resolved to a human-readable label, never a raw id.

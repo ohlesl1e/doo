@@ -236,6 +236,7 @@ def _c2b_pack() -> ContextPack:
                 tier="declared",
                 is_attacker_candidate=True,
                 auth_context_id=AuthContextId("ac-admin"),
+                slot="cookie",
             ),
             PackAuthContext(
                 handle="A2",
@@ -243,6 +244,7 @@ def _c2b_pack() -> ContextPack:
                 tier="declared",
                 is_attacker_candidate=True,
                 auth_context_id=AuthContextId("ac-user"),
+                slot="cookie",
             ),
         ),
         code_version="planner-c2/2",
@@ -298,11 +300,16 @@ def _c2b_pack_with_a2_tier(tier: str | None) -> ContextPack:
 
     base = _c2b_pack()
     a1, a2 = base.auth_contexts
+    # A non-declared tier carries no slot (ADR-0049: discovered-tier ACs are
+    # un-armable so have no credential slot).
+    a2_slot = "cookie" if tier == "declared" else None
     return base.model_copy(
         update={
             "auth_contexts": (
                 a1,
-                a2.model_copy(update={"tier": tier, "is_attacker_candidate": False}),
+                a2.model_copy(
+                    update={"tier": tier, "is_attacker_candidate": False, "slot": a2_slot}
+                ),
             )
         }
     )
@@ -691,7 +698,8 @@ def test_replay_hazards_not_in_key_hash() -> None:
             target_trust_boundary_id=p.target_trust_boundary_id,
             payload_class=p.payload_class,
             payload_hash="0" * 64,  # same resolved payload for both
-            auth_context_id=p.auth_context_id,
+            attacker_principal=p.attacker_principal,
+            attacker_slot=p.attacker_slot,
         )
 
     assert key(base) == key(with_hazards)
