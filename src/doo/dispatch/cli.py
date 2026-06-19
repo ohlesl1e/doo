@@ -406,6 +406,26 @@ def run_cmd(
                 fg=typer.colors.YELLOW,
             )
 
+    # #125: a `vulnerable` verdict that landed on an already-decided Finding
+    # is surfaced here so the tester re-reviews (ADR-0045 keeps the prior
+    # decision sticky; this is the visibility, not a reset).
+    reasserted = [o for o in result.outcomes if o.finding_reasserted is not None]
+    if reasserted:
+        typer.secho(
+            f"\n⚠ {len(reasserted)} Finding(s) re-asserted vulnerable against a "
+            "prior decision:",
+            fg=typer.colors.YELLOW,
+            bold=True,
+        )
+        for o in reasserted:
+            assert o.finding_reasserted is not None
+            fk, prior = o.finding_reasserted
+            typer.secho(
+                f"  • {fk[:12]} was {prior!r}; re-review with "
+                f"`doo finding review -e {engagement} --confirm/--reject {fk[:12]}`",
+                fg=typer.colors.YELLOW,
+            )
+
     if result.liveness_unverified:
         # ADR-0044 one-time flag: an authz 4xx fell back to `ok` because no
         # liveness endpoint resolved — those negatives are unverified.
@@ -551,6 +571,12 @@ def finding_review_cmd(
         "--actor",
         help="Who is making this decision (recorded in the audit ledger).",
     ),
+    include_reasserted: bool = typer.Option(
+        True,
+        "--include-reasserted/--no-include-reasserted",
+        help="Also show decided Findings re-asserted vulnerable since the last "
+        "decision (#125).",
+    ),
 ) -> None:
     """List `proposed` Findings (with transcript link); confirm/reject one.
 
@@ -562,6 +588,7 @@ def finding_review_cmd(
 
     from doo.dispatch.finding import (
         list_proposed_findings,
+        list_reasserted_findings,
         resolve_finding_key,
         review_finding,
     )
@@ -607,22 +634,45 @@ def finding_review_cmd(
 
     if not proposed:
         typer.echo(f"no proposed Findings in engagement {engagement!r}")
-        return
-    typer.echo(f"{len(proposed)} proposed Finding(s) in engagement {engagement!r}:\n")
-    for f in proposed:
+    else:
         typer.echo(
-            f"  {f.finding_key[:12]}  [{f.severity:>8}] {f.category:<24} "
-            f"affects {f.affects}"
+            f"{len(proposed)} proposed Finding(s) in engagement {engagement!r}:\n"
         )
-        typer.echo(f"      {f.title}")
-        typer.echo(
-            f"      references {len(f.referenced_testcases)} TestCase(s); "
-            f"transcript: {f.transcript_key or '(not persisted)'}"
-        )
-    typer.echo(
-        "\nconfirm: doo finding review -e <eng> --confirm <key>\n"
-        "reject:  doo finding review -e <eng> --reject <key> --reason '…'"
+        for f in proposed:
+            typer.echo(
+                f"  {f.finding_key[:12]}  [{f.severity:>8}] {f.category:<24} "
+                f"affects {f.affects}"
+            )
+            typer.echo(f"      {f.title}")
+            typer.echo(
+                f"      references {len(f.referenced_testcases)} TestCase(s); "
+                f"transcript: {f.transcript_key or '(not persisted)'}"
+            )
+
+    reasserted = (
+        list_reasserted_findings(neo4j, eid, ledger)  # type: ignore[arg-type]
+        if include_reasserted
+        else []
     )
+    if reasserted:
+            typer.secho(
+                f"\n⚠ {len(reasserted)} Finding(s) re-asserted vulnerable since "
+                "last decision:",
+                fg=typer.colors.YELLOW,
+                bold=True,
+            )
+            for f in reasserted:
+                typer.secho(
+                    f"  {f.finding_key[:12]}  [{f.severity:>8}] {f.category:<24} "
+                    f"affects {f.affects}  (was: {f.finding_status})",
+                    fg=typer.colors.YELLOW,
+                )
+
+    if proposed or reasserted:
+        typer.echo(
+            "\nconfirm: doo finding review -e <eng> --confirm <key>\n"
+            "reject:  doo finding review -e <eng> --reject <key> --reason '…'"
+        )
 
 
 # ---------------------------------------------------------------------------

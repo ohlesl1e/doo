@@ -30,6 +30,7 @@ from doo.dispatch.executor.send import HttpResponse, StubSender
 from doo.dispatch.finding import (
     InMemoryFindingLedger,
     list_proposed_findings,
+    list_reasserted_findings,
     resolve_finding_key,
     review_finding,
 )
@@ -832,6 +833,55 @@ def test_dispatch_spine_e2e(
         reason="re-eval",
     )
     assert ev2.prior_status == "confirmed" and ev2.new_status == "rejected"
+
+    # === #125: re-assert against a `rejected` Finding is surfaced. ===
+    # No re-commit yet → not re-asserted.
+    assert list_reasserted_findings(neo4j_client, EngagementId(ENG), fledger) == []
+    # Re-arm with a fresh scripted Interpreter (same `vulnerable` script as run3).
+    run4 = arm_run(
+        config=engagement_config,
+        selection=DispatchSelection(test_classes=("idor",), limit=1),
+        actor="e2e-tester",
+    )
+    fake4 = FakeMultiTurnCaller(
+        script=[
+            [("send_http_request_within_scope", {"role": "baseline_victim"})],
+            [
+                (
+                    "emit_verdict",
+                    {
+                        "verdict": "vulnerable",
+                        "justification": "re-test: still victim data",
+                        "observed_vs_expected": "200 with owner=victim",
+                        "evidence_refs": [],
+                        "proposed_severity": "high",
+                        "vuln_category": "idor",
+                        "affected_refs": ["TARGET"],
+                    },
+                )
+            ],
+        ]
+    )
+    deps4 = RunDependencies(
+        neo4j=neo4j_client,
+        lease=RedisLeaseReader(lease=lease),
+        opa=StubOpaClient(allow=True),
+        sender=StubSender(
+            response=HttpResponse(status=200, body=b'{"order_id":123,"owner":"victim"}')
+        ),
+        secrets=secrets,
+        bodies=NoopBodyStore(),
+        ledger=ledger,
+        interpreter=fake4,
+    )
+    result4 = execute_run(run4, deps4)
+    # The re-commit landed on the `rejected` Finding → surfaced on the outcome.
+    assert result4.outcomes[0].finding_reasserted == (finding_key, "rejected")
+    # And `list_reasserted_findings` now returns it (last_seen > ev2.timestamp).
+    ra = list_reasserted_findings(neo4j_client, EngagementId(ENG), fledger)
+    assert len(ra) == 1
+    assert ra[0].finding_key == finding_key and ra[0].finding_status == "rejected"
+
     ev3 = review_finding(
         neo4j_client, fledger, engagement_id=EngagementId(ENG),
         finding_key=finding_key, decision="confirm", actor="e2e-tester",
@@ -839,6 +889,8 @@ def test_dispatch_spine_e2e(
     )
     assert ev3.prior_status == "rejected" and ev3.new_status == "confirmed"
     assert len(fledger.events) == 3
+    # #125: after the fresh decision, no longer re-asserted (decision ≥ last_seen).
+    assert list_reasserted_findings(neo4j_client, EngagementId(ENG), fledger) == []
 
     # --- kill the lease → next send is `dispatcher_blocked('kill_switch')`. ---
     lease.release()
