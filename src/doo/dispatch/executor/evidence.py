@@ -82,6 +82,10 @@ class DispatchTestCase:
     expected_yield: float = 0.0
     generator: str | None = None
     confidence: float = 1.0
+    # ADR-0049 attacker identity; `None` only on un-migrated pre-0049 TestCases.
+    # The Interpreter pack surfaces this so the model knows who `primary` was.
+    attacker_principal: str | None = None
+    attacker_slot: str | None = None
 
 
 def load_evidence(

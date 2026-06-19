@@ -724,11 +724,15 @@ def test_dispatch_spine_e2e(
     assert ATTACKER_TOKEN not in " ".join(persisted_headers)
 
     # === S3: arm a SECOND run with a fake Interpreter (ADR-0045). ===
-    # Scripted: read primary body → emit_verdict(vulnerable). Assert the verdict
-    # lands on the TestCase (4th axis) and a `Finding@proposed` is committed with
-    # `REFERENCES → TestCase` + `AFFECTS → Endpoint`.
+    # Scripted: send baseline_victim → read primary body → emit_verdict(vulnerable).
+    # The baseline send is required by the #124 deterministic guard: a
+    # differential `vulnerable` with no `ok` baseline is downgraded to
+    # `inconclusive`. Assert the verdict lands on the TestCase (4th axis) and a
+    # `Finding@proposed` is committed with `REFERENCES → TestCase` + `AFFECTS →
+    # Endpoint`.
     fake_interpreter = FakeMultiTurnCaller(
         script=[
+            [("send_http_request_within_scope", {"role": "baseline_victim"})],
             [("read_response_body", {"body_ref": "role:primary"})],
             [
                 (

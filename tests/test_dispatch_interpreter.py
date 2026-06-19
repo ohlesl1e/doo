@@ -34,6 +34,7 @@ from doo.dispatch.interpreter.models import InterpreterVerdict, SendToolResult
 from doo.dispatch.interpreter.tools import (
     ToolContext,
     ToolError,
+    primary_result_for_prompt,
     read_response_body,
     send_http_request_within_scope,
 )
@@ -224,14 +225,62 @@ def test_send_tool_counts_against_run_budget() -> None:
 
 
 def test_send_tool_baseline_victim_without_victim_material_raises_toolerror() -> None:
-    """No declared victim material → surfaced as a `ToolError`, not a crash."""
+    """No declared victim material → surfaced as a `ToolError`, not a crash.
+
+    #124: the refusal text steers toward `inconclusive`, not "judge from primary
+    alone" (which produced FPs on differential tests).
+    """
     ctx, _, _ = _ctx(
         secrets=_DictSecretStore(
             {"ac-attacker": AuthMaterial(kind="bearer", raw="ATK", principal_label="b")}
         )
     )
-    with pytest.raises(ToolError, match="baseline_victim requires"):
+    with pytest.raises(ToolError) as exc:
         send_http_request_within_scope(ctx, role="baseline_victim")
+    msg = str(exc.value)
+    assert "baseline_victim requires" in msg
+    assert "Emit `inconclusive`" in msg
+    assert "bare 200 without a baseline is NOT evidence" in msg
+    assert "Judge from primary alone" not in msg
+
+
+# ---------------------------------------------------------------------------
+# `primary_sent_as` in the pack (#124 part B).
+# ---------------------------------------------------------------------------
+
+
+def test_pack_includes_primary_sent_as() -> None:
+    """The Interpreter is told who `primary` was sent as (ADR-0049 identity)."""
+    import dataclasses
+
+    ctx, _, _ = _ctx()
+    ctx = dataclasses.replace(
+        ctx,
+        testcase=dataclasses.replace(
+            ctx.testcase, attacker_principal="alice", attacker_slot="cookie"
+        ),
+    )
+    pack = primary_result_for_prompt(ctx, ctx.testcase.key_hash)
+    assert pack["primary_sent_as"] == {"principal_label": "alice", "slot": "cookie"}
+
+
+def test_pack_primary_sent_as_none_when_unmigrated() -> None:
+    """Pre-ADR-0049 TestCases (no `attacker_principal`) → `primary_sent_as: None`."""
+    ctx, _, _ = _ctx()  # _testcase() doesn't set attacker_principal
+    pack = primary_result_for_prompt(ctx, ctx.testcase.key_hash)
+    assert pack["primary_sent_as"] is None
+
+
+def test_system_prompt_tells_model_not_to_assume_unauth() -> None:
+    """#124: the prompt names `primary_sent_as`; the auth-bypass guidance no longer
+    hard-codes "NO credential" (that was only true for C1, not C2/C2b)."""
+    from doo.dispatch.interpreter.loop import SYSTEM_PROMPT, system_prompt_for
+
+    assert "primary_sent_as" in SYSTEM_PROMPT
+    assert "do NOT assume it was unauthenticated" in SYSTEM_PROMPT
+    ab = system_prompt_for("auth-bypass")
+    assert "NO credential" not in ab
+    assert "do NOT assume anonymous" in ab
 
 
 def test_read_response_body_unknown_ref_is_tool_error() -> None:
@@ -375,3 +424,99 @@ def test_verdict_not_vulnerable_rejects_finding_fields() -> None:
             vuln_category="idor",
             proposed_severity="high",
         )
+
+
+# ---------------------------------------------------------------------------
+# Deterministic verdict guard (#124 part C / ADR-0047 fail-closed).
+# ---------------------------------------------------------------------------
+
+
+def _send(role: str, *, ds: str = "ok") -> SendToolResult:
+    return SendToolResult(
+        role=role,  # type: ignore[arg-type]
+        dispatch_status=ds,
+        http_status=200 if ds == "ok" else None,
+        response_size=10,
+        observation_id=ObservationId(f"obs-{role}"),
+        body_ref=None,
+    )
+
+
+def _vuln() -> InterpreterVerdict:
+    return InterpreterVerdict(
+        verdict="vulnerable",
+        justification="primary 200 with victim data",
+        observed_vs_expected="200 vs expected 403",
+        evidence_refs=(ObservationId("obs-primary"),),
+        proposed_severity="high",
+        vuln_category="broken-auth",
+    )
+
+
+def test_guard_downgrades_vulnerable_when_no_baseline() -> None:
+    """Differential test class + only `primary` reached `ok` → `inconclusive`."""
+    from doo.dispatch.run import _guard_differential_verdict
+
+    out = _guard_differential_verdict(
+        _vuln(), test_class="auth-bypass", sent_roles={"primary": _send("primary")}
+    )
+    assert out.verdict == "inconclusive"
+    assert out.justification.startswith("[deterministic downgrade:")
+    assert "primary 200 with victim data" in out.justification
+    # Finding fields stripped (the validator enforces it).
+    assert out.vuln_category is None and out.proposed_severity is None
+    # Evidence refs preserved.
+    assert out.evidence_refs == (ObservationId("obs-primary"),)
+
+
+def test_guard_downgrades_when_baseline_sent_but_not_ok() -> None:
+    """A `baseline_victim` that hit `transport_error` / refusal is NOT a baseline."""
+    from doo.dispatch.run import _guard_differential_verdict
+
+    out = _guard_differential_verdict(
+        _vuln(),
+        test_class="idor",
+        sent_roles={
+            "primary": _send("primary"),
+            "baseline_victim": _send("baseline_victim", ds="transport_error"),
+        },
+    )
+    assert out.verdict == "inconclusive"
+
+
+def test_guard_keeps_vulnerable_when_baseline_ok() -> None:
+    from doo.dispatch.run import _guard_differential_verdict
+
+    v = _vuln()
+    out = _guard_differential_verdict(
+        v,
+        test_class="auth-bypass",
+        sent_roles={
+            "primary": _send("primary"),
+            "baseline_victim": _send("baseline_victim"),
+        },
+    )
+    assert out is v  # unchanged object
+
+
+def test_guard_passthrough_on_non_differential_class() -> None:
+    """A class not in `ROLES_BY_TEST_CLASS` (or with only `primary`) is untouched."""
+    from doo.dispatch.run import _guard_differential_verdict
+
+    v = _vuln()
+    out = _guard_differential_verdict(
+        v, test_class="forced_browsing", sent_roles={"primary": _send("primary")}
+    )
+    assert out is v
+
+
+def test_guard_passthrough_on_not_vulnerable() -> None:
+    from doo.dispatch.run import _guard_differential_verdict
+
+    nv = InterpreterVerdict(
+        verdict="not_vulnerable", justification="403", observed_vs_expected="403"
+    )
+    out = _guard_differential_verdict(
+        nv, test_class="auth-bypass", sent_roles={"primary": _send("primary")}
+    )
+    assert out is nv

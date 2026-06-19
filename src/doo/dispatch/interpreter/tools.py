@@ -112,7 +112,11 @@ def send_http_request_within_scope(ctx: ToolContext, *, role: str) -> SendToolRe
             raise ToolError(
                 "baseline_victim requires the victim's live auth material; the "
                 "evidence observation's AuthContext is not a declared principal "
-                "(no ${VAR} ref). Judge from primary alone or emit inconclusive."
+                "(no ${VAR} ref). Emit `inconclusive` unless the primary "
+                "response body ALONE discloses data the attacker should not see "
+                "(e.g. structured records, secrets, another tenant's "
+                "identifiers). A bare 200 without a baseline is NOT evidence of "
+                "bypass."
             )
         material = victim_mat
 
@@ -221,9 +225,19 @@ def primary_result_for_prompt(
     """
 
     primary = ctx.sent_roles.get("primary")
+    # #124: tell the model WHO the `primary` was sent as. Without this the
+    # Interpreter assumes "no auth" (the C1 shape) and mis-reasons on C2/C2b
+    # tests where the attacker is a declared principal.
+    sent_as: dict[str, str] | None = None
+    if ctx.testcase.attacker_principal is not None:
+        sent_as = {
+            "principal_label": ctx.testcase.attacker_principal,
+            "slot": ctx.testcase.attacker_slot or "",
+        }
     return {
         "testcase_key_hash": key_hash[:12],
         "test_class": ctx.testcase.test_class,
+        "primary_sent_as": sent_as,
         "target": {
             "method": ctx.evidence.method,
             "host": ctx.evidence.host.canonical_hostname,
