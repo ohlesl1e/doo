@@ -50,7 +50,12 @@ from doo.dispatch.executor.hazards import (
 )
 from doo.dispatch.executor.liveness import LivenessPolicy, LivenessProber, ProbeOutcome
 from doo.dispatch.executor.send import HttpResponse, Sender
-from doo.dispatch.finding import commit_finding, persist_transcript, record_verdict
+from doo.dispatch.finding import (
+    FindingCommitOutcome,
+    commit_finding,
+    persist_transcript,
+    record_verdict,
+)
 from doo.dispatch.interpreter.loop import (
     ConfirmLoopResult,
     MultiTurnLLMCaller,
@@ -500,6 +505,7 @@ def _execute_one(
     # tool context (ADR-0043: pre-send always-useful roles); every additional
     # send the loop makes goes through the SAME `dispatcher` instance, so the
     # run-wide budget + lease + OPA gate apply identically. ---
+    finding_reasserted: tuple[str, str] | None = None
     if deps.interpreter is not None and final_status == "ok":
         loop = _run_interpreter(
             tc,
@@ -514,8 +520,18 @@ def _execute_one(
         )
         sends.extend(
             _SendRecord(role=r, status=s, observation_id=o)
-            for (r, s, o) in loop
+            for (r, s, o) in loop.extra_sends
         )
+        # #125: a re-commit onto a decided Finding surfaces in the run summary.
+        if (
+            loop.finding is not None
+            and not loop.finding.created
+            and loop.finding.finding_status != "proposed"
+        ):
+            finding_reasserted = (
+                str(loop.finding.finding_key),
+                loop.finding.finding_status,
+            )
 
     return _outcome(
         tc,
@@ -523,6 +539,7 @@ def _execute_one(
         "executed",
         reason=None,
         sends=tuple((s.role, s.status, s.observation_id) for s in sends),
+        finding_reasserted=finding_reasserted,
         now=now,
     )
 
@@ -533,6 +550,19 @@ def _execute_one(
 _DIFFERENTIAL_CLASSES: frozenset[str] = frozenset(
     cls for cls, roles in ROLES_BY_TEST_CLASS.items() if len(roles) > 1
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _InterpreterOutcome:
+    """`_run_interpreter`'s return: extra sends + the (optional) Finding outcome.
+
+    `extra_sends` are the loop's non-`primary` sends (for `RunOutcome.sends`).
+    `finding` is the `commit_finding` result when the (guarded) verdict was
+    `vulnerable`; the caller surfaces a re-assert on a decided Finding (#125).
+    """
+
+    extra_sends: list[tuple[RequestRole, DispatchStatus, ObservationId | None]]
+    finding: FindingCommitOutcome | None
 
 
 def _guard_differential_verdict(
@@ -591,12 +621,13 @@ def _run_interpreter(
     primary_obs_id: ObservationId,
     primary_response: object,
     now: datetime,
-) -> list[tuple[RequestRole, DispatchStatus, ObservationId | None]]:
+) -> _InterpreterOutcome:
     """Drive the confirm loop for one TestCase; record verdict (+ Finding on vulnerable).
 
-    Returns the additional `(role, status, obs_id)` sends the loop made (for the
-    `RunOutcome.sends` record). The full transcript is persisted to blobs keyed
-    by `(run_id, key_hash)` (ADR-0045 replayability).
+    Returns the loop's additional sends (for `RunOutcome.sends`) and the
+    `commit_finding` outcome (so a re-assert on a decided Finding surfaces in
+    the run summary, #125). The full transcript is persisted to blobs keyed by
+    `(run_id, key_hash)` (ADR-0045 replayability).
     """
 
     ctx = ToolContext(
@@ -664,8 +695,9 @@ def _run_interpreter(
         now=now,
     )
 
+    finding_outcome: FindingCommitOutcome | None = None
     if verdict.verdict == "vulnerable":
-        commit_finding(
+        finding_outcome = commit_finding(
             deps.neo4j,
             engagement_id=run.engagement_id,
             testcase=tc,
@@ -700,11 +732,12 @@ def _run_interpreter(
     )
 
     # The loop's additional sends (excluding the pre-loaded `primary`).
-    return [
+    extra_sends: list[tuple[RequestRole, DispatchStatus, ObservationId | None]] = [
         (r.role, r.dispatch_status, r.observation_id)  # type: ignore[misc]
         for role, r in ctx.sent_roles.items()
         if role != "primary"
     ]
+    return _InterpreterOutcome(extra_sends=extra_sends, finding=finding_outcome)
 
 
 def _disambiguate_authz(
@@ -897,6 +930,7 @@ def _outcome(
     now: datetime,
     hazard: HazardInfo | None = None,
     sends: tuple[tuple[RequestRole, DispatchStatus, ObservationId | None], ...] = (),
+    finding_reasserted: tuple[str, str] | None = None,
 ) -> RunOutcome:
     return RunOutcome(
         engagement_id=run.engagement_id,
@@ -907,6 +941,7 @@ def _outcome(
         reason=reason,
         hazard=hazard,
         sends=sends,
+        finding_reasserted=finding_reasserted,
         at=now,
     )
 

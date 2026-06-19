@@ -255,6 +255,18 @@ def commit_finding(
         category=verdict.vuln_category,
         affects=f"{affects_label}:{affects_id}",
     )
+    # #125: a `vulnerable` re-commit onto an already-decided Finding is
+    # surfaced loudly. ADR-0045 keeps `finding_status` sticky (correct), but
+    # the tester needs to know the signal exists so they can re-review.
+    if not created and status != "proposed":
+        log.warning(
+            "finding.recommit_on_decided",
+            engagement_id=engagement_id,
+            finding_key=finding_key,
+            prior_status=status,
+            run_id=run_id,
+            key_hash=testcase.key_hash,
+        )
     return FindingCommitOutcome(
         finding_key=finding_key, created=created, finding_status=status
     )
@@ -500,6 +512,65 @@ def list_proposed_findings(
     ]
 
 
+def list_reasserted_findings(
+    client: Neo4jClient, engagement_id: EngagementId, ledger: FindingLedger
+) -> list[ProposedFindingView]:
+    """Decided Findings re-asserted `vulnerable` since the last decision (#125).
+
+    A Finding is *re-asserted* iff `finding_status ∈ {rejected, confirmed}` AND
+    its `last_seen` (bumped by every `commit_finding` MERGE) is strictly newer
+    than its latest ledger event timestamp — i.e. a fresh `vulnerable` verdict
+    landed after the human's most recent confirm/reject. Surfaced so the tester
+    re-reviews; ADR-0045's stickiness is unchanged.
+    """
+
+    frag = for_engagement(engagement_id, var="f")
+    rows = client.execute_read(
+        f"""
+        MATCH (f:Finding)
+        {frag.and_(
+            "f.status = 'active' AND f.finding_status IN ['rejected', 'confirmed']"
+        )}
+        OPTIONAL MATCH (f)-[:REFERENCES]->(t:TestCase)
+        WITH f, collect(t.key_hash) AS tcs
+        RETURN f.finding_key AS fk, f.category AS cat, f.severity AS sev,
+               f.title AS title, f.primary_affected_label AS aflabel,
+               f.primary_affected_id AS afid, f.transcript_key AS tk,
+               f.finding_status AS status, f.last_seen AS last_seen, tcs
+        ORDER BY f.last_seen DESC
+        """,
+        **frag.parameters,
+    )
+    out: list[ProposedFindingView] = []
+    for r in rows:
+        fk = FindingId(str(r["fk"]))
+        evs = ledger.events_for(engagement_id, fk)
+        if not evs:
+            # Decided but no ledger row — shouldn't happen (review_finding
+            # always appends), but treat as re-asserted so it surfaces.
+            latest_decision = None
+        else:
+            latest_decision = max(e.timestamp for e in evs)
+        # Neo4j datetime → compare native; both are tz-aware.
+        last_seen = r["last_seen"].to_native() if hasattr(r["last_seen"], "to_native") else r["last_seen"]
+        if latest_decision is None or last_seen > latest_decision:
+            out.append(
+                ProposedFindingView(
+                    finding_key=fk,
+                    category=str(r["cat"]),
+                    severity=str(r["sev"]),
+                    title=str(r["title"]),
+                    affects=f"{r['aflabel']}:{str(r['afid'])[:12]}",
+                    referenced_testcases=tuple(
+                        TestCaseKeyHash(str(t)) for t in (r["tcs"] or []) if t
+                    ),
+                    transcript_key=r.get("tk"),
+                    finding_status=str(r["status"]),
+                )
+            )
+    return out
+
+
 def resolve_finding_key(
     client: Neo4jClient, engagement_id: EngagementId, prefix: str
 ) -> FindingId | None:
@@ -588,6 +659,7 @@ __all__ = [
     "compute_finding_key",
     "list_proposed_findings",
     "merge_finding_into",
+    "list_reasserted_findings",
     "persist_transcript",
     "resolve_finding_key",
     "record_verdict",

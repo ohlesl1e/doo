@@ -323,6 +323,10 @@ class RunOutcome(BaseModel):
     hazard: HazardInfo | None = None
     # On `executed`: the `(role, dispatch_status, observation_id)` per send.
     sends: tuple[tuple[RequestRole, DispatchStatus, ObservationId | None], ...] = ()
+    # #125: `(finding_key, prior_status)` when this TestCase's `vulnerable`
+    # verdict landed on an already-decided Finding (`finding_status` ≠
+    # `proposed`). Surfaced in the run summary so the tester re-reviews.
+    finding_reasserted: tuple[str, str] | None = None
     at: datetime
 
 
