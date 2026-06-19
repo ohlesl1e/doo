@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
-from doo.events.l3 import (
+from doo.events.structural import (
     EdgeCreated,
     EdgeRemoved,
     L3Event,

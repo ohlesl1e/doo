@@ -30,6 +30,7 @@ from doo.dispatch.executor.send import HttpResponse, StubSender
 from doo.dispatch.finding import (
     InMemoryFindingLedger,
     list_proposed_findings,
+    resolve_finding_key,
     review_finding,
 )
 from doo.dispatch.interpreter.loop import FakeMultiTurnCaller
@@ -38,7 +39,7 @@ from doo.dispatch.models import DispatchSelection
 from doo.dispatch.ontology import NoopBodyStore
 from doo.dispatch.run import RunDependencies, arm_run, execute_run
 from doo.dispatch.secrets import EnvSecretStore
-from doo.events.slice4 import compute_testcase_key_hash
+from doo.events.execution import compute_testcase_key_hash
 from doo.ids import EngagementId
 from doo.infra.neo4j_driver import Neo4jClient
 from doo.infra.redis_lease import RedisLease
@@ -209,7 +210,8 @@ def _seed_graph(neo4j: Neo4jClient, *, attacker_ac_id: str) -> str:
         target_trust_boundary_id=None,
         payload_class="auth-token-swap",
         payload_hash=payload_hash,  # type: ignore[arg-type]
-        auth_context_id=attacker_ac_id,  # type: ignore[arg-type]
+        attacker_principal="attacker",
+        attacker_slot="bearer",
     )
     neo4j.execute_write(
         """
@@ -217,6 +219,7 @@ def _seed_graph(neo4j: Neo4jClient, *, attacker_ac_id: str) -> str:
         MERGE (t:TestCase {engagement_id: $eid, key_hash: $kh})
         ON CREATE SET t.test_class = 'idor', t.payload_class = 'auth-token-swap',
                       t.payload_hash = $ph, t.auth_context_id = $ac_attacker,
+                      t.attacker_principal = 'attacker', t.attacker_slot = 'bearer',
                       t.target_endpoint_id = $epid,
                       t.review_status = 'approved', t.expected_yield = 0.9,
                       t.generator = 'c2', t.hold = ['order_id'],
@@ -289,7 +292,8 @@ def _seed_authz_graph(
         target_trust_boundary_id=None,
         payload_class="auth-token-swap",
         payload_hash=payload_hash,  # type: ignore[arg-type]
-        auth_context_id=attacker_ac_id,  # type: ignore[arg-type]
+        attacker_principal="attacker",
+        attacker_slot="bearer",
     )
     neo4j.execute_write(
         """
@@ -297,6 +301,7 @@ def _seed_authz_graph(
         MERGE (t:TestCase {engagement_id: $eid, key_hash: $kh})
         ON CREATE SET t.test_class = 'idor', t.payload_class = 'auth-token-swap',
                       t.payload_hash = $ph, t.auth_context_id = $ac_attacker,
+                      t.attacker_principal = 'attacker', t.attacker_slot = 'bearer',
                       t.target_endpoint_id = $epid, t.review_status = 'approved',
                       t.expected_yield = 0.9, t.generator = 'c2', t.hold = ['order_id'],
                       t.replay_hazards = [], t.source = 'llm-planner',
@@ -415,7 +420,9 @@ def test_authz_liveness_e2e(
         secrets=secrets,
         bodies=NoopBodyStore(),
         ledger=InMemoryDispatchLedger(),
-        liveness=LivenessPolicy.from_config(config, env=env),
+        liveness=LivenessPolicy.from_config(
+            config, graph_map={attacker_ac_id: ("attacker-b", "bearer")}
+        ),
         reactive=reactive,
     )
     result = execute_run(run, deps)
@@ -505,7 +512,7 @@ def _seed_csrf_graph(
         engagement_id=EngagementId(eng), test_class="idor",
         target_endpoint_id=EP_ID, target_parameter_id=None, target_trust_boundary_id=None,
         payload_class="auth-token-swap", payload_hash=payload_hash,  # type: ignore[arg-type]
-        auth_context_id=attacker_ac_id,  # type: ignore[arg-type]
+        attacker_principal="attacker", attacker_slot="bearer",
     )
     neo4j.execute_write(
         """
@@ -513,6 +520,7 @@ def _seed_csrf_graph(
         MERGE (t:TestCase {engagement_id: $eid, key_hash: $kh})
         ON CREATE SET t.test_class='idor', t.payload_class='auth-token-swap',
                       t.payload_hash=$ph, t.auth_context_id=$ac_attacker,
+                      t.attacker_principal='attacker', t.attacker_slot='bearer',
                       t.target_endpoint_id=$epid, t.review_status='approved',
                       t.expected_yield=0.9, t.generator='c2', t.hold=['order_id'],
                       t.replay_hazards=['csrf_token'], t.source='llm-planner',
@@ -569,7 +577,7 @@ def test_csrf_hazard_resolution_e2e(
         neo4j=neo4j_client, lease=RedisLeaseReader(lease=lease),
         opa=StubOpaClient(allow=True), sender=sender,  # type: ignore[arg-type]
         secrets=secrets, bodies=NoopBodyStore(), ledger=ledger,
-        liveness=LivenessPolicy.from_config(config, env=env),
+        liveness=LivenessPolicy.from_config(config),
     )
     result = execute_run(run, deps)
 
@@ -600,7 +608,7 @@ def test_csrf_hazard_resolution_e2e(
         neo4j=neo4j_client, lease=RedisLeaseReader(lease=lease_b),
         opa=StubOpaClient(allow=True), sender=_PathScriptedSender({}),  # type: ignore[arg-type]
         secrets=secrets_b, bodies=NoopBodyStore(), ledger=ledger_b,
-        liveness=LivenessPolicy.from_config(cfg_b, env=env),
+        liveness=LivenessPolicy.from_config(cfg_b),
     )
     result_b = execute_run(run_b, deps_b)
     outcome_b = result_b.outcomes[0]
@@ -716,11 +724,15 @@ def test_dispatch_spine_e2e(
     assert ATTACKER_TOKEN not in " ".join(persisted_headers)
 
     # === S3: arm a SECOND run with a fake Interpreter (ADR-0045). ===
-    # Scripted: read primary body → emit_verdict(vulnerable). Assert the verdict
-    # lands on the TestCase (4th axis) and a `Finding@proposed` is committed with
-    # `REFERENCES → TestCase` + `AFFECTS → Endpoint`.
+    # Scripted: send baseline_victim → read primary body → emit_verdict(vulnerable).
+    # The baseline send is required by the #124 deterministic guard: a
+    # differential `vulnerable` with no `ok` baseline is downgraded to
+    # `inconclusive`. Assert the verdict lands on the TestCase (4th axis) and a
+    # `Finding@proposed` is committed with `REFERENCES → TestCase` + `AFFECTS →
+    # Endpoint`.
     fake_interpreter = FakeMultiTurnCaller(
         script=[
+            [("send_http_request_within_scope", {"role": "baseline_victim"})],
             [("read_response_body", {"body_ref": "role:primary"})],
             [
                 (
@@ -805,6 +817,28 @@ def test_dispatch_spine_e2e(
     )
     assert ev.prior_status == "proposed" and ev.new_status == "confirmed"
     assert len(fledger.events) == 1
+
+    # `resolve_finding_key` reaches a non-`proposed` Finding (the CLI's
+    # --confirm/--reject must work after a prior decision; the ledger holds
+    # both events). 12-char prefix and full key both resolve; ambiguity raises.
+    assert resolve_finding_key(neo4j_client, EngagementId(ENG), finding_key) == finding_key
+    assert resolve_finding_key(neo4j_client, EngagementId(ENG), finding_key[:12]) == finding_key
+    assert resolve_finding_key(neo4j_client, EngagementId(ENG), "ffffffffffff") is None
+    # And `review_finding` itself transitions confirmed → rejected → confirmed
+    # with each step ledger-recorded (a tester changing their mind).
+    ev2 = review_finding(
+        neo4j_client, fledger, engagement_id=EngagementId(ENG),
+        finding_key=finding_key, decision="reject", actor="e2e-tester",
+        reason="re-eval",
+    )
+    assert ev2.prior_status == "confirmed" and ev2.new_status == "rejected"
+    ev3 = review_finding(
+        neo4j_client, fledger, engagement_id=EngagementId(ENG),
+        finding_key=finding_key, decision="confirm", actor="e2e-tester",
+        reason="re-test confirms",
+    )
+    assert ev3.prior_status == "rejected" and ev3.new_status == "confirmed"
+    assert len(fledger.events) == 3
 
     # --- kill the lease → next send is `dispatcher_blocked('kill_switch')`. ---
     lease.release()

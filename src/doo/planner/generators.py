@@ -171,6 +171,9 @@ class C1Generator:
             payload_class="no-payload",
             payload_spec=PayloadSpec(kind="none"),
             auth_context_id=anon_auth,
+            # ADR-0049: anonymous attacker → the rotation-stable sentinel pair.
+            attacker_principal="anonymous",
+            attacker_slot="anonymous",
             target_endpoint_id=candidate.target_endpoint_id,
             # Validity is high (validator confirms it); priority is a heuristic
             # hunch derived from the gap's decayed confidence (ADR-0037). A dead

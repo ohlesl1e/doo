@@ -38,8 +38,10 @@ from doo.observability.logging import get_logger
 log = get_logger(__name__)
 
 # Prompt/algorithm version stamped on the persisted transcript (ADR-0005); bump
-# when the system prompt or tool schemas change. /2 adds per-test_class guidance.
-INTERPRETER_PROMPT_VERSION = "interpreter-confirm/2"
+# when the system prompt or tool schemas change. /2 adds per-test_class
+# guidance. /3 (#124) names the `primary` principal and tightens the
+# missing-baseline steer toward `inconclusive`.
+INTERPRETER_PROMPT_VERSION = "interpreter-confirm/3"
 
 # Per-`test_class` guidance appended to the base prompt (S7/#92). Mirrors the
 # Planner's per-kind prompt selection: the deciding question differs by class.
@@ -56,10 +58,13 @@ _CLASS_GUIDANCE: dict[str, str] = {
         "`baseline_negative` rules out 'any id works'."
     ),
     "auth-bypass": (
-        "\n\nTHIS CLASS — AUTH-BYPASS: the `primary` was sent with NO credential. "
-        "Vulnerable = an endpoint that should require auth served a 2xx anonymously "
-        "(compare `baseline_victim`, the same request WITH the owner's auth — it "
-        "should differ only by identity, not by gate)."
+        "\n\nTHIS CLASS — AUTH-BYPASS: the `primary` was sent as the principal "
+        "named in `primary_sent_as` (which MAY be `anonymous` for C1-derived "
+        "tests, or a low-privilege declared account for C2/C2b — do NOT assume "
+        "anonymous). Vulnerable = the attacker reached content they should not; "
+        "compare `baseline_victim` (the authorised side). If `baseline_victim` "
+        "is unavailable, emit `inconclusive` unless the `primary` body ALONE "
+        "proves disclosure."
     ),
     "privilege-escalation": (
         "\n\nTHIS CLASS — PRIVILEGE-ESCALATION: a lower-tier principal hit a "
@@ -83,8 +88,10 @@ def system_prompt_for(test_class: str) -> str:
 
 SYSTEM_PROMPT = (
     "You are the INTERPRETER for one approved security test case. The test has "
-    "already been sent (the `primary` request, under the attacker's auth); you "
-    "are given its result. Your job: decide whether the hypothesis held — did "
+    "already been sent (the `primary` request, under the attacker's auth — see "
+    "`primary_sent_as` for which principal; do NOT assume it was "
+    "unauthenticated); you are given its result. Your job: decide whether the "
+    "hypothesis held — did "
     "the boundary fail (vulnerable), hold (not_vulnerable), or can you not tell "
     "(inconclusive)?\n\n"
     "Tools:\n"

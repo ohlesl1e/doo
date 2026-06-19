@@ -27,6 +27,36 @@ def _base_yaml(environment: str, dispatch: dict | None = None) -> dict:
     return doc
 
 
+def test_tls_verify_defaults_true() -> None:
+    assert DispatchConfig().tls_verify is True
+
+
+def test_staging_permits_tls_verify_false_and_ca_path() -> None:
+    cfg = EngagementConfig.model_validate(_base_yaml("staging", {"tls_verify": False}))
+    assert cfg.dispatch.tls_verify is False
+    cfg2 = EngagementConfig.model_validate(
+        _base_yaml("staging", {"tls_verify": "/etc/ssl/internal-ca.pem"})
+    )
+    assert cfg2.dispatch.tls_verify == "/etc/ssl/internal-ca.pem"
+
+
+def test_production_rejects_tls_verify_false() -> None:
+    """Disabling TLS verification on a production target lets a MITM harvest
+    spliced declared-principal credentials and decouples OPA's host check from
+    the server actually reached."""
+    with pytest.raises(ValidationError, match="tls_verify"):
+        EngagementConfig.model_validate(_base_yaml("production", {"tls_verify": False}))
+
+
+def test_production_permits_tls_verify_ca_path() -> None:
+    """A CA-bundle path is the right answer for a production target with a
+    private CA — verification still happens, just against the named bundle."""
+    cfg = EngagementConfig.model_validate(
+        _base_yaml("production", {"tls_verify": "/etc/ssl/private-ca.pem"})
+    )
+    assert cfg.dispatch.tls_verify == "/etc/ssl/private-ca.pem"
+
+
 def test_environment_is_required() -> None:
     """ADR-0042: `environment` has no default; the tester is forced to state it."""
     doc = _base_yaml("staging")

@@ -30,7 +30,7 @@ from typing import Annotated, cast
 
 import typer
 
-from doo.events.l2 import L2Event, ParseFailure
+from doo.events.observation import L2Event, ParseFailure
 from doo.observability.logging import configure_logging, get_logger
 
 log = get_logger(__name__)

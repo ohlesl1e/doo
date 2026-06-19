@@ -17,3 +17,7 @@ The target half is a **three-way XOR**: exactly one of `target_endpoint_id` (rou
 - The unused half of the target tuple (`target_parameter_id` for boundary-targeted tests, `target_trust_boundary_id` for endpoint-targeted tests) stays null and is normalized out before hashing.
 - `AuthContext` is part of the key: the same test under a different auth state is a distinct TestCase — which is the whole point of auth-coverage analysis.
 - The LLM proposing the "same" test slightly rephrased self-dedupes at commit. No application-level dedup loop is required.
+
+## Amendment (ADR-0049) — attacker keyed by credential slot, not `auth_context_id`
+
+`auth_context_id` in the `key_hash` is replaced by `(attacker_principal, attacker_slot)` — the rotation-stable **credential slot**. `auth_context_id` stays on the node as a non-key evidence property (`ON MATCH SET` to the AC the most recent planner run held). The "different auth state ⇒ distinct TestCase" intent is preserved: a different *slot* is a different auth state (C4 weak/strong), a rotated token in the *same* slot is not — so token rotation no longer mints a duplicate TestCase. Anonymous tests use `("anonymous", "anonymous")`. See ADR-0049 for rationale and migration.

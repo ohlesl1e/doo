@@ -147,6 +147,15 @@ class GraphState(Protocol):
         """
         ...
 
+    def backfill_auth_context_slots(self, engagement_id: EngagementId) -> int:
+        """Stamp `slot = token_kind` on slot-less declared ACs (ADR-0049).
+
+        Idempotent; runs on every `engagement start` so engagements created
+        before the slot field existed pick it up without a manual step. Returns
+        the number of nodes stamped. Implementations without a graph return ``0``.
+        """
+        ...
+
 
 # ---------------------------------------------------------------------------
 # YAML file -> EngagementConfig with the id-immutability ledger.
@@ -249,6 +258,7 @@ class _ResolvedAuthContext:
 
     auth_hash: Sha256Hex
     kind: str
+    slot: str
     identity_claims: dict[str, str | int | float | bool | None]
     validity_window: dict[str, Any] | None
 
@@ -318,9 +328,11 @@ def _resolve_auth_context(
             }
 
     # The raw `token` goes out of scope here and is never persisted.
+    assert decl.slot is not None  # guaranteed by DeclaredAuthContext._default_slot_to_kind
     return _ResolvedAuthContext(
         auth_hash=auth_hash,
         kind=decl.kind,
+        slot=decl.slot,
         identity_claims=identity_claims,
         validity_window=validity_window,
     )
@@ -532,6 +544,7 @@ def _principal_mutations(
                     "id": ac_id,
                     "auth_hash": r.auth_hash,
                     "token_kind": r.kind,
+                    "slot": r.slot,
                     "tier": "declared",
                     "is_anonymous": False,
                     "validity_window": r.validity_window,
@@ -668,6 +681,9 @@ def load_engagement(
                 )
             )
         state.apply_mutations(tuple(mutations))
+        # ADR-0049: idempotent slot backfill so pre-0049 declared ACs gain a
+        # `slot` (= token_kind) on the next `engagement start` after upgrade.
+        state.backfill_auth_context_slots(config.engagement.id)
         # ADR-0048: retroactive sweep after declared writes — folds any
         # already-ingested claim-keyed discovered Principals onto their
         # declared counterparts (ingest-then-declare order). Idempotent.
@@ -735,10 +751,11 @@ def load_engagement(
     cosmetic = name_changed or description_changed
 
     if not material and not cosmetic:
-        # ADR-0048: the retroactive sweep runs on EVERY `engagement start`,
-        # including a config noop — declared state hasn't changed but
-        # ingestion since the last load may have produced phantom discovered
-        # twins. Idempotent (status='active' filter), so a true noop reports 0.
+        # ADR-0049 slot backfill + ADR-0048 retroactive sweep both run on EVERY
+        # `engagement start`, including a config noop — declared state hasn't
+        # changed but pre-0049 nodes / phantom discovered twins may exist.
+        # Both idempotent, so a true noop reports 0.
+        state.backfill_auth_context_slots(config.engagement.id)
         reconciled = state.reconcile_discovered_to_declared(
             config.engagement.id, preferred_claim=config.auth.identity_key
         )
@@ -863,6 +880,7 @@ def load_engagement(
         )
 
     state.apply_mutations(tuple(mutations))
+    state.backfill_auth_context_slots(config.engagement.id)
     reconciled = state.reconcile_discovered_to_declared(
         config.engagement.id, preferred_claim=config.auth.identity_key
     )

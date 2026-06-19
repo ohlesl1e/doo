@@ -17,7 +17,7 @@ cannot hammer the IdP. On a successful rotation the helper: runs the mechanism
 (`command` / `oauth_refresh` / `http`, credentials from the helper's env) → writes
 a new `AuthContext` node (`OF_PRINCIPAL` → the same Principal as the old one), marks
 the old `status="expired"`, and writes the new raw material to the rotation file
-the Executor's `RotatableSecretStore` reads. No LLM, deterministic control.
+the Executor's `SlotResolvingSecretStore` reads. No LLM, deterministic control.
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ from types import FrameType
 from doo.canonical.cookies import canonical_credential_value
 from doo.canonical.identity import auth_context_id, compute_auth_hash
 from doo.dispatch.reactive import AUTH_REACTIVE_STREAM, REACTIVE_AUTH_INVALID
-from doo.dispatch.secrets import write_rotation_entry
+from doo.dispatch.secrets import build_declared_slot_map, write_rotation_entry
 from doo.ids import AuthContextId, EngagementId
 from doo.infra.neo4j_driver import Neo4jClient
 from doo.infra.streams import StreamClient
@@ -55,14 +55,17 @@ class RefreshError(Exception):
 
 
 # ---------------------------------------------------------------------------
-# Refresh mechanisms — `(refresh_config, env) → new raw token`. Credentials are
-# read from the helper's env; never inline, never the dispatcher's env.
+# Refresh mechanisms — `(refresh_config, env, verify) → new raw token`.
+# Credentials are read from the helper's env; never inline, never the
+# dispatcher's env. `verify` is the engagement's `dispatch.tls_verify` (the
+# helper's outbound calls hit the same target/IdP as the dispatcher, so the
+# same TLS posture applies — staging-only `False`, gated on `EngagementConfig`).
 # ---------------------------------------------------------------------------
 
-RefreshMechanismFn = Callable[[RefreshConfig, dict[str, str]], str]
+RefreshMechanismFn = Callable[[RefreshConfig, dict[str, str], bool | str], str]
 
 
-def _refresh_command(rc: RefreshConfig, env: dict[str, str]) -> str:
+def _refresh_command(rc: RefreshConfig, env: dict[str, str], verify: bool | str) -> str:
     """Shell out to the tester's script; the fresh token is its stdout."""
 
     assert rc.command is not None
@@ -84,7 +87,7 @@ def _refresh_command(rc: RefreshConfig, env: dict[str, str]) -> str:
     return token
 
 
-def _refresh_oauth(rc: RefreshConfig, env: dict[str, str]) -> str:
+def _refresh_oauth(rc: RefreshConfig, env: dict[str, str], verify: bool | str) -> str:
     """OAuth2 refresh-grant POST; reads the refresh token + client creds from env."""
 
     import httpx
@@ -98,7 +101,7 @@ def _refresh_oauth(rc: RefreshConfig, env: dict[str, str]) -> str:
         data["client_id"] = env[rc.client_id_env]
     if rc.client_secret_env and env.get(rc.client_secret_env):
         data["client_secret"] = env[rc.client_secret_env]
-    resp = httpx.post(rc.token_url, data=data, timeout=30.0)
+    resp = httpx.post(rc.token_url, data=data, timeout=30.0, verify=verify)
     resp.raise_for_status()
     token = resp.json().get("access_token")
     if not token:
@@ -106,7 +109,7 @@ def _refresh_oauth(rc: RefreshConfig, env: dict[str, str]) -> str:
     return str(token)
 
 
-def _refresh_http(rc: RefreshConfig, env: dict[str, str]) -> str:
+def _refresh_http(rc: RefreshConfig, env: dict[str, str], verify: bool | str) -> str:
     """A templated HTTP request; `${VAR}` in the body is substituted from env."""
 
     import re
@@ -117,7 +120,12 @@ def _refresh_http(rc: RefreshConfig, env: dict[str, str]) -> str:
     body = rc.http_body or ""
     body = re.sub(r"\$\{(\w+)\}", lambda m: env.get(m.group(1), ""), body)
     resp = httpx.request(
-        rc.http_method, rc.http_url, headers=rc.http_headers, content=body, timeout=30.0
+        rc.http_method,
+        rc.http_url,
+        headers=rc.http_headers,
+        content=body,
+        timeout=30.0,
+        verify=verify,
     )
     resp.raise_for_status()
     token = resp.text.strip()
@@ -178,11 +186,11 @@ def _decode_credential_claims(
 
 @dataclass(frozen=True, slots=True)
 class ManagedAuthContext:
-    """One declared AuthContext the helper rotates."""
+    """One declared credential slot the helper rotates (ADR-0049)."""
 
-    auth_context_id: AuthContextId
-    kind: AuthContextKind
     principal_label: str
+    slot: str
+    kind: AuthContextKind
     refresh: RefreshConfig
 
 
@@ -215,7 +223,8 @@ class AuthHelper:
     engagement_id: EngagementId
     neo4j: Neo4jClient
     rotation_path: Path
-    managed: dict[AuthContextId, ManagedAuthContext]
+    managed: dict[tuple[str, str], ManagedAuthContext]
+    id_to_slot: dict[AuthContextId, tuple[str, str]] = field(default_factory=dict)
     streams: StreamClient | None = None
     env: dict[str, str] = field(default_factory=lambda: dict(os.environ))
     clock: Callable[[], float] = time.monotonic
@@ -223,8 +232,12 @@ class AuthHelper:
         default_factory=lambda: dict(_MECHANISMS)
     )
     rate_limiter: RateLimiter = field(default_factory=RateLimiter)
+    # Engagement's `dispatch.tls_verify` — threaded to the http/oauth refresh
+    # mechanisms (the `command` mechanism ignores it). Same staging-only gate
+    # as the dispatcher's wire send.
+    tls_verify: bool | str = True
     consumer_group: str = "auth-helper"
-    _next_refresh_at: dict[AuthContextId, float] = field(default_factory=dict)
+    _next_refresh_at: dict[tuple[str, str], float] = field(default_factory=dict)
 
     @classmethod
     def from_config(
@@ -239,24 +252,23 @@ class AuthHelper:
     ) -> AuthHelper:
         e = env if env is not None else dict(os.environ)
         eid = config.engagement.id
-        managed: dict[AuthContextId, ManagedAuthContext] = {}
-        for principal in config.principals:
-            for decl in principal.auth_contexts:
+        # ADR-0049: every declared AuthContext id (all generations) → its
+        # rotation-stable (principal_label, slot). Reactive events carry the
+        # content-addressed id; this map translates them to the slot key.
+        id_to_slot = build_declared_slot_map(neo4j, eid)
+        managed: dict[tuple[str, str], ManagedAuthContext] = {}
+        for p in config.principals:
+            for decl in p.auth_contexts:
+                assert decl.slot is not None
                 if decl.refresh is None:
+                    log.info(
+                        "auth_helper.unmanaged_slot", principal=p.label, slot=decl.slot
+                    )
                     continue
-                raw = e.get(decl.env_var_name)
-                if not raw:
-                    continue  # no current material → nothing to track yet
-                ac_id = auth_context_id(
-                    eid,
-                    compute_auth_hash(
-                        decl.kind, canonical_credential_value(decl.kind, raw)
-                    ),
-                )
-                managed[ac_id] = ManagedAuthContext(
-                    auth_context_id=ac_id,
+                managed[(p.label, decl.slot)] = ManagedAuthContext(
+                    principal_label=p.label,
+                    slot=decl.slot,
                     kind=decl.kind,
-                    principal_label=principal.label,
                     refresh=decl.refresh,
                 )
         helper = cls(
@@ -264,49 +276,56 @@ class AuthHelper:
             neo4j=neo4j,
             rotation_path=rotation_path,
             managed=managed,
+            id_to_slot=id_to_slot,
             streams=streams,
             env=e,
             clock=clock,
+            tls_verify=config.dispatch.tls_verify,
         )
         helper._schedule_all()
         return helper
 
     def _schedule_all(self) -> None:
         now = self.clock()
-        for ac_id, m in self.managed.items():
+        for slot_key, m in self.managed.items():
             if m.refresh.validity_window_s is not None:
-                self._next_refresh_at[ac_id] = (
+                self._next_refresh_at[slot_key] = (
                     now + m.refresh.validity_window_s - m.refresh.margin_s
                 )
 
-    def due_proactively(self, now: float | None = None) -> list[AuthContextId]:
-        """AuthContexts whose proactive refresh time has arrived (ADR-0014)."""
+    def due_proactively(self, now: float | None = None) -> list[tuple[str, str]]:
+        """Credential slots whose proactive refresh time has arrived (ADR-0014)."""
 
         t = now if now is not None else self.clock()
         return [
-            ac_id for ac_id, at in self._next_refresh_at.items() if at <= t
+            slot_key for slot_key, at in self._next_refresh_at.items() if at <= t
         ]
 
-    def rotate(self, ac_id: AuthContextId, *, reason: str) -> bool:
-        """Rotate one AuthContext: mechanism → new node + rotation-file material.
+    def rotate(self, slot_key: tuple[str, str], *, reason: str) -> bool:
+        """Rotate one credential slot: mechanism → new node + rotation-file material.
 
         Returns True on success, False if rate-limited or the mechanism failed.
         Reschedules the proactive timer on success.
         """
 
-        m = self.managed.get(ac_id)
+        m = self.managed.get(slot_key)
         if m is None:
             log.warning(
-                "auth_helper.unmanaged", engagement_id=self.engagement_id, auth_context_id=ac_id
+                "auth_helper.unmanaged",
+                engagement_id=self.engagement_id,
+                principal_label=slot_key[0],
+                slot=slot_key[1],
             )
             return False
+        rate_key = f"{slot_key[0]}:{slot_key[1]}"
         if not self.rate_limiter.allow(
-            str(ac_id), max_per_window=m.refresh.max_refreshes_per_hour
+            rate_key, max_per_window=m.refresh.max_refreshes_per_hour
         ):
             log.warning(
                 "auth_helper.rate_limited",
                 engagement_id=self.engagement_id,
-                auth_context_id=ac_id,
+                principal_label=m.principal_label,
+                slot=m.slot,
                 reason=reason,
                 max_per_hour=m.refresh.max_refreshes_per_hour,
             )
@@ -314,18 +333,19 @@ class AuthHelper:
 
         mechanism = self.mechanisms[m.refresh.mechanism]
         try:
-            new_raw = mechanism(m.refresh, self.env)
+            new_raw = mechanism(m.refresh, self.env, self.tls_verify)
         except Exception as exc:  # noqa: BLE001 - any mechanism failure is non-fatal
             log.warning(
                 "auth_helper.refresh_failed",
                 engagement_id=self.engagement_id,
-                auth_context_id=ac_id,
+                principal_label=m.principal_label,
+                slot=m.slot,
                 mechanism=m.refresh.mechanism,
                 error=str(exc),
             )
             return False
 
-        self.rate_limiter.record(str(ac_id))
+        self.rate_limiter.record(rate_key)
         # Hash the canonical credential form (#103); `new_raw` itself stays the
         # wire-form value written to the rotation file for the Executor to send.
         canonical = canonical_credential_value(m.kind, new_raw)
@@ -338,7 +358,8 @@ class AuthHelper:
         # an opaque (non-JWT) credential — empty claims, no window.
         identity_claims, validity_window = _decode_credential_claims(m.kind, canonical)
         self._rotate_graph(
-            old_id=ac_id,
+            principal_label=m.principal_label,
+            slot=m.slot,
             new_id=new_id,
             new_hash=new_hash,
             kind=m.kind,
@@ -347,36 +368,24 @@ class AuthHelper:
         )
         write_rotation_entry(
             self.rotation_path,
-            auth_context_id=new_id,
+            principal_label=m.principal_label,
+            slot=m.slot,
             raw=new_raw,
             kind=m.kind,
-            principal_label=m.principal_label,
         )
-        # The selection/TestCases still reference the OLD id; also write the new
-        # material under the OLD id so in-flight TestCases pick it up immediately.
-        write_rotation_entry(
-            self.rotation_path,
-            auth_context_id=ac_id,
-            raw=new_raw,
-            kind=m.kind,
-            principal_label=m.principal_label,
-        )
-        # Track the new id as managed (so a subsequent reactive event on it works)
-        # and reschedule the proactive timer.
-        self.managed[new_id] = ManagedAuthContext(
-            auth_context_id=new_id, kind=m.kind,
-            principal_label=m.principal_label, refresh=m.refresh,
-        )
+        # Track the new content-addressed id → slot so a later reactive event
+        # on the rotated token still maps. Reschedule the proactive timer.
+        self.id_to_slot[new_id] = slot_key
         if m.refresh.validity_window_s is not None:
-            self._next_refresh_at[ac_id] = (
+            self._next_refresh_at[slot_key] = (
                 self.clock() + m.refresh.validity_window_s - m.refresh.margin_s
             )
         log.info(
             "auth_helper.rotated",
             engagement_id=self.engagement_id,
-            old_auth_context_id=ac_id,
-            new_auth_context_id=new_id,
             principal_label=m.principal_label,
+            slot=m.slot,
+            new_auth_context_id=new_id,
             mechanism=m.refresh.mechanism,
             reason=reason,
         )
@@ -385,7 +394,8 @@ class AuthHelper:
     def _rotate_graph(
         self,
         *,
-        old_id: AuthContextId,
+        principal_label: str,
+        slot: str,
         new_id: AuthContextId,
         new_hash: str,
         kind: AuthContextKind,
@@ -395,11 +405,15 @@ class AuthHelper:
         now = datetime.now(UTC)
         self.neo4j.execute_write(
             """
-            MATCH (old:AuthContext {engagement_id: $eid, id: $old_id})
-                  -[:OF_PRINCIPAL]->(p:Principal)
+            MATCH (p:Principal {engagement_id: $eid, label: $label})
+                  <-[:OF_PRINCIPAL]-(old:AuthContext)
+            WHERE old.tier = 'declared' AND coalesce(old.slot, old.token_kind) = $slot
+              AND old.status = 'active'
+            WITH p, old ORDER BY old.last_seen DESC LIMIT 1
             SET old.status = 'expired', old.last_seen = $now
             MERGE (new:AuthContext {engagement_id: $eid, auth_hash: $new_hash})
             ON CREATE SET new.id = $new_id, new.token_kind = $kind, new.tier = 'declared',
+                          new.slot = $slot,
                           new.is_anonymous = false, new.source = 'auth-helper',
                           new.confidence = 1.0, new.confidence_method = 'heuristic',
                           new.first_seen = $now, new.ingested_at = $now
@@ -409,7 +423,8 @@ class AuthHelper:
             MERGE (new)-[:OF_PRINCIPAL]->(p)
             """,
             eid=self.engagement_id,
-            old_id=str(old_id),
+            label=principal_label,
+            slot=slot,
             new_id=str(new_id),
             new_hash=new_hash,
             kind=kind,
@@ -441,7 +456,12 @@ class AuthHelper:
                 and payload.get("engagement_id") == str(self.engagement_id)
             ):
                 ac_id = AuthContextId(str(payload.get("auth_context_id", "")))
-                if ac_id in self.managed and self.rotate(ac_id, reason="reactive"):
+                slot_key = self.id_to_slot.get(ac_id)
+                if slot_key is None or slot_key not in self.managed:
+                    log.info(
+                        "auth_helper.reactive_unmapped", auth_context_id=str(ac_id)
+                    )
+                elif self.rotate(slot_key, reason="reactive"):
                     rotations += 1
             self.streams.ack(AUTH_REACTIVE_STREAM, self.consumer_group, msg_id)
         return rotations
@@ -471,8 +491,8 @@ class AuthHelper:
             rotation_path=str(self.rotation_path),
         )
         while not stop.is_set():
-            for ac_id in self.due_proactively():
-                self.rotate(ac_id, reason="proactive")
+            for slot_key in self.due_proactively():
+                self.rotate(slot_key, reason="proactive")
             self.poll_reactive(block_ms=int(tick_s * 1000))
             stop.wait(timeout=tick_s)
         log.info("auth_helper.stopped", engagement_id=self.engagement_id)

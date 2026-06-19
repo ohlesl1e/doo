@@ -29,7 +29,7 @@ from doo.dispatch.models import DispatchSelection
 from doo.dispatch.ontology import NoopBodyStore
 from doo.dispatch.run import RunDependencies, arm_run, execute_run
 from doo.dispatch.secrets import EnvSecretStore
-from doo.events.slice4 import compute_testcase_key_hash
+from doo.events.execution import compute_testcase_key_hash
 from doo.ids import EngagementId
 from doo.infra.neo4j_driver import Neo4jClient
 from doo.infra.redis_lease import RedisLease
@@ -138,7 +138,7 @@ def _seed(neo4j: Neo4jClient, *, attacker_ac: str, victim_ac: str) -> str:
         target_endpoint_id=None, target_parameter_id=None,
         target_trust_boundary_id=TB,  # type: ignore[arg-type]
         payload_class="boundary-probe", payload_hash=payload_hash,  # type: ignore[arg-type]
-        auth_context_id=attacker_ac,  # type: ignore[arg-type]
+        attacker_principal="attacker", attacker_slot="bearer",
     )
     neo4j.execute_write(
         """
@@ -146,6 +146,7 @@ def _seed(neo4j: Neo4jClient, *, attacker_ac: str, victim_ac: str) -> str:
         MERGE (t:TestCase {engagement_id:$eid, key_hash:$kh})
         ON CREATE SET t.test_class='boundary-violation', t.payload_class='boundary-probe',
                       t.payload_hash=$ph, t.auth_context_id=$attacker_ac,
+                      t.attacker_principal='attacker', t.attacker_slot='bearer',
                       t.target_trust_boundary_id=$tb, t.review_status='approved',
                       t.expected_yield=0.9, t.generator='capability', t.hold=[],
                       t.replay_hazards=[], t.source='llm-planner', t.confidence=0.99, t += $cross

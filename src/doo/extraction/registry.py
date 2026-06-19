@@ -15,7 +15,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 
 from doo.events.envelope import IngestionEnvelope
-from doo.events.l2 import L2Event
+from doo.events.observation import L2Event
 from doo.extraction.har import BodyUploader, parse_har
 
 # A parser turns a raw blob + its envelope into a stream of L2 events. An optional

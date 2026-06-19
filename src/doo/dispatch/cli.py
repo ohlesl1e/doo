@@ -22,6 +22,7 @@ import typer
 if TYPE_CHECKING:
     from doo.dispatch.interpreter.loop import MultiTurnLLMCaller
 
+from doo.canonical.identity import auth_context_id, compute_anonymous_auth_hash
 from doo.dispatch.executor.dispatcher import OpaClient, RedisLeaseReader, StubOpaClient
 from doo.dispatch.executor.liveness import LivenessPolicy
 from doo.dispatch.executor.send import HttpxSender
@@ -29,7 +30,11 @@ from doo.dispatch.ledger import JsonFileDispatchLedger
 from doo.dispatch.models import DispatchSelection
 from doo.dispatch.ontology import NoopBodyStore
 from doo.dispatch.run import RunDependencies, arm_run, execute_run
-from doo.dispatch.secrets import EnvSecretStore, RotatableSecretStore
+from doo.dispatch.secrets import (
+    EnvSecretStore,
+    SlotResolvingSecretStore,
+    build_declared_slot_map,
+)
 from doo.ids import EngagementId
 from doo.infra.neo4j_driver import Neo4jClient
 from doo.infra.redis_lease import RedisLease
@@ -350,6 +355,11 @@ def run_cmd(
             raise typer.Exit(code=0)
 
     neo4j = _build_neo4j()
+    # ADR-0049: one read at run-arm — every declared AuthContext id (all
+    # generations) → its rotation-stable (principal_label, slot). Shared by the
+    # secret store and the liveness policy so a stale plan-time id still arms.
+    graph_map = build_declared_slot_map(neo4j, cfg.engagement.id)
+    anon = auth_context_id(cfg.engagement.id, compute_anonymous_auth_hash())
     deps = RunDependencies(
         neo4j=neo4j,
         lease=_build_lease(cfg.engagement.id),
@@ -361,16 +371,19 @@ def run_cmd(
             environment=cfg.environment,
             unsafe_stub=unsafe_stub_opa,
         ),
-        sender=HttpxSender(),
-        secrets=RotatableSecretStore(
-            base=EnvSecretStore.from_config(cfg), rotation_path=_rotation_path()
+        sender=HttpxSender(verify=cfg.dispatch.tls_verify),
+        secrets=SlotResolvingSecretStore(
+            graph_map=graph_map,
+            env=EnvSecretStore.from_config(cfg),
+            anon_id=anon,
+            rotation_path=_rotation_path(),
         ),
         bodies=_build_body_store(),  # type: ignore[arg-type]
         ledger=_default_ledger(),
         interpreter=_build_interpreter(),
         # ADR-0044: declared liveness endpoints + body matchers, and the reactive
         # refresh emitter for a dead token.
-        liveness=LivenessPolicy.from_config(cfg),
+        liveness=LivenessPolicy.from_config(cfg, graph_map=graph_map),
         reactive=_build_reactive(),  # type: ignore[arg-type]
     )
 
@@ -547,26 +560,30 @@ def finding_review_cmd(
     decision; only `confirmed` Findings feed reporting.
     """
 
-    from doo.dispatch.finding import list_proposed_findings, review_finding
-    from doo.ids import FindingId
+    from doo.dispatch.finding import (
+        list_proposed_findings,
+        resolve_finding_key,
+        review_finding,
+    )
 
     configure_logging()
     neo4j = _build_neo4j()
     ledger = _default_finding_ledger()
     eid = EngagementId(engagement)
 
-    proposed = list_proposed_findings(neo4j, eid)
-
     if confirm or reject:
         target = (confirm or reject or "").strip()
-        # Allow a 12-char prefix (the CLI prints prefixes).
-        match = next(
-            (f for f in proposed if f.finding_key == target or f.finding_key.startswith(target)),
-            None,
-        )
-        if match is None:
+        # Resolve against ALL active Findings (not just proposed): a tester
+        # may override a prior reject after re-test. The ledger records
+        # `prior_status → new_status` so the audit trail is intact (ADR-0045).
+        try:
+            full_key = resolve_finding_key(neo4j, eid, target)
+        except ValueError as exc:
+            typer.secho(str(exc), fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1) from exc
+        if full_key is None:
             typer.secho(
-                f"no proposed Finding matching {target!r} in engagement {engagement!r}",
+                f"no Finding matching {target!r} in engagement {engagement!r}",
                 fg=typer.colors.RED,
                 err=True,
             )
@@ -576,16 +593,17 @@ def finding_review_cmd(
             neo4j,
             ledger,  # type: ignore[arg-type]
             engagement_id=eid,
-            finding_key=FindingId(match.finding_key),
+            finding_key=full_key,
             decision=decision,  # type: ignore[arg-type]
             actor=actor,
             reason=reason,
         )
         typer.echo(
-            f"Finding {match.finding_key[:12]} [{match.category}/{match.severity}] "
-            f"{event.prior_status} → {event.new_status} by {actor}"
+            f"Finding {full_key[:12]} {event.prior_status} → {event.new_status} by {actor}"
         )
         return
+
+    proposed = list_proposed_findings(neo4j, eid)
 
     if not proposed:
         typer.echo(f"no proposed Findings in engagement {engagement!r}")
@@ -634,7 +652,7 @@ def auth_helper_run_cmd(
     Proactive (per `validity_window_s`) + reactive (consumes the `auth_invalid`
     events the dispatcher emits) rotation, rate-limited per AuthContext. Refresh
     credentials come from THIS process's env. New material lands in the rotation
-    file the dispatcher's `RotatableSecretStore` reads.
+    file the dispatcher's `SlotResolvingSecretStore` reads.
     """
 
     from typing import cast

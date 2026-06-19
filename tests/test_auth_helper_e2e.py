@@ -18,10 +18,18 @@ from typing import cast
 import pytest
 import redis
 
-from doo.canonical.identity import auth_context_id, compute_auth_hash
+from doo.canonical.identity import (
+    auth_context_id,
+    compute_anonymous_auth_hash,
+    compute_auth_hash,
+)
 from doo.dispatch.auth_helper import AuthHelper
 from doo.dispatch.reactive import StreamReactiveEmitter
-from doo.dispatch.secrets import EnvSecretStore, RotatableSecretStore
+from doo.dispatch.secrets import (
+    EnvSecretStore,
+    SlotResolvingSecretStore,
+    build_declared_slot_map,
+)
 from doo.ids import DispatchRunId, EngagementId, TestCaseKeyHash
 from doo.infra.neo4j_driver import Neo4jClient
 from doo.infra.streams import RedisStreamLike, StreamClient
@@ -84,11 +92,12 @@ def test_auth_helper_reactive_rotation_e2e(
     env = {"AH_ATTACKER": ATTACKER_TOKEN}
     old_ac = auth_context_id(EngagementId(ENG), compute_auth_hash("bearer", ATTACKER_TOKEN))
 
-    # Seed a declared Principal + the old AuthContext + OF_PRINCIPAL.
+    # Seed a declared Principal + the old AuthContext + OF_PRINCIPAL. The new
+    # `_rotate_graph` MATCHes on `p.label`, so the seed must carry it.
     neo4j_client.execute_write(
         """
         MERGE (p:Principal {engagement_id: $eid, identity_key: 'attacker-b'})
-        ON CREATE SET p.tier='declared', p.status='active'
+        ON CREATE SET p.tier='declared', p.status='active', p.label='attacker-b'
         MERGE (ac:AuthContext {engagement_id: $eid, id: $old_id})
         ON CREATE SET ac.auth_hash=$old_hash, ac.tier='declared', ac.token_kind='bearer',
                       ac.is_anonymous=false, ac.status='active'
@@ -106,7 +115,10 @@ def test_auth_helper_reactive_rotation_e2e(
     helper = AuthHelper.from_config(
         config, neo4j=neo4j_client, rotation_path=rotation_path, streams=streams, env=env
     )
-    assert old_ac in helper.managed
+    # ADR-0049: `managed` is slot-keyed; the seeded declared AuthContext is
+    # picked up by `build_declared_slot_map` so the reactive id maps.
+    assert ("attacker-b", "bearer") in helper.managed
+    assert helper.id_to_slot[old_ac] == ("attacker-b", "bearer")
 
     # The dispatcher would emit this when the liveness probe shows the token dead.
     StreamReactiveEmitter(streams).emit_auth_invalid(
@@ -128,7 +140,7 @@ def test_auth_helper_reactive_rotation_e2e(
         OPTIONAL MATCH (old:AuthContext {engagement_id: $eid, id: $old_id})
         OPTIONAL MATCH (new:AuthContext {engagement_id: $eid, id: $new_id})-[:OF_PRINCIPAL]->(p)
         RETURN old.status AS old_status, new.status AS new_status,
-               new.source AS new_source
+               new.source AS new_source, new.slot AS new_slot
         """,
         eid=ENG,
         old_id=str(old_ac),
@@ -137,18 +149,23 @@ def test_auth_helper_reactive_rotation_e2e(
     assert rows[0]["old_status"] == "expired"
     assert rows[0]["new_status"] == "active"
     assert rows[0]["new_source"] == "auth-helper"
+    # ADR-0049 / #119: rotation writes the declared slot directly.
+    assert rows[0]["new_slot"] == "bearer"
 
-    # --- rotation file: the Executor's store now serves NEW material for both ids. ---
+    # --- rotation file: keyed on (principal_label, slot); the Executor's
+    # SlotResolvingSecretStore serves NEW material for the OLD plan-time id. ---
     data = json.loads(rotation_path.read_text())
-    assert data[str(old_ac)]["raw"] == "NEW-ROTATED-TOKEN"
-    assert data[str(new_ac)]["raw"] == "NEW-ROTATED-TOKEN"
-    store = RotatableSecretStore(
-        base=EnvSecretStore.from_config(config, env=env), rotation_path=rotation_path
+    assert data["attacker-b:bearer"]["raw"] == "NEW-ROTATED-TOKEN"
+    store = SlotResolvingSecretStore(
+        graph_map=build_declared_slot_map(neo4j_client, EngagementId(ENG)),
+        env=EnvSecretStore.from_config(config, env=env),
+        anon_id=auth_context_id(EngagementId(ENG), compute_anonymous_auth_hash()),
+        rotation_path=rotation_path,
     )
     mat = store.material_for(old_ac)
     assert mat is not None and mat.raw == "NEW-ROTATED-TOKEN"
 
     # --- rate limit: a 4th reactive within the hour is refused (max 3). ---
     for _ in range(3):
-        helper.rotate(old_ac, reason="reactive")
-    assert helper.rotate(old_ac, reason="reactive") is False
+        helper.rotate(("attacker-b", "bearer"), reason="reactive")
+    assert helper.rotate(("attacker-b", "bearer"), reason="reactive") is False

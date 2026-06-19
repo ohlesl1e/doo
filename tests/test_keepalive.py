@@ -21,6 +21,7 @@ import time
 
 import pytest
 
+from doo.engagement.cli_keepalive import _Neo4jLeaseConfigReader
 from doo.engagement.keepalive import (
     EngagementNotFoundError,
     KeepaliveConfig,
@@ -30,6 +31,43 @@ from doo.engagement.keepalive import (
 from doo.ids import EngagementId
 from doo.infra.redis_lease import LEASE_VALUE_ACTIVE, RedisLease, lease_key
 from doo.setup.config import KillSwitchConfig
+
+# --- _Neo4jLeaseConfigReader unit -------------------------------------------
+# Regression for the `TypeError: string indices must be integers` on
+# `doo engagement keepalive`: the loader JSON-encodes `kill_switch` (Neo4j
+# cannot store a nested map as a node property — `graph_state.py:253`); the
+# reader must decode it.
+
+
+class _FakeSession:
+    def __init__(self, rows: list[dict[str, object]]) -> None:
+        self._rows = rows
+
+    def run(self, cypher: str, **params: object) -> list[dict[str, object]]:
+        return list(self._rows)
+
+
+def test_neo4j_reader_decodes_json_kill_switch() -> None:
+    """`e.kill_switch` is stored as a JSON string; the reader decodes it."""
+    session = _FakeSession(
+        [{"kill_switch": '{"lease_ttl_seconds": 45, "refresh_interval_seconds": 20}'}]
+    )
+    cfg = _Neo4jLeaseConfigReader(session).read_kill_switch_config(EngagementId("e"))
+    assert cfg == KillSwitchConfig(lease_ttl_seconds=45, refresh_interval_seconds=20)
+
+
+def test_neo4j_reader_unknown_engagement_returns_none() -> None:
+    cfg = _Neo4jLeaseConfigReader(_FakeSession([])).read_kill_switch_config(
+        EngagementId("missing")
+    )
+    assert cfg is None
+
+
+def test_neo4j_reader_null_kill_switch_falls_back_to_defaults() -> None:
+    cfg = _Neo4jLeaseConfigReader(
+        _FakeSession([{"kill_switch": None}])
+    ).read_kill_switch_config(EngagementId("e"))
+    assert cfg == KillSwitchConfig()
 
 # --- Fakes -------------------------------------------------------------------
 

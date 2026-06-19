@@ -16,7 +16,7 @@ from uuid import uuid4
 
 from doo.canonical.value_objects import BlobRef
 from doo.events.envelope import IngestionEnvelope
-from doo.events.l2 import RequestObservation
+from doo.events.observation import RequestObservation
 from doo.extraction.har import parse_har
 from doo.ids import BlobKey, EngagementId, IdempotencyKey, Sha256Hex
 from tests.fixtures import BODIES_HAR

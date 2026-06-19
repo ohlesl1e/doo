@@ -44,7 +44,7 @@ from __future__ import annotations
 from typing import Protocol, runtime_checkable
 
 from doo.canonical.value_objects import Scheme
-from doo.events.slice4 import PayloadClass
+from doo.events.execution import PayloadClass
 from doo.setup.config import ScopeRules
 
 # ---------------------------------------------------------------------------

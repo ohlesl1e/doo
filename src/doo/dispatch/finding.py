@@ -500,6 +500,39 @@ def list_proposed_findings(
     ]
 
 
+def resolve_finding_key(
+    client: Neo4jClient, engagement_id: EngagementId, prefix: str
+) -> FindingId | None:
+    """Resolve a `finding_key` (or 12-char prefix) regardless of `finding_status`.
+
+    `list_proposed_findings` is the right *listing* (the review queue is
+    `proposed`-only), but `--confirm` / `--reject` must reach a Finding the
+    tester previously rejected and is now overriding — the ledger records
+    `prior_status → new_status` so the audit trail is intact (ADR-0045).
+    Returns `None` when no active Finding matches; ambiguity (>1 match) raises.
+    """
+
+    frag = for_engagement(engagement_id, var="f")
+    rows = client.execute_read(
+        f"""
+        MATCH (f:Finding)
+        {frag.and_("f.status = 'active' AND f.finding_key STARTS WITH $pre")}
+        RETURN f.finding_key AS fk
+        """,
+        pre=prefix,
+        **frag.parameters,
+    )
+    if not rows:
+        return None
+    if len(rows) > 1:
+        keys = ", ".join(str(r["fk"])[:12] for r in rows)
+        raise ValueError(
+            f"finding-key prefix {prefix!r} is ambiguous ({len(rows)} matches: {keys}); "
+            "use a longer prefix"
+        )
+    return FindingId(str(rows[0]["fk"]))
+
+
 # ---------------------------------------------------------------------------
 # Transcript persistence (ADR-0037 applied to the Interpreter, ADR-0045).
 # ---------------------------------------------------------------------------
@@ -556,6 +589,7 @@ __all__ = [
     "list_proposed_findings",
     "merge_finding_into",
     "persist_transcript",
+    "resolve_finding_key",
     "record_verdict",
     "review_finding",
 ]

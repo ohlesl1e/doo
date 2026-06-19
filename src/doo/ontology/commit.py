@@ -28,8 +28,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Protocol
 
-from doo.events.l2 import L2Event, ParseFailure, RequestObservation
-from doo.events.l3 import (
+from doo.events.observation import L2Event, ParseFailure, RequestObservation
+from doo.events.structural import (
     EdgeCreated,
     L3Event,
     NodeCreated,

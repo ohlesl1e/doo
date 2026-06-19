@@ -641,6 +641,12 @@ def resolve_draft(
         return _reject("unknown_auth", pack, draft, f"auth_context_ref {draft.auth_context_ref!r}")
     if auth.tier != "declared":
         return _reject_non_declared(pack, draft, auth)
+    if auth.slot is None:
+        return _reject(
+            "attacker_no_slot", pack, draft,
+            f"auth_context_ref {draft.auth_context_ref!r} has no credential slot "
+            "(discovered-tier or pre-ADR-0049 node)",
+        )
 
     held: list[str] = []
     for h in draft.hold:
@@ -663,6 +669,8 @@ def resolve_draft(
         payload_class="auth-token-swap",
         payload_spec=PayloadSpec(kind="none"),
         auth_context_id=auth.auth_context_id,
+        attacker_principal=auth.principal_label,
+        attacker_slot=auth.slot,
         target_endpoint_id=target_endpoint_id,
         target_parameter_id=target_parameter_id,
         target_trust_boundary_id=target_trust_boundary_id,
@@ -708,6 +716,12 @@ def resolve_c3_draft(
     auth = auths.get(draft.auth_context_ref)
     if auth is None:
         return _reject("unknown_auth", pack, draft, f"auth_context_ref {draft.auth_context_ref!r}")
+    if auth.slot is None:
+        return _reject(
+            "attacker_no_slot", pack, draft,
+            f"auth_context_ref {draft.auth_context_ref!r} has no credential slot "
+            "(discovered-tier or pre-ADR-0049 node)",
+        )
 
     return PlannerProposal(
         engagement_id=pack.engagement_id,
@@ -717,6 +731,8 @@ def resolve_c3_draft(
         payload_class="benign-probe",
         payload_spec=PayloadSpec(kind="observed_value", value_hash=pack.observed_value_hash),
         auth_context_id=auth.auth_context_id,
+        attacker_principal=auth.principal_label,
+        attacker_slot=auth.slot,
         target_parameter_id=target.parameter_id,
         expected_yield=draft.expected_yield,
         confidence_method="llm-self-reported",
@@ -749,6 +765,12 @@ def resolve_sink_draft(
     auth = auths.get(draft.auth_context_ref)
     if auth is None:
         return _reject("unknown_auth", pack, draft, f"auth_context_ref {draft.auth_context_ref!r}")
+    if auth.slot is None:
+        return _reject(
+            "attacker_no_slot", pack, draft,
+            f"auth_context_ref {draft.auth_context_ref!r} has no credential slot "
+            "(discovered-tier or pre-ADR-0049 node)",
+        )
 
     return PlannerProposal(
         engagement_id=pack.engagement_id,
@@ -758,6 +780,8 @@ def resolve_sink_draft(
         payload_class="ssrf-callback",
         payload_spec=PayloadSpec(kind="configured", config_key=config_key),
         auth_context_id=auth.auth_context_id,
+        attacker_principal=auth.principal_label,
+        attacker_slot=auth.slot,
         target_parameter_id=target.parameter_id,
         expected_yield=draft.expected_yield,
         confidence_method="llm-self-reported",

@@ -57,7 +57,7 @@ from doo.dispatch.interpreter.loop import (
     run_confirm_loop,
 )
 from doo.dispatch.interpreter.mode import select_interpreter_mode
-from doo.dispatch.interpreter.models import SendToolResult
+from doo.dispatch.interpreter.models import InterpreterVerdict, SendToolResult
 from doo.dispatch.interpreter.tools import ToolContext
 from doo.dispatch.ledger import (
     DispatchLedger,
@@ -66,6 +66,7 @@ from doo.dispatch.ledger import (
     resolve_overrides,
 )
 from doo.dispatch.models import (
+    ROLES_BY_TEST_CLASS,
     ConcreteRequest,
     DispatchLedgerEvent,
     DispatchRun,
@@ -77,9 +78,9 @@ from doo.dispatch.models import (
 )
 from doo.dispatch.ontology import BodyStore, commit_agent_send
 from doo.dispatch.reactive import ReactiveEmitter
-from doo.dispatch.secrets import AuthMaterial, SecretStore
+from doo.dispatch.secrets import AuthMaterial, SecretStore, SlotMaterialMissing
 from doo.dispatch.selection import select_testcases
-from doo.events.slice4 import DispatchStatus
+from doo.events.execution import DispatchStatus
 from doo.ids import (
     AuthContextId,
     DispatchRunId,
@@ -345,17 +346,28 @@ def _execute_one(
             now=now,
         )
 
-    # --- auth-material lookup (ADR-0012/0015). ---
-    material = deps.secrets.material_for(tc.auth_context_id)
+    # --- auth-material lookup (ADR-0012/0015 + ADR-0049 slot indirection). ---
+    try:
+        material = deps.secrets.material_for(tc.auth_context_id)
+    except SlotMaterialMissing as exc:
+        return _outcome(
+            tc,
+            run,
+            "hazard_unresolved",
+            reason=(
+                f"declared principal {exc.principal_label!r} slot {exc.slot!r} "
+                f"has no live material (env unset and no rotation entry)"
+            ),
+            now=now,
+        )
     if material is None:
         return _outcome(
             tc,
             run,
             "hazard_unresolved",
             reason=(
-                f"no live token material for auth_context_id "
-                f"{tc.auth_context_id!r} (declared principals only; check "
-                "${VAR} env refs)"
+                f"auth_context_id {tc.auth_context_id!r} is not a declared "
+                f"credential (discovered-tier; un-armable)"
             ),
             now=now,
         )
@@ -515,6 +527,59 @@ def _execute_one(
     )
 
 
+#: Test classes whose verdict requires a baseline differential (any class whose
+#: role enum has more than `primary`). Derived from `ROLES_BY_TEST_CLASS` so a
+#: new authz class automatically picks up the guard.
+_DIFFERENTIAL_CLASSES: frozenset[str] = frozenset(
+    cls for cls, roles in ROLES_BY_TEST_CLASS.items() if len(roles) > 1
+)
+
+
+def _guard_differential_verdict(
+    verdict: InterpreterVerdict,
+    *,
+    test_class: str,
+    sent_roles: dict[RequestRole, SendToolResult],
+) -> InterpreterVerdict:
+    """ADR-0047 fail-closed: a differential `vulnerable` with no `ok` baseline → `inconclusive`.
+
+    The Interpreter is advisory; this deterministic guard is the floor. A
+    `vulnerable` verdict on a differential test class (idor / bola / auth-bypass
+    / privilege-escalation / boundary-violation) where no non-`primary` role
+    reached `dispatch_status='ok'` cannot be sound — there is no comparison
+    evidence. Downgrade to `inconclusive` and log; the original LLM verdict is
+    preserved verbatim in the persisted transcript (the run driver passes
+    `loop_result.verdict` to `persist_transcript`).
+    """
+
+    if verdict.verdict != "vulnerable" or test_class not in _DIFFERENTIAL_CLASSES:
+        return verdict
+    baseline_ok = any(
+        role != "primary" and r.dispatch_status == "ok"
+        for role, r in sent_roles.items()
+    )
+    if baseline_ok:
+        return verdict
+    log.warning(
+        "interpreter.verdict_downgraded",
+        test_class=test_class,
+        from_="vulnerable",
+        to="inconclusive",
+        reason="no baseline role reached dispatch_status=ok",
+    )
+    return InterpreterVerdict(
+        verdict="inconclusive",
+        justification=(
+            "[deterministic downgrade: differential test, no baseline reached "
+            f"the wire] {verdict.justification}"
+        ),
+        observed_vs_expected=verdict.observed_vs_expected,
+        evidence_refs=verdict.evidence_refs,
+        # vuln_category / proposed_severity / affected_refs MUST be absent on
+        # `inconclusive` (`InterpreterVerdict._vulnerable_requires_category`).
+    )
+
+
 def _run_interpreter(
     tc: DispatchTestCase,
     *,
@@ -573,6 +638,13 @@ def _run_interpreter(
         expected_outcome="(see TestCase justification)",
     )
 
+    # #124 / ADR-0047: deterministic floor under the LLM verdict. The
+    # *transcript* (below) records the original verdict; the *recorded* verdict
+    # and Finding commit use the guarded one.
+    verdict = _guard_differential_verdict(
+        loop_result.verdict, test_class=tc.test_class, sent_roles=ctx.sent_roles
+    )
+
     transcript_key = persist_transcript(
         deps.bodies,
         engagement_id=run.engagement_id,
@@ -586,18 +658,18 @@ def _run_interpreter(
         deps.neo4j,
         engagement_id=run.engagement_id,
         key_hash=tc.key_hash,
-        verdict=loop_result.verdict,
+        verdict=verdict,
         run_id=run.run_id,
         transcript_key=transcript_key,
         now=now,
     )
 
-    if loop_result.verdict.verdict == "vulnerable":
+    if verdict.verdict == "vulnerable":
         commit_finding(
             deps.neo4j,
             engagement_id=run.engagement_id,
             testcase=tc,
-            verdict=loop_result.verdict,
+            verdict=verdict,
             run_id=run.run_id,
             transcript_key=transcript_key,
             now=now,
@@ -621,7 +693,8 @@ def _run_interpreter(
         engagement_id=run.engagement_id,
         run_id=run.run_id,
         key_hash=tc.key_hash,
-        verdict=loop_result.verdict.verdict,
+        verdict=verdict.verdict,
+        llm_verdict=loop_result.verdict.verdict,
         tool_calls_used=loop_result.tool_calls_used,
         terminated_by=loop_result.terminated_by,
     )

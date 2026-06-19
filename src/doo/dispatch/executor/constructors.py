@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from doo.dispatch.executor.evidence import DispatchTestCase, EvidenceObservation
 from doo.dispatch.models import ConcreteRequest, RequestRole
 from doo.dispatch.secrets import AuthMaterial
-from doo.events.slice4 import TestClass
+from doo.events.execution import TestClass
 
 # A constructor: pure `(testcase, evidence, auth material)` → `ConcreteRequest`.
 # `auth` is the **attacker** material for `primary` (the TestCase's

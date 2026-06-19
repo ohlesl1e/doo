@@ -13,7 +13,7 @@ from uuid import uuid4
 import pytest
 
 from doo.canonical.value_objects import AuthContextCue, HostRef
-from doo.events.l2 import RequestObservation
+from doo.events.observation import RequestObservation
 from doo.ids import EngagementId, L2EventId, ObservationId, SourceId
 from doo.ontology.commit import (
     CommitOrchestrator,

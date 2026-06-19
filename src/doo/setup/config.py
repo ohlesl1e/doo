@@ -22,7 +22,7 @@ from typing import Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from doo.events.slice4 import PayloadClass
+from doo.events.execution import PayloadClass
 from doo.ids import EngagementId, EngagementName, ScopeContentHash
 
 PathPattern = str  # Glob/segment pattern; canonical Scope rule format (ADR-0035).
@@ -325,7 +325,19 @@ class DeclaredAuthContext(BaseModel):
 
     kind: AuthContextKind
     token: str = Field(min_length=1)
+    # Rotation-stable handle for this credential within its Principal (ADR-0049).
+    # Defaults to `kind` so a single-credential principal needs no explicit slot;
+    # explicit `slot:` is only required to disambiguate ≥2 ACs of the same kind
+    # (e.g. session vs. step-up cookie). `(principal.label, slot)` is unique per
+    # engagement — enforced on `EngagementConfig`.
+    slot: str | None = None
     refresh: RefreshConfig | None = None
+
+    @model_validator(mode="after")
+    def _default_slot_to_kind(self) -> Self:
+        if self.slot is None:
+            object.__setattr__(self, "slot", self.kind)
+        return self
 
     @model_validator(mode="after")
     def _token_is_env_ref(self) -> Self:
@@ -505,6 +517,14 @@ class DispatchConfig(BaseModel):
     # compile here so a bad pattern is a loud load-time error, not a run-time one.
     auth_invalid_match: str | None = None
     replay_invalid_match: str | None = None
+    # TLS verification for the wire send (`HttpxSender`). `True` (default) =
+    # system CA bundle; `False` = skip verification (staging-only — the
+    # `_environment_gates_dispatch_modes` validator on `EngagementConfig`
+    # rejects this on production: the dispatcher splices live declared-principal
+    # credentials, and `verify=False` lets a MITM harvest them and decouples the
+    # OPA host check from the server actually reached); a `str` is a CA-bundle
+    # filepath (the right answer for an internal target with a private CA).
+    tls_verify: bool | str = True
 
     @model_validator(mode="after")
     def _match_patterns_compile(self) -> Self:
@@ -567,6 +587,34 @@ class EngagementConfig(BaseModel):
         return self
 
     @model_validator(mode="after")
+    def _unique_principal_slots(self) -> Self:
+        """`(principal.label, slot)` is unique per engagement (ADR-0049).
+
+        The slot is the rotation-stable attacker identity; a collision would make
+        secrets lookup and TestCase keying ambiguous. The fix is an explicit
+        `slot:` on each colliding declaration.
+        """
+
+        seen: set[tuple[str, str]] = set()
+        for p in self.principals:
+            for ac in p.auth_contexts:
+                assert ac.slot is not None  # guaranteed by _default_slot_to_kind
+                if ac.slot == "anonymous":
+                    raise ValueError(
+                        f"principal {p.label!r}: slot 'anonymous' is reserved for the "
+                        "anonymous attacker sentinel (ADR-0049); choose another slot"
+                    )
+                key = (p.label, ac.slot)
+                if key in seen:
+                    raise ValueError(
+                        f"credential slot ({p.label!r}, {ac.slot!r}) declared more "
+                        f"than once. When a principal has multiple AuthContexts of "
+                        f"kind {ac.kind!r}, give each an explicit `slot:` (ADR-0049)."
+                    )
+                seen.add(key)
+        return self
+
+    @model_validator(mode="after")
     def _environment_gates_dispatch_modes(self) -> Self:
         """Reject illegal `arming × interpreter` combos at LOAD time (ADR-0042).
 
@@ -591,6 +639,15 @@ class EngagementConfig(BaseModel):
                     f"(got {self.dispatch.interpreter!r}); freelance is staging-only "
                     "(ADR-0042: a human arming a freelance run is not "
                     "human-in-the-loop for what it actually sends)"
+                )
+            if self.dispatch.tls_verify is False:
+                raise ValueError(
+                    "environment=production forbids dispatch.tls_verify=false: the "
+                    "dispatcher sends live declared-principal credentials, and "
+                    "skipping verification lets a MITM harvest them and decouples "
+                    "the OPA host check from the server actually reached. For a "
+                    "production target with a private CA, set tls_verify to the "
+                    "CA-bundle path instead."
                 )
         return self
 

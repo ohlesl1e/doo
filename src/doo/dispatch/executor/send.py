@@ -55,8 +55,11 @@ class HttpxSender:
     redirect target is a *new* request that must pass the gate, ADR-0046).
     """
 
-    def __init__(self, *, timeout_s: float = 30.0) -> None:
+    def __init__(self, *, timeout_s: float = 30.0, verify: bool | str = True) -> None:
         self._timeout_s = timeout_s
+        # `True` = system CA; `False` = skip (staging-only, gated on
+        # `EngagementConfig`); `str` = CA-bundle path. Passed straight to httpx.
+        self._verify = verify
 
     def send(self, request: ConcreteRequest) -> HttpResponse:
         import time
@@ -80,6 +83,7 @@ class HttpxSender:
                 content=request.body,
                 timeout=self._timeout_s,
                 follow_redirects=False,
+                verify=self._verify,
             )
         except httpx.HTTPError as exc:
             raise TransportError(str(exc)) from exc

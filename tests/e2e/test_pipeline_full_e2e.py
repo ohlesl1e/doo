@@ -1,4 +1,4 @@
-"""Comprehensive slice-1 end-to-end (T8 capstone).
+"""Comprehensive ingestion->graph pipeline end-to-end (slice-1 T8 capstone).
 
 One HAR (`tests/fixtures/har/comprehensive.har`), driven through the real
 L1->L2->L3 pipeline on Neo4j+Redis+MinIO testcontainers, exercising **every**

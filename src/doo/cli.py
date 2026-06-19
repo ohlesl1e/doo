@@ -17,6 +17,7 @@ from doo.cli_worker import register_worker
 from doo.coverage.cli import coverage_app
 from doo.dispatch.cli import auth_helper_app, dispatch_app, finding_app
 from doo.engagement.cli_keepalive import register_keepalive
+from doo.engagement.cli_migrate import register_migrate_testcase_keys
 from doo.ingestion.cli_ingest import register_ingest
 from doo.observability.ids import new_span_id, new_trace_id
 from doo.observability.logging import bind_correlation, configure_logging, get_logger
@@ -196,6 +197,8 @@ def status(
 
 # T7: register `doo engagement keepalive` (single line; keeps cli.py diff small).
 register_keepalive(engagement_app)
+# ADR-0049 / #120: register `doo engagement migrate-testcase-keys`.
+register_migrate_testcase_keys(engagement_app)
 # T2: register `doo ingest har`.
 register_ingest(app)
 # Slice-1: register `doo worker run` (drives the L2 + L3 pipeline workers).

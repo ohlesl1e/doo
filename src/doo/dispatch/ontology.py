@@ -25,7 +25,7 @@ from doo.canonical.identity import host_id
 from doo.canonical.value_objects import BlobRef
 from doo.dispatch.executor.send import HttpResponse
 from doo.dispatch.models import ConcreteRequest, RequestRole
-from doo.events.slice4 import DispatchStatus
+from doo.events.execution import DispatchStatus
 from doo.ids import (
     AuthContextId,
     DispatchRunId,

@@ -14,7 +14,7 @@ import structlog
 from structlog.contextvars import merge_contextvars
 
 from doo.events.envelope import IngestionEnvelope
-from doo.events.l2 import L2Event
+from doo.events.observation import L2Event
 from doo.ids import BlobKey, EngagementId
 from doo.ingestion.intake import IntakeDeps, ingest_har
 from doo.ingestion.l2_worker import L2WorkerDeps, process_envelope

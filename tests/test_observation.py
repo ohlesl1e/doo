@@ -14,7 +14,7 @@ import pytest
 from pydantic import TypeAdapter, ValidationError
 
 from doo.canonical.value_objects import AuthContextCue, BlobRef, HostRef
-from doo.events.l2 import (
+from doo.events.observation import (
     L2Event,
     ParseFailure,
     RequestObservation,

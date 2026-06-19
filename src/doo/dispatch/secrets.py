@@ -17,12 +17,15 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from doo.canonical.cookies import canonical_credential_value
 from doo.canonical.identity import auth_context_id, compute_auth_hash
 from doo.ids import AuthContextId, EngagementId
 from doo.setup.config import AuthContextKind, EngagementConfig
+
+if TYPE_CHECKING:
+    from doo.infra.neo4j_driver import Neo4jClient
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +60,22 @@ class UnknownAuthContextError(Exception):
     """
 
 
+class SlotMaterialMissing(UnknownAuthContextError):
+    """A declared `(principal_label, slot)` exists in the graph but has no live
+    material (env var unset AND no rotation entry). ADR-0049 distinguishes this
+    from a discovered-tier id (`material_for` → `None`): the former is an
+    operator/config error, the latter is an un-armable TestCase by design.
+    """
+
+    def __init__(self, *, principal_label: str, slot: str) -> None:
+        self.principal_label = principal_label
+        self.slot = slot
+        super().__init__(
+            f"declared principal {principal_label!r} slot {slot!r} has no live "
+            "material (env unset and no rotation entry)"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class EnvSecretStore:
     """Env-var-backed `SecretStore` built from a loaded `EngagementConfig`.
@@ -68,6 +87,7 @@ class EnvSecretStore:
     """
 
     by_id: dict[AuthContextId, AuthMaterial]
+    by_slot: dict[tuple[str, str], AuthMaterial]
 
     @classmethod
     def from_config(
@@ -76,6 +96,7 @@ class EnvSecretStore:
         e = env if env is not None else dict(os.environ)
         eid: EngagementId = config.engagement.id
         by_id: dict[AuthContextId, AuthMaterial] = {}
+        by_slot: dict[tuple[str, str], AuthMaterial] = {}
         for principal in config.principals:
             for decl in principal.auth_contexts:
                 raw = e.get(decl.env_var_name)
@@ -92,34 +113,77 @@ class EnvSecretStore:
                     decl.kind, canonical_credential_value(decl.kind, raw)
                 )
                 ac_id = auth_context_id(eid, ah)
-                by_id[ac_id] = AuthMaterial(
+                mat = AuthMaterial(
                     kind=decl.kind, raw=raw, principal_label=principal.label
                 )
-        return cls(by_id=by_id)
+                by_id[ac_id] = mat
+                # ADR-0049: the rotation-stable key. T1 guarantees `slot` is
+                # always populated post-validation (defaults to `kind`).
+                assert decl.slot is not None
+                by_slot[(principal.label, decl.slot)] = mat
+        return cls(by_id=by_id, by_slot=by_slot)
 
     def material_for(self, auth_context_id: AuthContextId) -> AuthMaterial | None:
         return self.by_id.get(auth_context_id)
 
 
-@dataclass(frozen=True, slots=True)
-class RotatableSecretStore:
-    """`SecretStore` that overlays a helper-written rotation file (ADR-0014, S6).
+def build_declared_slot_map(
+    neo4j: Neo4jClient, engagement_id: EngagementId
+) -> dict[AuthContextId, tuple[str, str]]:
+    """One Cypher at run-arm: every declared AC id (all generations) → (principal_label, slot).
 
-    Wraps a `base` (env-backed) store and, on **each** `material_for`, re-reads a
-    JSON rotation file (`DOO_SECRET_ROTATION_PATH`, `{auth_context_id: raw}`) the
-    auth-helper writes when it rotates a token. The Executor calls `material_for`
-    per-TestCase, so a mid-run rotation is picked up without a restart. A missing
-    file = no overlay (today's env-only behaviour). The overlay carries only the
-    raw token; `kind` / `principal_label` / `tier` come from the base declaration
-    of the SAME `auth_context_id`, or — for a freshly-rotated id not in the base —
-    a `_meta` sidecar the helper writes alongside the raw value.
+    ADR-0049: a TestCase carries the `auth_context_id` of the AuthContext
+    generation it was *planned* against, which may have since rotated. This map
+    lets the Executor translate any historical declared id to its rotation-stable
+    `(principal_label, slot)` key, and from there to live material.
     """
 
-    base: SecretStore
-    rotation_path: Path
+    rows = neo4j.execute_read(
+        """
+        MATCH (ac:AuthContext {engagement_id: $eid})-[:OF_PRINCIPAL]->(p:Principal)
+        WHERE ac.tier = 'declared'
+        RETURN ac.id AS id, p.label AS label, coalesce(ac.slot, ac.token_kind) AS slot
+        """,
+        eid=str(engagement_id),
+    )
+    return {
+        AuthContextId(str(r["id"])): (str(r["label"]), str(r["slot"])) for r in rows
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class SlotResolvingSecretStore:
+    """ADR-0049: secrets lookup keys on the rotation-stable `(principal_label, slot)`,
+    not the content-addressed `auth_context_id`.
+
+    The G5 symptom this fixes: a TestCase planned at engagement-start carries an
+    `auth_context_id` derived from the *then*-current token; by run-arm the env
+    var holds a fresh token, so `EnvSecretStore.by_id` misses and the run refuses
+    every authz test as `hazard_unresolved`. The slot indirection makes "alice's
+    session cookie" the lookup key, which is stable across rotations.
+
+    Resolution order (first hit wins):
+
+    1. anonymous → placeholder material;
+    2. `graph_map` translates the (possibly stale) id → `(principal_label, slot)`;
+    3. rotation overlay on that slot — re-read on each call, so a mid-run
+       helper write is picked up without a dispatch restart, and beats a
+       stale env-held token;
+    4. `env.by_id` — env-derived id matches (no rotation since plan; also the
+       fallback when `graph_map` is incomplete);
+    5. `graph_map` miss AND `by_id` miss → `None` (discovered-tier / genuinely
+       unknown, un-armable by design);
+    6. `env.by_slot` — the engagement-start declared material;
+    7. `SlotMaterialMissing` — declared slot with neither overlay nor env.
+    """
+
+    graph_map: dict[AuthContextId, tuple[str, str]]
+    env: EnvSecretStore
+    anon_id: AuthContextId
+    rotation_path: Path | None = None
 
     def _overlay(self) -> dict[str, dict[str, str]]:
-        if not self.rotation_path.exists():
+        if self.rotation_path is None or not self.rotation_path.exists():
             return {}
         try:
             data: dict[str, dict[str, str]] = json.loads(self.rotation_path.read_text())
@@ -128,35 +192,49 @@ class RotatableSecretStore:
             return {}
 
     def material_for(self, auth_context_id: AuthContextId) -> AuthMaterial | None:
-        entry = self._overlay().get(str(auth_context_id))
-        if entry is not None and entry.get("raw"):
-            base_mat = self.base.material_for(auth_context_id)
-            return AuthMaterial(
-                kind=entry.get("kind", base_mat.kind if base_mat else "bearer"),  # type: ignore[arg-type]
-                raw=entry["raw"],
-                principal_label=entry.get(
-                    "principal_label",
-                    base_mat.principal_label if base_mat else "rotated",
-                ),
-                tier=entry.get("tier", base_mat.tier if base_mat else "declared"),
-            )
-        return self.base.material_for(auth_context_id)
+        if auth_context_id == self.anon_id:
+            # The anon constructors ignore `auth`; placeholder satisfies the
+            # `AuthMaterial` Literal type and the OPA `principal_tier` field.
+            return AuthMaterial(kind="bearer", raw="", principal_label="anonymous")
+        slot_key = self.graph_map.get(auth_context_id)
+        if slot_key is not None:
+            entry = self._overlay().get(f"{slot_key[0]}:{slot_key[1]}")
+            if entry is not None and entry.get("raw"):
+                return AuthMaterial(
+                    kind=entry["kind"],  # type: ignore[arg-type]
+                    raw=entry["raw"],
+                    principal_label=slot_key[0],
+                )
+        # Env-derived id matches (no rotation since plan-time); also covers a
+        # declared id the graph_map missed (loader not yet run).
+        hit = self.env.material_for(auth_context_id)
+        if hit is not None:
+            return hit
+        if slot_key is None:
+            # Genuinely unknown / discovered-tier — un-armable by design.
+            return None
+        mat = self.env.by_slot.get(slot_key)
+        if mat is None:
+            raise SlotMaterialMissing(principal_label=slot_key[0], slot=slot_key[1])
+        return mat
 
 
 def write_rotation_entry(
     rotation_path: Path,
     *,
-    auth_context_id: AuthContextId,
+    principal_label: str,
+    slot: str,
     raw: str,
     kind: str,
-    principal_label: str,
-    tier: str = "declared",
 ) -> None:
-    """Write/overwrite one rotated AuthContext's material into the rotation file.
+    """Write/overwrite one rotated credential slot's material into the rotation file.
 
-    Called by the auth-helper after a successful refresh; the Executor's
-    `RotatableSecretStore` reads it on the next `material_for`. The file holds raw
-    tokens — it lives on the helper/agent host only, never the graph (ADR-0015).
+    ADR-0049: keyed on the rotation-stable `"{principal_label}:{slot}"`, not the
+    content-addressed `auth_context_id` — one entry per slot, overwritten on each
+    rotation. Called by the auth-helper after a successful refresh; the Executor's
+    `SlotResolvingSecretStore` re-reads it on the next `material_for`. The file
+    holds raw tokens — it lives on the helper/agent host only, never the graph
+    (ADR-0015).
     """
 
     data: dict[str, dict[str, str]] = {}
@@ -165,11 +243,6 @@ def write_rotation_entry(
             data = json.loads(rotation_path.read_text())
         except (json.JSONDecodeError, OSError):
             data = {}
-    data[str(auth_context_id)] = {
-        "raw": raw,
-        "kind": kind,
-        "principal_label": principal_label,
-        "tier": tier,
-    }
+    data[f"{principal_label}:{slot}"] = {"raw": raw, "kind": kind}
     rotation_path.parent.mkdir(parents=True, exist_ok=True)
     rotation_path.write_text(json.dumps(data, indent=2))

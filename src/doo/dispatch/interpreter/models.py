@@ -18,7 +18,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from doo.dispatch.models import ROLES_BY_TEST_CLASS, RequestRole
-from doo.events.slice4 import FindingCategory, FindingSeverity, PayloadClass, TestClass
+from doo.events.execution import FindingCategory, FindingSeverity, PayloadClass, TestClass
 from doo.ids import ObservationId
 
 Verdict = Literal["vulnerable", "not_vulnerable", "inconclusive"]

@@ -12,7 +12,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from uuid import uuid4
 
-from doo.events.l2 import ParseFailure
+from doo.events.observation import ParseFailure
 from doo.ids import EngagementId, L2EventId, ObservationId, SourceId
 from doo.ontology.l3_worker import L3WorkerDeps, run_l3_worker
 

@@ -53,6 +53,8 @@ def select_testcases(
                t.test_class AS test_class,
                t.payload_class AS payload_class,
                t.auth_context_id AS auth_context_id,
+               t.attacker_principal AS attacker_principal,
+               t.attacker_slot AS attacker_slot,
                t.target_endpoint_id AS target_endpoint_id,
                t.target_parameter_id AS target_parameter_id,
                t.target_trust_boundary_id AS target_trust_boundary_id,
@@ -83,6 +85,8 @@ def select_testcases(
             expected_yield=float(r["expected_yield"]),
             generator=r["generator"],
             confidence=float(r["confidence"]),
+            attacker_principal=r["attacker_principal"],
+            attacker_slot=r["attacker_slot"],
         )
         for r in rows
     ]

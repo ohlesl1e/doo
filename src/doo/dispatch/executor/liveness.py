@@ -8,8 +8,9 @@ refresh) from a genuine boundary (`ok`) from a stale replay (`replay_invalid`).
 
 The probe is a real Dispatcher send (kill-switch → OPA → budget → wire), tagged
 `request_role = "liveness"`, counted against the run budget. Its result is
-**cached per `(auth_context_id, window)`** (default 60s) so a run of N authz tests
-under one attacker token costs ~1 probe per window, not N.
+**cached per `((principal_label, slot), window)`** (ADR-0049; default 60s) so a
+run of N authz tests under one attacker credential — across any rotated
+generation of it — costs ~1 probe per window, not N.
 
 The probe endpoint is the Principal's declared `liveness_endpoint` (ADR-0012-legal
 warm-up knowledge), falling back to the first observed self-endpoint
@@ -25,15 +26,13 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from doo.canonical.cookies import canonical_credential_value
-from doo.canonical.identity import auth_context_id, compute_auth_hash
 from doo.dispatch.executor.classify import BodyMatchers, LivenessResult, is_auth_negative
 from doo.dispatch.executor.constructors import _splice_auth
 from doo.dispatch.executor.dispatcher import Dispatcher, DispatchResult
 from doo.dispatch.executor.evidence import EvidenceObservation
 from doo.dispatch.models import ConcreteRequest
 from doo.dispatch.secrets import AuthMaterial
-from doo.events.slice4 import PayloadClass, TestClass
+from doo.events.execution import PayloadClass, TestClass
 from doo.ids import AuthContextId, EngagementId
 from doo.infra.neo4j_driver import Neo4jClient
 from doo.observability.logging import get_logger
@@ -70,24 +69,25 @@ class LivenessEndpointSpec:
 class LivenessPolicy:
     """Engagement-level liveness config, projected from `EngagementConfig` (ADR-0044).
 
-    `declared_by_ac` maps each declared `AuthContext` id to its Principal's
-    `liveness_endpoint` (computed the same way `EnvSecretStore` derives the id, so
-    the two cannot drift). `matchers` are the compiled body-match overrides.
-    Built once at run-arm time and injected into the run driver.
+    ADR-0049: `declared_by_slot` maps each rotation-stable `(principal_label,
+    slot)` to its Principal's `liveness_endpoint`; `slot_for_id` translates a
+    (possibly stale) `auth_context_id` to that key via the run-arm graph read.
+    `matchers` are the compiled body-match overrides. Built once at run-arm time
+    and injected into the run driver.
     """
 
     matchers: BodyMatchers
-    declared_by_ac: dict[AuthContextId, LivenessEndpointSpec]
+    declared_by_slot: dict[tuple[str, str], LivenessEndpointSpec]
+    slot_for_id: dict[AuthContextId, tuple[str, str]]
 
     @classmethod
     def from_config(
-        cls, config: EngagementConfig, *, env: dict[str, str] | None = None
+        cls,
+        config: EngagementConfig,
+        *,
+        graph_map: dict[AuthContextId, tuple[str, str]] | None = None,
     ) -> LivenessPolicy:
-        import os
-
-        e = env if env is not None else dict(os.environ)
-        eid: EngagementId = config.engagement.id
-        declared: dict[AuthContextId, LivenessEndpointSpec] = {}
+        declared: dict[tuple[str, str], LivenessEndpointSpec] = {}
         for principal in config.principals:
             if principal.liveness_endpoint is None:
                 continue
@@ -96,18 +96,9 @@ class LivenessPolicy:
                 path=principal.liveness_endpoint.path,
             )
             for decl in principal.auth_contexts:
-                raw = e.get(decl.env_var_name)
-                if not raw:
-                    # The secret store is the authority for missing tokens; here a
-                    # missing env var just means no declared endpoint for this id.
-                    continue
-                ac_id = auth_context_id(
-                    eid,
-                    compute_auth_hash(
-                        decl.kind, canonical_credential_value(decl.kind, raw)
-                    ),
-                )
-                declared[ac_id] = spec
+                # T1 guarantees `slot` post-validation (defaults to `kind`).
+                assert decl.slot is not None
+                declared[(principal.label, decl.slot)] = spec
 
         d = config.dispatch
         matchers = BodyMatchers(
@@ -118,7 +109,11 @@ class LivenessPolicy:
             if d.replay_invalid_match
             else None,
         )
-        return cls(matchers=matchers, declared_by_ac=declared)
+        return cls(
+            matchers=matchers,
+            declared_by_slot=declared,
+            slot_for_id=dict(graph_map) if graph_map is not None else {},
+        )
 
 
 def infer_self_endpoint(
@@ -190,17 +185,20 @@ class LivenessProber:
     engagement_id: EngagementId
     window_s: float = 60.0
     clock: Callable[[], float] = time.monotonic
-    _cache: dict[AuthContextId, tuple[LivenessResult, float]] = field(
-        default_factory=dict
+    # ADR-0049: cache keys on the slot key (or the raw id when no slot maps), so
+    # one probe covers every generation of the same `(principal, slot)`.
+    _cache: dict[tuple[str, str] | AuthContextId, tuple[LivenessResult, float]] = (
+        field(default_factory=dict)
     )
     acs_without_endpoint: set[AuthContextId] = field(default_factory=set)
 
     def _resolve_endpoint(
-        self, ac_id: AuthContextId
+        self, ac_id: AuthContextId, slot_key: tuple[str, str] | None
     ) -> LivenessEndpointSpec | None:
-        declared = self.policy.declared_by_ac.get(ac_id)
-        if declared is not None:
-            return declared
+        if slot_key is not None:
+            declared = self.policy.declared_by_slot.get(slot_key)
+            if declared is not None:
+                return declared
         return infer_self_endpoint(
             self.neo4j, engagement_id=self.engagement_id, auth_context_id=ac_id
         )
@@ -216,14 +214,18 @@ class LivenessProber:
     ) -> ProbeOutcome:
         """Probe (or return cached) the AuthContext's liveness (ADR-0044)."""
 
-        cached = self._cache.get(auth_context_id)
+        slot_key = self.policy.slot_for_id.get(auth_context_id)
+        cache_key: tuple[str, str] | AuthContextId = (
+            slot_key if slot_key is not None else auth_context_id
+        )
+        cached = self._cache.get(cache_key)
         if cached is not None and (self.clock() - cached[1]) < self.window_s:
             return ProbeOutcome(result=cached[0], sent=False)
 
-        endpoint = self._resolve_endpoint(auth_context_id)
+        endpoint = self._resolve_endpoint(auth_context_id, slot_key)
         if endpoint is None:
             self.acs_without_endpoint.add(auth_context_id)
-            self._cache[auth_context_id] = ("unknown", self.clock())
+            self._cache[cache_key] = ("unknown", self.clock())
             log.warning(
                 "dispatch.liveness.no_endpoint",
                 engagement_id=self.engagement_id,
@@ -247,7 +249,7 @@ class LivenessProber:
             now=now,
         )
         result = self._interpret(dr)
-        self._cache[auth_context_id] = (result, self.clock())
+        self._cache[cache_key] = (result, self.clock())
         log.info(
             "dispatch.liveness.probed",
             engagement_id=self.engagement_id,

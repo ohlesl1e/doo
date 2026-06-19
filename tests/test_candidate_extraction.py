@@ -21,7 +21,7 @@ import jwt as pyjwt
 from doo.canonical.value_objects import BlobRef
 from doo.canonical.values import hash_for
 from doo.events.envelope import IngestionEnvelope
-from doo.events.l2 import RequestObservation
+from doo.events.observation import RequestObservation
 from doo.extraction.artifacts import (
     extract_candidates,
     extract_diagnostics,
