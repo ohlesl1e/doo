@@ -2,9 +2,9 @@
 
 The prober is exercised against a real `Dispatcher` (StubSender, always-alive
 lease, allow-all OPA) and a tiny fake graph client — no testcontainers. Covers:
-declared-endpoint probe → live/dead, per-(ac, window) caching, the
+declared-endpoint probe → live/dead, per-(slot, window) caching, the
 self-endpoint inference fallback, the no-endpoint `unknown` + flag, a
-gate-blocked probe → `unknown`, and `LivenessPolicy.from_config` id mapping.
+gate-blocked probe → `unknown`, and `LivenessPolicy.from_config` slot mapping.
 """
 
 from __future__ import annotations
@@ -12,7 +12,6 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from doo.canonical.identity import auth_context_id, compute_auth_hash
 from doo.canonical.value_objects import HostRef
 from doo.dispatch.executor.dispatcher import (
     AlwaysAliveLease,
@@ -91,11 +90,17 @@ class _FakeClient:
         return self._rows
 
 
+_SLOT = ("attacker-b", "bearer")
+
+
 def _policy(spec: LivenessEndpointSpec | None) -> LivenessPolicy:
     from doo.dispatch.executor.classify import BodyMatchers
 
-    declared = {AC: spec} if spec is not None else {}
-    return LivenessPolicy(matchers=BodyMatchers(), declared_by_ac=declared)
+    declared = {_SLOT: spec} if spec is not None else {}
+    slot_for_id = {AC: _SLOT} if spec is not None else {}
+    return LivenessPolicy(
+        matchers=BodyMatchers(), declared_by_slot=declared, slot_for_id=slot_for_id
+    )
 
 
 def test_declared_endpoint_probe_live() -> None:
@@ -225,7 +230,7 @@ def test_gate_blocked_probe_is_unknown() -> None:
     assert len(sender.sent) == 0  # no bytes left the process
 
 
-def test_policy_from_config_maps_ac_and_matchers() -> None:
+def test_policy_from_config_maps_slot_and_matchers() -> None:
     config = EngagementConfig.model_validate(
         {
             "engagement": {"id": "eng-cfg", "name": "cfg"},
@@ -248,14 +253,54 @@ def test_policy_from_config_maps_ac_and_matchers() -> None:
             ],
         }
     )
-    policy = LivenessPolicy.from_config(config, env={"TOK": "raw-token"})
-
-    expected_ac = auth_context_id(
-        EngagementId("eng-cfg"), compute_auth_hash("bearer", "raw-token")
+    stale = AuthContextId("ac-stale-gen")
+    policy = LivenessPolicy.from_config(
+        config, graph_map={stale: ("attacker-b", "bearer")}
     )
-    assert expected_ac in policy.declared_by_ac
-    spec = policy.declared_by_ac[expected_ac]
+
+    # ADR-0049: keyed on (label, slot) — `slot` defaulted to `kind` (T1).
+    assert ("attacker-b", "bearer") in policy.declared_by_slot
+    spec = policy.declared_by_slot[("attacker-b", "bearer")]
     assert spec.method == "GET" and spec.path == "/me"  # method normalised upper
+    # The graph map is copied through so the prober can translate stale ids.
+    assert policy.slot_for_id[stale] == ("attacker-b", "bearer")
     assert policy.matchers.auth_invalid is not None
     assert policy.matchers.auth_invalid.search("token revoked")
     assert policy.matchers.replay_invalid is not None
+
+
+def test_stale_id_resolves_declared_endpoint_via_slot() -> None:
+    """ADR-0049 / #117: a probe under a *stale* (rotated-out) `auth_context_id`
+    still hits the declared `liveness_endpoint` — and shares the cache window
+    with the fresh id of the same `(principal, slot)`."""
+
+    from doo.dispatch.executor.classify import BodyMatchers
+
+    stale = AuthContextId("ac-stale")
+    fresh = AuthContextId("ac-fresh")
+    spec = LivenessEndpointSpec(method="GET", path="/me")
+    policy = LivenessPolicy(
+        matchers=BodyMatchers(),
+        declared_by_slot={("alice", "cookie"): spec},
+        slot_for_id={stale: ("alice", "cookie"), fresh: ("alice", "cookie")},
+    )
+    sender = StubSender(response=HttpResponse(status=200))
+    prober = LivenessProber(
+        dispatcher=_dispatcher(sender),
+        neo4j=_FakeClient(),  # type: ignore[arg-type]
+        policy=policy,
+        engagement_id=ENG,
+    )
+    out = prober.probe(
+        auth_context_id=stale, material=_material(), evidence=_evidence(),
+        test_class="idor", now=datetime.now(UTC),
+    )
+    assert out.result == "live" and out.sent is True
+    assert sender.sent[0].path == "/me"
+    # Same slot, different id → cache hit, no second wire send.
+    out2 = prober.probe(
+        auth_context_id=fresh, material=_material(), evidence=_evidence(),
+        test_class="idor", now=datetime.now(UTC),
+    )
+    assert out2.result == "live" and out2.sent is False
+    assert len(sender.sent) == 1

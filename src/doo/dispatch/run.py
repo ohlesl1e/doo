@@ -77,7 +77,7 @@ from doo.dispatch.models import (
 )
 from doo.dispatch.ontology import BodyStore, commit_agent_send
 from doo.dispatch.reactive import ReactiveEmitter
-from doo.dispatch.secrets import AuthMaterial, SecretStore
+from doo.dispatch.secrets import AuthMaterial, SecretStore, SlotMaterialMissing
 from doo.dispatch.selection import select_testcases
 from doo.events.slice4 import DispatchStatus
 from doo.ids import (
@@ -345,17 +345,28 @@ def _execute_one(
             now=now,
         )
 
-    # --- auth-material lookup (ADR-0012/0015). ---
-    material = deps.secrets.material_for(tc.auth_context_id)
+    # --- auth-material lookup (ADR-0012/0015 + ADR-0049 slot indirection). ---
+    try:
+        material = deps.secrets.material_for(tc.auth_context_id)
+    except SlotMaterialMissing as exc:
+        return _outcome(
+            tc,
+            run,
+            "hazard_unresolved",
+            reason=(
+                f"declared principal {exc.principal_label!r} slot {exc.slot!r} "
+                f"has no live material (env unset and no rotation entry)"
+            ),
+            now=now,
+        )
     if material is None:
         return _outcome(
             tc,
             run,
             "hazard_unresolved",
             reason=(
-                f"no live token material for auth_context_id "
-                f"{tc.auth_context_id!r} (declared principals only; check "
-                "${VAR} env refs)"
+                f"auth_context_id {tc.auth_context_id!r} is not a declared "
+                f"credential (discovered-tier; un-armable)"
             ),
             now=now,
         )

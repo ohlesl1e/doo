@@ -17,12 +17,15 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from doo.canonical.cookies import canonical_credential_value
 from doo.canonical.identity import auth_context_id, compute_auth_hash
 from doo.ids import AuthContextId, EngagementId
 from doo.setup.config import AuthContextKind, EngagementConfig
+
+if TYPE_CHECKING:
+    from doo.infra.neo4j_driver import Neo4jClient
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +60,22 @@ class UnknownAuthContextError(Exception):
     """
 
 
+class SlotMaterialMissing(UnknownAuthContextError):
+    """A declared `(principal_label, slot)` exists in the graph but has no live
+    material (env var unset AND no rotation entry). ADR-0049 distinguishes this
+    from a discovered-tier id (`material_for` → `None`): the former is an
+    operator/config error, the latter is an un-armable TestCase by design.
+    """
+
+    def __init__(self, *, principal_label: str, slot: str) -> None:
+        self.principal_label = principal_label
+        self.slot = slot
+        super().__init__(
+            f"declared principal {principal_label!r} slot {slot!r} has no live "
+            "material (env unset and no rotation entry)"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class EnvSecretStore:
     """Env-var-backed `SecretStore` built from a loaded `EngagementConfig`.
@@ -68,6 +87,7 @@ class EnvSecretStore:
     """
 
     by_id: dict[AuthContextId, AuthMaterial]
+    by_slot: dict[tuple[str, str], AuthMaterial]
 
     @classmethod
     def from_config(
@@ -76,6 +96,7 @@ class EnvSecretStore:
         e = env if env is not None else dict(os.environ)
         eid: EngagementId = config.engagement.id
         by_id: dict[AuthContextId, AuthMaterial] = {}
+        by_slot: dict[tuple[str, str], AuthMaterial] = {}
         for principal in config.principals:
             for decl in principal.auth_contexts:
                 raw = e.get(decl.env_var_name)
@@ -92,13 +113,79 @@ class EnvSecretStore:
                     decl.kind, canonical_credential_value(decl.kind, raw)
                 )
                 ac_id = auth_context_id(eid, ah)
-                by_id[ac_id] = AuthMaterial(
+                mat = AuthMaterial(
                     kind=decl.kind, raw=raw, principal_label=principal.label
                 )
-        return cls(by_id=by_id)
+                by_id[ac_id] = mat
+                # ADR-0049: the rotation-stable key. T1 guarantees `slot` is
+                # always populated post-validation (defaults to `kind`).
+                assert decl.slot is not None
+                by_slot[(principal.label, decl.slot)] = mat
+        return cls(by_id=by_id, by_slot=by_slot)
 
     def material_for(self, auth_context_id: AuthContextId) -> AuthMaterial | None:
         return self.by_id.get(auth_context_id)
+
+
+def build_declared_slot_map(
+    neo4j: Neo4jClient, engagement_id: EngagementId
+) -> dict[AuthContextId, tuple[str, str]]:
+    """One Cypher at run-arm: every declared AC id (all generations) → (principal_label, slot).
+
+    ADR-0049: a TestCase carries the `auth_context_id` of the AuthContext
+    generation it was *planned* against, which may have since rotated. This map
+    lets the Executor translate any historical declared id to its rotation-stable
+    `(principal_label, slot)` key, and from there to live material.
+    """
+
+    rows = neo4j.execute_read(
+        """
+        MATCH (ac:AuthContext {engagement_id: $eid})-[:OF_PRINCIPAL]->(p:Principal)
+        WHERE ac.tier = 'declared'
+        RETURN ac.id AS id, p.label AS label, coalesce(ac.slot, ac.token_kind) AS slot
+        """,
+        eid=str(engagement_id),
+    )
+    return {
+        AuthContextId(str(r["id"])): (str(r["label"]), str(r["slot"])) for r in rows
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class SlotResolvingSecretStore:
+    """ADR-0049: secrets lookup keys on the rotation-stable `(principal_label, slot)`,
+    not the content-addressed `auth_context_id`.
+
+    The G5 symptom this fixes: a TestCase planned at engagement-start carries an
+    `auth_context_id` derived from the *then*-current token; by run-arm the env
+    var holds a fresh token, so `EnvSecretStore.by_id` misses and the run refuses
+    every authz test as `hazard_unresolved`. The slot indirection makes "alice's
+    session cookie" the lookup key, which is stable across rotations.
+
+    T4 folds the rotation overlay in; for now `RotatableSecretStore` wraps this.
+    """
+
+    graph_map: dict[AuthContextId, tuple[str, str]]
+    env: EnvSecretStore
+    anon_id: AuthContextId
+
+    def material_for(self, auth_context_id: AuthContextId) -> AuthMaterial | None:
+        if auth_context_id == self.anon_id:
+            # The anon constructors ignore `auth`; placeholder satisfies the
+            # `AuthMaterial` Literal type and the OPA `principal_tier` field.
+            return AuthMaterial(kind="bearer", raw="", principal_label="anonymous")
+        # Fast path: env-derived id matches (no rotation since plan-time).
+        hit = self.env.material_for(auth_context_id)
+        if hit is not None:
+            return hit
+        slot_key = self.graph_map.get(auth_context_id)
+        if slot_key is None:
+            # Genuinely unknown / discovered-tier — un-armable by design.
+            return None
+        mat = self.env.by_slot.get(slot_key)
+        if mat is None:
+            raise SlotMaterialMissing(principal_label=slot_key[0], slot=slot_key[1])
+        return mat
 
 
 @dataclass(frozen=True, slots=True)

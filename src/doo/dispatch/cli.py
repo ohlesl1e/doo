@@ -22,6 +22,7 @@ import typer
 if TYPE_CHECKING:
     from doo.dispatch.interpreter.loop import MultiTurnLLMCaller
 
+from doo.canonical.identity import auth_context_id, compute_anonymous_auth_hash
 from doo.dispatch.executor.dispatcher import OpaClient, RedisLeaseReader, StubOpaClient
 from doo.dispatch.executor.liveness import LivenessPolicy
 from doo.dispatch.executor.send import HttpxSender
@@ -29,7 +30,12 @@ from doo.dispatch.ledger import JsonFileDispatchLedger
 from doo.dispatch.models import DispatchSelection
 from doo.dispatch.ontology import NoopBodyStore
 from doo.dispatch.run import RunDependencies, arm_run, execute_run
-from doo.dispatch.secrets import EnvSecretStore, RotatableSecretStore
+from doo.dispatch.secrets import (
+    EnvSecretStore,
+    RotatableSecretStore,
+    SlotResolvingSecretStore,
+    build_declared_slot_map,
+)
 from doo.ids import EngagementId
 from doo.infra.neo4j_driver import Neo4jClient
 from doo.infra.redis_lease import RedisLease
@@ -350,6 +356,11 @@ def run_cmd(
             raise typer.Exit(code=0)
 
     neo4j = _build_neo4j()
+    # ADR-0049: one read at run-arm — every declared AuthContext id (all
+    # generations) → its rotation-stable (principal_label, slot). Shared by the
+    # secret store and the liveness policy so a stale plan-time id still arms.
+    graph_map = build_declared_slot_map(neo4j, cfg.engagement.id)
+    anon = auth_context_id(cfg.engagement.id, compute_anonymous_auth_hash())
     deps = RunDependencies(
         neo4j=neo4j,
         lease=_build_lease(cfg.engagement.id),
@@ -363,14 +374,19 @@ def run_cmd(
         ),
         sender=HttpxSender(),
         secrets=RotatableSecretStore(
-            base=EnvSecretStore.from_config(cfg), rotation_path=_rotation_path()
+            base=SlotResolvingSecretStore(
+                graph_map=graph_map,
+                env=EnvSecretStore.from_config(cfg),
+                anon_id=anon,
+            ),
+            rotation_path=_rotation_path(),
         ),
         bodies=_build_body_store(),  # type: ignore[arg-type]
         ledger=_default_ledger(),
         interpreter=_build_interpreter(),
         # ADR-0044: declared liveness endpoints + body matchers, and the reactive
         # refresh emitter for a dead token.
-        liveness=LivenessPolicy.from_config(cfg),
+        liveness=LivenessPolicy.from_config(cfg, graph_map=graph_map),
         reactive=_build_reactive(),  # type: ignore[arg-type]
     )
 
