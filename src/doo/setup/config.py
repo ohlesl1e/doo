@@ -22,7 +22,7 @@ from typing import Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from doo.events.slice4 import PayloadClass
+from doo.events.execution import PayloadClass
 from doo.ids import EngagementId, EngagementName, ScopeContentHash
 
 PathPattern = str  # Glob/segment pattern; canonical Scope rule format (ADR-0035).

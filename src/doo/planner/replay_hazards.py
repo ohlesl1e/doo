@@ -34,7 +34,7 @@ import math
 import re
 from dataclasses import dataclass
 
-from doo.events.l2 import ValueCandidate
+from doo.events.observation import ValueCandidate
 from doo.planner.models import REPLAY_HAZARD_ROLES, ReplayHazardRole
 
 

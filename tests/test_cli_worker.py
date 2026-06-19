@@ -16,7 +16,7 @@ from typer.testing import CliRunner
 
 from doo.cli import app
 from doo.cli_worker import _drain_once, _report_parse_failures, _truncate
-from doo.events.l2 import ParseFailure
+from doo.events.observation import ParseFailure
 from doo.ids import EngagementId, L2EventId, ObservationId, SourceId
 
 # Strip ANSI styling so assertions don't depend on rich's colour codes. `--help` is

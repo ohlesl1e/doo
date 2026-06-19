@@ -40,7 +40,7 @@ from doo.canonical.identity import (
     principal_id,
 )
 from doo.canonical.value_objects import AuthContextCue, HostRef
-from doo.events.l2 import ParseFailure, RequestObservation
+from doo.events.observation import ParseFailure, RequestObservation
 from doo.ids import (
     AuthContextId,
     EngagementId,

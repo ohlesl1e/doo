@@ -37,7 +37,7 @@ from doo.dispatch.models import (
     RequestRole,
     RunBudget,
 )
-from doo.events.slice4 import DispatchStatus, TestClass
+from doo.events.execution import DispatchStatus, TestClass
 from doo.ids import EngagementId
 from doo.infra.redis_lease import LEASE_VALUE_ACTIVE, RedisLease
 from doo.observability.logging import get_logger

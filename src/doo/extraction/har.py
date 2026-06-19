@@ -48,7 +48,7 @@ from doo.canonical.identity import (
 )
 from doo.canonical.value_objects import AuthContextCue, BlobRef, HostRef, ObservedIdentity
 from doo.events.envelope import IngestionEnvelope
-from doo.events.l2 import (
+from doo.events.observation import (
     BodyParam,
     L2Event,
     Method,

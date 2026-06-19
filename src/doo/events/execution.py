@@ -1,11 +1,11 @@
-"""Slice-4 hedge contracts: `TestCase`, `Finding`, `ExecutedAsEdge`.
+"""Action-layer (L5) contracts: `TestCase`, `Finding`, `ExecutedAsEdge`.
 
-No slice-1 code path constructs these — but the identity / target / dispatch
-rules are *already settled* in ADRs 0007, 0013, and CONTEXT.md. Writing the
-Pydantic shapes now prevents design drift when slice 4 lands and lets the L3
-schema bootstrap include constraints for the corresponding node types.
+The identity / target / dispatch rules these encode are settled in ADRs 0007,
+0013, and CONTEXT.md. Originally drafted as a slice-1 hedge against design drift;
+since slice 4 (Executor + Interpreter) shipped, the Planner constructs `TestCase`s
+and the dispatch loop mints `Finding`s / `EXECUTED_AS` edges against these shapes.
 
-The hedge is contracts only — no graph-mutation code, no Cypher writers.
+Contracts only — no graph-mutation code, no Cypher writers live here.
 """
 
 from __future__ import annotations

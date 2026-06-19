@@ -22,7 +22,7 @@ from uuid import uuid4
 import pytest
 
 from doo.events.envelope import IngestionEnvelope
-from doo.events.l2 import ParseFailure, RequestObservation
+from doo.events.observation import ParseFailure, RequestObservation
 from doo.extraction.har import parse_har
 from doo.ids import BlobKey, EngagementId, IdempotencyKey, Sha256Hex
 from tests.fixtures import (

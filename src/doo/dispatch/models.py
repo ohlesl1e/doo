@@ -19,7 +19,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from doo.canonical.value_objects import HostRef
-from doo.events.slice4 import DispatchStatus, PayloadClass, TestClass
+from doo.events.execution import DispatchStatus, PayloadClass, TestClass
 from doo.ids import (
     AuthContextId,
     DispatchRunId,

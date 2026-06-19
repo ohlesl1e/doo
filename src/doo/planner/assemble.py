@@ -44,7 +44,7 @@ from typing import Any, cast
 
 from doo.canonical.trust_boundary import CapabilityKind, stronger_capability_side
 from doo.coverage.models import C2bResult, C2Result, C3Result, PrincipalEvidence
-from doo.events.l2 import ValueCandidate
+from doo.events.observation import ValueCandidate
 from doo.ids import (
     AuthContextId,
     EngagementId,

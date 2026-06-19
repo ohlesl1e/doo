@@ -15,7 +15,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from doo.events.l2 import L2Event
+from doo.events.observation import L2Event
 from doo.infra.streams import L2_EVENTS_STREAM, StreamClient
 from doo.observability.logging import get_logger
 from doo.ontology.commit import CommitOrchestrator, CommitResult

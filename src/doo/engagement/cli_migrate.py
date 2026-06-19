@@ -23,7 +23,7 @@ from typing import Any
 import typer
 
 from doo.canonical.identity import auth_context_id, compute_anonymous_auth_hash
-from doo.events.slice4 import compute_testcase_key_hash
+from doo.events.execution import compute_testcase_key_hash
 from doo.ids import (
     EngagementId,
     ParameterId,

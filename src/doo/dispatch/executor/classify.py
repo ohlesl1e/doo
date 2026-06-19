@@ -32,7 +32,7 @@ from typing import Literal
 
 from doo.dispatch.executor.send import HttpResponse
 from doo.dispatch.models import RequestRole
-from doo.events.slice4 import DispatchStatus, TestClass
+from doo.events.execution import DispatchStatus, TestClass
 
 # Authz `test_class`es whose 4xx-on-`primary` is *not* immediately `auth_invalid`
 # (ADR-0044 amendment): the liveness probe disambiguates.

@@ -32,7 +32,7 @@ from doo.dispatch.executor.dispatcher import Dispatcher, DispatchResult
 from doo.dispatch.executor.evidence import EvidenceObservation
 from doo.dispatch.models import ConcreteRequest
 from doo.dispatch.secrets import AuthMaterial
-from doo.events.slice4 import PayloadClass, TestClass
+from doo.events.execution import PayloadClass, TestClass
 from doo.ids import AuthContextId, EngagementId
 from doo.infra.neo4j_driver import Neo4jClient
 from doo.observability.logging import get_logger

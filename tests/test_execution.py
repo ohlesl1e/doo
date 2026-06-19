@@ -1,8 +1,8 @@
-"""Slice-4 hedge contracts construct cleanly and enforce their identity rules.
+"""Action-layer (L5) contracts construct cleanly and enforce their identity rules.
 
-These are not used by slice-1 code. The tests exist so that when slice 4
-lands, the identity rule, the three-way XOR target, and the dispatch-status
-enum are already locked in and cannot drift silently.
+Cover the identity rule, the three-way XOR target, and the dispatch-status enum
+for `TestCase` / `Finding` / `ExecutedAsEdge` — the shapes the Planner and dispatch
+loop build against, locked in so they cannot drift silently.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 import pytest
 from pydantic import ValidationError
 
-from doo.events.slice4 import (
+from doo.events.execution import (
     DISPATCH_STATUSES,
     ExecutedAsEdge,
     Finding,

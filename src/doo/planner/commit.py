@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from doo import __version__
-from doo.events.slice4 import PayloadClass, TestClass
+from doo.events.execution import PayloadClass, TestClass
 from doo.ids import (
     AuthContextId,
     EngagementId,

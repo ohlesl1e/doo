@@ -20,8 +20,8 @@ import pytest
 import structlog
 
 from doo.coverage.models import C2bResult, PrincipalEvidence
-from doo.events.l2 import ValueCandidate
-from doo.events.slice4 import compute_testcase_key_hash
+from doo.events.execution import compute_testcase_key_hash
+from doo.events.observation import ValueCandidate
 from doo.ids import AuthContextId, EngagementId
 from doo.infra.neo4j_driver import Neo4jClient
 from doo.planner import assemble as assemble_mod

@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from doo.events.envelope import IngestionEnvelope
-from doo.events.l2 import L2Event, ParseFailure
+from doo.events.observation import L2Event, ParseFailure
 from doo.extraction.registry import UnknownParserError, get_parser
 from doo.ids import BlobKey, ObservationId, SourceId
 from doo.infra.blobs import BlobClient

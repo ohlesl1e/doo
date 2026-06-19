@@ -23,7 +23,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from doo.events.slice4 import PayloadClass, TestClass
+from doo.events.execution import PayloadClass, TestClass
 from doo.ids import (
     AuthContextId,
     EngagementId,

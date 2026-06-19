@@ -22,7 +22,7 @@ from doo.dispatch.interpreter.models import SendToolResult
 from doo.dispatch.models import ROLES_BY_TEST_CLASS, DispatchRun, RequestRole
 from doo.dispatch.ontology import BodyStore, commit_agent_send
 from doo.dispatch.secrets import AuthMaterial, SecretStore
-from doo.events.slice4 import TestClass
+from doo.events.execution import TestClass
 from doo.ids import ObservationId, TestCaseKeyHash
 from doo.infra.neo4j_driver import Neo4jClient
 from doo.observability.logging import get_logger

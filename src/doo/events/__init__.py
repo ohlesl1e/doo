@@ -6,30 +6,14 @@ L2 -> L3: `L2Event` discriminated union over `RequestObservation` /
 inline `ValueCandidate`s on the observation, promoted at flush).
 L3 -> consumers: `L3Event` discriminated union of structural events.
 
-Plus slice-4 hedge contracts (`TestCase`, `Finding`, `EXECUTED_AS`) — the
-identity / target rules must be locked in now so slice 4 doesn't drift.
+Plus action-layer (L5) contracts (`TestCase`, `Finding`, `EXECUTED_AS`) — the
+identity / target rules the Planner and dispatch loop build against.
 See ARCHITECTURE.md "Layer contracts (L1 -> L2 -> L3)" and the grill-queue G2
 outputs.
 """
 
 from doo.events.envelope import SOURCE_KINDS, IngestionEnvelope, SourceKind
-from doo.events.l2 import (
-    L2Event,
-    L2EventBase,
-    ParseFailure,
-    ParseFailureKind,
-    RequestObservation,
-    ValueCandidate,
-)
-from doo.events.l3 import (
-    EdgeCreated,
-    EdgeRemoved,
-    L3Event,
-    NodeCreated,
-    NodeUpdated,
-    Reconciliation,
-)
-from doo.events.slice4 import (
+from doo.events.execution import (
     DISPATCH_STATUSES,
     DispatchStatus,
     ExecutedAsEdge,
@@ -39,6 +23,22 @@ from doo.events.slice4 import (
     PayloadClass,
     TestCase,
     TestClass,
+)
+from doo.events.observation import (
+    L2Event,
+    L2EventBase,
+    ParseFailure,
+    ParseFailureKind,
+    RequestObservation,
+    ValueCandidate,
+)
+from doo.events.structural import (
+    EdgeCreated,
+    EdgeRemoved,
+    L3Event,
+    NodeCreated,
+    NodeUpdated,
+    Reconciliation,
 )
 
 __all__ = [

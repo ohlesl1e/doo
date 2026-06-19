@@ -79,7 +79,7 @@ from doo.dispatch.ontology import BodyStore, commit_agent_send
 from doo.dispatch.reactive import ReactiveEmitter
 from doo.dispatch.secrets import AuthMaterial, SecretStore, SlotMaterialMissing
 from doo.dispatch.selection import select_testcases
-from doo.events.slice4 import DispatchStatus
+from doo.events.execution import DispatchStatus
 from doo.ids import (
     AuthContextId,
     DispatchRunId,

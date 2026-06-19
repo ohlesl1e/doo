@@ -38,7 +38,7 @@ from doo.dispatch.models import DispatchSelection
 from doo.dispatch.ontology import NoopBodyStore
 from doo.dispatch.run import RunDependencies, arm_run, execute_run
 from doo.dispatch.secrets import EnvSecretStore
-from doo.events.slice4 import compute_testcase_key_hash
+from doo.events.execution import compute_testcase_key_hash
 from doo.ids import EngagementId
 from doo.infra.neo4j_driver import Neo4jClient
 from doo.infra.redis_lease import RedisLease
