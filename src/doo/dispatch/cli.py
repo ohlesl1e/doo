@@ -560,26 +560,30 @@ def finding_review_cmd(
     decision; only `confirmed` Findings feed reporting.
     """
 
-    from doo.dispatch.finding import list_proposed_findings, review_finding
-    from doo.ids import FindingId
+    from doo.dispatch.finding import (
+        list_proposed_findings,
+        resolve_finding_key,
+        review_finding,
+    )
 
     configure_logging()
     neo4j = _build_neo4j()
     ledger = _default_finding_ledger()
     eid = EngagementId(engagement)
 
-    proposed = list_proposed_findings(neo4j, eid)
-
     if confirm or reject:
         target = (confirm or reject or "").strip()
-        # Allow a 12-char prefix (the CLI prints prefixes).
-        match = next(
-            (f for f in proposed if f.finding_key == target or f.finding_key.startswith(target)),
-            None,
-        )
-        if match is None:
+        # Resolve against ALL active Findings (not just proposed): a tester
+        # may override a prior reject after re-test. The ledger records
+        # `prior_status → new_status` so the audit trail is intact (ADR-0045).
+        try:
+            full_key = resolve_finding_key(neo4j, eid, target)
+        except ValueError as exc:
+            typer.secho(str(exc), fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1) from exc
+        if full_key is None:
             typer.secho(
-                f"no proposed Finding matching {target!r} in engagement {engagement!r}",
+                f"no Finding matching {target!r} in engagement {engagement!r}",
                 fg=typer.colors.RED,
                 err=True,
             )
@@ -589,16 +593,17 @@ def finding_review_cmd(
             neo4j,
             ledger,  # type: ignore[arg-type]
             engagement_id=eid,
-            finding_key=FindingId(match.finding_key),
+            finding_key=full_key,
             decision=decision,  # type: ignore[arg-type]
             actor=actor,
             reason=reason,
         )
         typer.echo(
-            f"Finding {match.finding_key[:12]} [{match.category}/{match.severity}] "
-            f"{event.prior_status} → {event.new_status} by {actor}"
+            f"Finding {full_key[:12]} {event.prior_status} → {event.new_status} by {actor}"
         )
         return
+
+    proposed = list_proposed_findings(neo4j, eid)
 
     if not proposed:
         typer.echo(f"no proposed Findings in engagement {engagement!r}")

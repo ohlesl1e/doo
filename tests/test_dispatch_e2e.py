@@ -30,6 +30,7 @@ from doo.dispatch.executor.send import HttpResponse, StubSender
 from doo.dispatch.finding import (
     InMemoryFindingLedger,
     list_proposed_findings,
+    resolve_finding_key,
     review_finding,
 )
 from doo.dispatch.interpreter.loop import FakeMultiTurnCaller
@@ -812,6 +813,28 @@ def test_dispatch_spine_e2e(
     )
     assert ev.prior_status == "proposed" and ev.new_status == "confirmed"
     assert len(fledger.events) == 1
+
+    # `resolve_finding_key` reaches a non-`proposed` Finding (the CLI's
+    # --confirm/--reject must work after a prior decision; the ledger holds
+    # both events). 12-char prefix and full key both resolve; ambiguity raises.
+    assert resolve_finding_key(neo4j_client, EngagementId(ENG), finding_key) == finding_key
+    assert resolve_finding_key(neo4j_client, EngagementId(ENG), finding_key[:12]) == finding_key
+    assert resolve_finding_key(neo4j_client, EngagementId(ENG), "ffffffffffff") is None
+    # And `review_finding` itself transitions confirmed → rejected → confirmed
+    # with each step ledger-recorded (a tester changing their mind).
+    ev2 = review_finding(
+        neo4j_client, fledger, engagement_id=EngagementId(ENG),
+        finding_key=finding_key, decision="reject", actor="e2e-tester",
+        reason="re-eval",
+    )
+    assert ev2.prior_status == "confirmed" and ev2.new_status == "rejected"
+    ev3 = review_finding(
+        neo4j_client, fledger, engagement_id=EngagementId(ENG),
+        finding_key=finding_key, decision="confirm", actor="e2e-tester",
+        reason="re-test confirms",
+    )
+    assert ev3.prior_status == "rejected" and ev3.new_status == "confirmed"
+    assert len(fledger.events) == 3
 
     # --- kill the lease → next send is `dispatcher_blocked('kill_switch')`. ---
     lease.release()
