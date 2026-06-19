@@ -38,9 +38,10 @@ log = get_logger(__name__)
 class _Neo4jLeaseConfigReader:
     """Reads `Engagement.kill_switch` from Neo4j and maps it to KillSwitchConfig.
 
-    The loader (ADR-0019) stores `kill_switch = {lease_ttl_seconds,
-    refresh_interval_seconds}` as a property map on the `Engagement` node. We
-    read just that property.
+    The loader (ADR-0019) persists `kill_switch` as a **JSON string** on the
+    `Engagement` node — Neo4j cannot store nested maps as node properties, so
+    the writer (`ontology/graph_state.py`) `json.dumps` it. We read just that
+    property and decode it here (same guard as the `graph_state` reader).
     """
 
     def __init__(self, session: object) -> None:
@@ -49,7 +50,8 @@ class _Neo4jLeaseConfigReader:
     def read_kill_switch_config(
         self, engagement_id: EngagementId
     ) -> KillSwitchConfig | None:
-        # MATCH the engagement root and return its kill_switch property map.
+        import json
+
         records = list(
             self._session.run(  # type: ignore[attr-defined]
                 "MATCH (e:Engagement {id: $id}) RETURN e.kill_switch AS kill_switch",
@@ -62,9 +64,11 @@ class _Neo4jLeaseConfigReader:
         if ks is None:
             # Node exists but no kill_switch persisted — fall back to defaults.
             return KillSwitchConfig()
+        if isinstance(ks, str):
+            ks = json.loads(ks)
         return KillSwitchConfig(
-            lease_ttl_seconds=int(ks["lease_ttl_seconds"]),
-            refresh_interval_seconds=int(ks["refresh_interval_seconds"]),
+            lease_ttl_seconds=int(ks.get("lease_ttl_seconds", 60)),
+            refresh_interval_seconds=int(ks.get("refresh_interval_seconds", 30)),
         )
 
 
