@@ -371,7 +371,7 @@ def run_cmd(
             environment=cfg.environment,
             unsafe_stub=unsafe_stub_opa,
         ),
-        sender=HttpxSender(),
+        sender=HttpxSender(verify=cfg.dispatch.tls_verify),
         secrets=SlotResolvingSecretStore(
             graph_map=graph_map,
             env=EnvSecretStore.from_config(cfg),

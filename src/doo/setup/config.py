@@ -517,6 +517,14 @@ class DispatchConfig(BaseModel):
     # compile here so a bad pattern is a loud load-time error, not a run-time one.
     auth_invalid_match: str | None = None
     replay_invalid_match: str | None = None
+    # TLS verification for the wire send (`HttpxSender`). `True` (default) =
+    # system CA bundle; `False` = skip verification (staging-only — the
+    # `_environment_gates_dispatch_modes` validator on `EngagementConfig`
+    # rejects this on production: the dispatcher splices live declared-principal
+    # credentials, and `verify=False` lets a MITM harvest them and decouples the
+    # OPA host check from the server actually reached); a `str` is a CA-bundle
+    # filepath (the right answer for an internal target with a private CA).
+    tls_verify: bool | str = True
 
     @model_validator(mode="after")
     def _match_patterns_compile(self) -> Self:
@@ -631,6 +639,15 @@ class EngagementConfig(BaseModel):
                     f"(got {self.dispatch.interpreter!r}); freelance is staging-only "
                     "(ADR-0042: a human arming a freelance run is not "
                     "human-in-the-loop for what it actually sends)"
+                )
+            if self.dispatch.tls_verify is False:
+                raise ValueError(
+                    "environment=production forbids dispatch.tls_verify=false: the "
+                    "dispatcher sends live declared-principal credentials, and "
+                    "skipping verification lets a MITM harvest them and decouples "
+                    "the OPA host check from the server actually reached. For a "
+                    "production target with a private CA, set tls_verify to the "
+                    "CA-bundle path instead."
                 )
         return self
 
