@@ -40,8 +40,11 @@ log = get_logger(__name__)
 # Prompt/algorithm version stamped on the persisted transcript (ADR-0005); bump
 # when the system prompt or tool schemas change. /2 adds per-test_class
 # guidance. /3 (#124) names the `primary` principal and tightens the
-# missing-baseline steer toward `inconclusive`.
-INTERPRETER_PROMPT_VERSION = "interpreter-confirm/3"
+# missing-baseline steer toward `inconclusive`. /4 (#126) adds
+# `baseline_anonymous` for priv-esc/boundary and corrects the auth-bypass
+# guidance (its `primary` is always anonymous on the wire — `authbypass_primary`
+# strips all auth regardless of `primary_sent_as`).
+INTERPRETER_PROMPT_VERSION = "interpreter-confirm/4"
 
 # Per-`test_class` guidance appended to the base prompt (S7/#92). Mirrors the
 # Planner's per-kind prompt selection: the deciding question differs by class.
@@ -58,24 +61,35 @@ _CLASS_GUIDANCE: dict[str, str] = {
         "`baseline_negative` rules out 'any id works'."
     ),
     "auth-bypass": (
-        "\n\nTHIS CLASS — AUTH-BYPASS: the `primary` was sent as the principal "
-        "named in `primary_sent_as` (which MAY be `anonymous` for C1-derived "
-        "tests, or a low-privilege declared account for C2/C2b — do NOT assume "
-        "anonymous). Vulnerable = the attacker reached content they should not; "
-        "compare `baseline_victim` (the authorised side). If `baseline_victim` "
-        "is unavailable, emit `inconclusive` unless the `primary` body ALONE "
-        "proves disclosure."
+        "\n\nTHIS CLASS — AUTH-BYPASS: the `primary` was sent with NO credential "
+        "on the wire (the constructor strips all auth regardless of "
+        "`primary_sent_as` — that field is the TestCase's attacker identity, "
+        "not what was spliced). Vulnerable = an endpoint that should require "
+        "auth served sensitive content anonymously. Compare `baseline_victim` "
+        "(the same request WITH the owner's auth). If `baseline_victim` is "
+        "unavailable, emit `inconclusive` unless the `primary` body ALONE "
+        "discloses clearly-sensitive structured data."
     ),
     "privilege-escalation": (
         "\n\nTHIS CLASS — PRIVILEGE-ESCALATION: a lower-tier principal hit a "
         "higher-privilege action. Vulnerable = the low-tier `primary` succeeded "
-        "where only the privileged `baseline_victim` should."
+        "where only the privileged `baseline_victim` should. If "
+        "`baseline_victim` is unavailable, send `baseline_anonymous` (same "
+        "request, NO auth): if anonymous gets the same body as `primary`, the "
+        "endpoint has no auth check at all — emit `vulnerable` with "
+        "`vuln_category='broken-auth'` (CWE-306). If anonymous 4xx, the "
+        "attacker's credential was the gate; without the victim baseline emit "
+        "`inconclusive`."
     ),
     "boundary-violation": (
         "\n\nTHIS CLASS — BOUNDARY-VIOLATION: the test crosses a declared "
         "TrustBoundary (capability/tenant, ADR-0039). Vulnerable = the attacker "
         "side reached what only the stronger/other side should; `baseline_victim` "
-        "is that authorized side."
+        "is that authorized side. If `baseline_victim` is unavailable, send "
+        "`baseline_anonymous` (same request, NO auth): if anonymous gets the "
+        "same body as `primary`, the endpoint has no auth check at all — emit "
+        "`vulnerable` with `vuln_category='broken-auth'` (CWE-306). If "
+        "anonymous 4xx, without the victim baseline emit `inconclusive`."
     ),
 }
 

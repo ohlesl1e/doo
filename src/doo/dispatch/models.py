@@ -44,6 +44,7 @@ RequestRole = Literal[
     "primary",
     "baseline_victim",
     "baseline_negative",
+    "baseline_anonymous",
     "hazard_warmup",
     "liveness",
 ]
@@ -51,6 +52,7 @@ REQUEST_ROLES: tuple[RequestRole, ...] = (
     "primary",
     "baseline_victim",
     "baseline_negative",
+    "baseline_anonymous",
     "hazard_warmup",
     "liveness",
 )
@@ -61,9 +63,14 @@ REQUEST_ROLES: tuple[RequestRole, ...] = (
 ROLES_BY_TEST_CLASS: dict[TestClass, tuple[RequestRole, ...]] = {
     "idor": ("primary", "baseline_victim", "baseline_negative"),
     "bola": ("primary", "baseline_victim", "baseline_negative"),
+    # `auth-bypass` `primary` is ALREADY anonymous on the wire (see
+    # `authbypass_primary`), so `baseline_anonymous` would be redundant here.
     "auth-bypass": ("primary", "baseline_victim"),
-    "privilege-escalation": ("primary", "baseline_victim"),
-    "boundary-violation": ("primary", "baseline_victim"),
+    # priv-esc / boundary `primary` splices the attacker's auth (`idor_primary`);
+    # `baseline_anonymous` (#126) is the no-auth probe that answers "is this
+    # endpoint auth-gated at all?" when `baseline_victim` is un-armable.
+    "privilege-escalation": ("primary", "baseline_victim", "baseline_anonymous"),
+    "boundary-violation": ("primary", "baseline_victim", "baseline_anonymous"),
 }
 
 
