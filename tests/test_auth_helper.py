@@ -59,7 +59,7 @@ def _helper(tmp_path: Path, *, clock_box: dict[str, float], **rc_kw: Any) -> Aut
         id_to_slot={AC: SLOT},
         env={},
         clock=lambda: clock_box["t"],
-        mechanisms={"command": lambda rc, env: "NEW-TOKEN"},
+        mechanisms={"command": lambda rc, env, verify: "NEW-TOKEN"},
     )
     helper._schedule_all()
     return helper
@@ -133,7 +133,7 @@ def test_rotate_writes_identity_claims_and_validity_window(tmp_path: Path) -> No
         {"_id": "u-rot", "exp": 4102444800}, "k" * 32, algorithm="HS256"
     )
     helper = _helper(tmp_path, clock_box=box)
-    helper.mechanisms["command"] = lambda rc, env: rotated
+    helper.mechanisms["command"] = lambda rc, env, verify: rotated
     assert helper.rotate(SLOT, reason="proactive") is True
 
     write = helper.neo4j.writes[0]  # type: ignore[attr-defined]
@@ -146,7 +146,7 @@ def test_rotate_writes_identity_claims_and_validity_window(tmp_path: Path) -> No
 
     # Opaque (non-JWT) credential → empty claims, no window; non-fatal.
     helper2 = _helper(tmp_path, clock_box=box)
-    helper2.mechanisms["command"] = lambda rc, env: "opaque-not-a-jwt"
+    helper2.mechanisms["command"] = lambda rc, env, verify: "opaque-not-a-jwt"
     assert helper2.rotate(SLOT, reason="proactive") is True
     write2 = helper2.neo4j.writes[0]  # type: ignore[attr-defined]
     assert _json.loads(write2["identity_claims"]) == {}
@@ -177,7 +177,7 @@ def test_rotate_quoted_cookie_hashes_canonical_writes_wire_raw(tmp_path: Path) -
         },
         env={},
         clock=lambda: box["t"],
-        mechanisms={"command": lambda rc, env: wire},
+        mechanisms={"command": lambda rc, env, verify: wire},
     )
     helper._schedule_all()
     assert helper.rotate(cookie_slot, reason="reactive") is True
@@ -190,6 +190,22 @@ def test_rotate_quoted_cookie_hashes_canonical_writes_wire_raw(tmp_path: Path) -
     assert helper.id_to_slot[new_id] == cookie_slot
     # Wire-form raw survives un-stripped under the slot key.
     assert data["user-c:cookie"]["raw"] == wire
+
+
+def test_rotate_threads_tls_verify_to_mechanism(tmp_path: Path) -> None:
+    """`dispatch.tls_verify` reaches the refresh mechanism (oauth/http honour it)."""
+    seen: list[bool | str] = []
+
+    def _mech(rc: RefreshConfig, env: dict[str, str], verify: bool | str) -> str:
+        seen.append(verify)
+        return "TOK"
+
+    box = {"t": 0.0}
+    helper = _helper(tmp_path, clock_box=box)
+    helper.tls_verify = False
+    helper.mechanisms["command"] = _mech
+    assert helper.rotate(SLOT, reason="reactive") is True
+    assert seen == [False]
 
 
 def test_rotate_respects_rate_limit(tmp_path: Path) -> None:

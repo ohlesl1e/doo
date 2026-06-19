@@ -55,14 +55,17 @@ class RefreshError(Exception):
 
 
 # ---------------------------------------------------------------------------
-# Refresh mechanisms — `(refresh_config, env) → new raw token`. Credentials are
-# read from the helper's env; never inline, never the dispatcher's env.
+# Refresh mechanisms — `(refresh_config, env, verify) → new raw token`.
+# Credentials are read from the helper's env; never inline, never the
+# dispatcher's env. `verify` is the engagement's `dispatch.tls_verify` (the
+# helper's outbound calls hit the same target/IdP as the dispatcher, so the
+# same TLS posture applies — staging-only `False`, gated on `EngagementConfig`).
 # ---------------------------------------------------------------------------
 
-RefreshMechanismFn = Callable[[RefreshConfig, dict[str, str]], str]
+RefreshMechanismFn = Callable[[RefreshConfig, dict[str, str], bool | str], str]
 
 
-def _refresh_command(rc: RefreshConfig, env: dict[str, str]) -> str:
+def _refresh_command(rc: RefreshConfig, env: dict[str, str], verify: bool | str) -> str:
     """Shell out to the tester's script; the fresh token is its stdout."""
 
     assert rc.command is not None
@@ -84,7 +87,7 @@ def _refresh_command(rc: RefreshConfig, env: dict[str, str]) -> str:
     return token
 
 
-def _refresh_oauth(rc: RefreshConfig, env: dict[str, str]) -> str:
+def _refresh_oauth(rc: RefreshConfig, env: dict[str, str], verify: bool | str) -> str:
     """OAuth2 refresh-grant POST; reads the refresh token + client creds from env."""
 
     import httpx
@@ -98,7 +101,7 @@ def _refresh_oauth(rc: RefreshConfig, env: dict[str, str]) -> str:
         data["client_id"] = env[rc.client_id_env]
     if rc.client_secret_env and env.get(rc.client_secret_env):
         data["client_secret"] = env[rc.client_secret_env]
-    resp = httpx.post(rc.token_url, data=data, timeout=30.0)
+    resp = httpx.post(rc.token_url, data=data, timeout=30.0, verify=verify)
     resp.raise_for_status()
     token = resp.json().get("access_token")
     if not token:
@@ -106,7 +109,7 @@ def _refresh_oauth(rc: RefreshConfig, env: dict[str, str]) -> str:
     return str(token)
 
 
-def _refresh_http(rc: RefreshConfig, env: dict[str, str]) -> str:
+def _refresh_http(rc: RefreshConfig, env: dict[str, str], verify: bool | str) -> str:
     """A templated HTTP request; `${VAR}` in the body is substituted from env."""
 
     import re
@@ -117,7 +120,12 @@ def _refresh_http(rc: RefreshConfig, env: dict[str, str]) -> str:
     body = rc.http_body or ""
     body = re.sub(r"\$\{(\w+)\}", lambda m: env.get(m.group(1), ""), body)
     resp = httpx.request(
-        rc.http_method, rc.http_url, headers=rc.http_headers, content=body, timeout=30.0
+        rc.http_method,
+        rc.http_url,
+        headers=rc.http_headers,
+        content=body,
+        timeout=30.0,
+        verify=verify,
     )
     resp.raise_for_status()
     token = resp.text.strip()
@@ -224,6 +232,10 @@ class AuthHelper:
         default_factory=lambda: dict(_MECHANISMS)
     )
     rate_limiter: RateLimiter = field(default_factory=RateLimiter)
+    # Engagement's `dispatch.tls_verify` — threaded to the http/oauth refresh
+    # mechanisms (the `command` mechanism ignores it). Same staging-only gate
+    # as the dispatcher's wire send.
+    tls_verify: bool | str = True
     consumer_group: str = "auth-helper"
     _next_refresh_at: dict[tuple[str, str], float] = field(default_factory=dict)
 
@@ -268,6 +280,7 @@ class AuthHelper:
             streams=streams,
             env=e,
             clock=clock,
+            tls_verify=config.dispatch.tls_verify,
         )
         helper._schedule_all()
         return helper
@@ -320,7 +333,7 @@ class AuthHelper:
 
         mechanism = self.mechanisms[m.refresh.mechanism]
         try:
-            new_raw = mechanism(m.refresh, self.env)
+            new_raw = mechanism(m.refresh, self.env, self.tls_verify)
         except Exception as exc:  # noqa: BLE001 - any mechanism failure is non-fatal
             log.warning(
                 "auth_helper.refresh_failed",
