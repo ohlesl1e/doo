@@ -204,6 +204,31 @@ class Neo4jGraphState:
         )
         return result.upgrades
 
+    def backfill_auth_context_slots(self, engagement_id: EngagementId) -> int:
+        """Stamp `slot = token_kind` on slot-less declared ACs (ADR-0049).
+
+        Idempotent: the `slot IS NULL` filter means a second run is a no-op.
+        Covers all generations (`status` not filtered) so expired/rotated ACs
+        from before the slot field existed are reachable by the dispatcher's
+        slot-map.
+        """
+
+        rows = self._client.execute_write(
+            """
+            MATCH (ac:AuthContext {engagement_id: $eid})
+            WHERE ac.tier = 'declared' AND ac.slot IS NULL
+            SET ac.slot = ac.token_kind
+            RETURN count(ac) AS n
+            """,
+            eid=str(engagement_id),
+        )
+        n = int(rows[0]["n"]) if rows else 0
+        if n:
+            log.info(
+                "engagement.slot_backfill", engagement_id=str(engagement_id), stamped=n
+            )
+        return n
+
 
 def _scope_create(client: Neo4jClient, m: PlannedMutation) -> None:
     import json
@@ -336,6 +361,7 @@ def _auth_context_declare(client: Neo4jClient, m: PlannedMutation) -> None:
                             identity_key: $principal_identity_key})
         MERGE (ac:AuthContext {engagement_id: $engagement_id, auth_hash: $auth_hash})
         SET ac.id = $props.id, ac.token_kind = $props.token_kind, ac.tier = $props.tier,
+            ac.slot = $props.slot,
             ac.is_anonymous = false, ac.validity_window = $props.validity_window,
             ac.identity_claims = $props.identity_claims,
             ac.source = $props.source, ac.source_id = $props.source_id,

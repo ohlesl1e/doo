@@ -35,7 +35,7 @@ class _FakeNeo4j:
         self.writes: list[dict[str, Any]] = []
 
     def execute_write(self, query: str, **params: Any) -> list[dict[str, Any]]:
-        self.writes.append(params)
+        self.writes.append({"_query": query, **params})
         return []
 
 
@@ -106,6 +106,11 @@ def test_rotate_writes_rotation_file_and_graph(tmp_path: Path) -> None:
     # Graph write happened (old expired + new node + OF_PRINCIPAL).
     assert helper.neo4j.writes  # type: ignore[attr-defined]
     assert helper.neo4j.writes[0]["old_id"] == str(AC)  # type: ignore[attr-defined]
+    # ADR-0049 / #116: the rotation Cypher copies the slot forward from `old`.
+    assert (
+        "new.slot = coalesce(old.slot, old.token_kind)"
+        in helper.neo4j.writes[0]["_query"]  # type: ignore[attr-defined]
+    )
     # The new id is now also managed (a later reactive event on it works).
     assert new_id in helper.managed
 

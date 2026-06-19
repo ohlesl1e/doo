@@ -128,7 +128,7 @@ def test_auth_helper_reactive_rotation_e2e(
         OPTIONAL MATCH (old:AuthContext {engagement_id: $eid, id: $old_id})
         OPTIONAL MATCH (new:AuthContext {engagement_id: $eid, id: $new_id})-[:OF_PRINCIPAL]->(p)
         RETURN old.status AS old_status, new.status AS new_status,
-               new.source AS new_source
+               new.source AS new_source, new.slot AS new_slot
         """,
         eid=ENG,
         old_id=str(old_ac),
@@ -137,6 +137,9 @@ def test_auth_helper_reactive_rotation_e2e(
     assert rows[0]["old_status"] == "expired"
     assert rows[0]["new_status"] == "active"
     assert rows[0]["new_source"] == "auth-helper"
+    # ADR-0049 / #116: rotation copies slot forward. The seed had no `slot`,
+    # so `coalesce(old.slot, old.token_kind)` picks `bearer`.
+    assert rows[0]["new_slot"] == "bearer"
 
     # --- rotation file: the Executor's store now serves NEW material for both ids. ---
     data = json.loads(rotation_path.read_text())

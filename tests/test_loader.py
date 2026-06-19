@@ -42,12 +42,18 @@ class FakeGraphState:
     # engagement_id -> {label -> _principal_view-shaped dict}
     principals: dict[EngagementId, dict[str, dict]] = field(default_factory=dict)
     reconcile_calls: list[tuple[EngagementId, str | None]] = field(default_factory=list)
+    backfill_calls: list[EngagementId] = field(default_factory=list)
 
     def reconcile_discovered_to_declared(
         self, engagement_id: EngagementId, *, preferred_claim: str | None
     ) -> int:
         """ADR-0048 retroactive sweep — no graph in the fake, just record the call."""
         self.reconcile_calls.append((engagement_id, preferred_claim))
+        return 0
+
+    def backfill_auth_context_slots(self, engagement_id: EngagementId) -> int:
+        """ADR-0049 slot backfill — no graph in the fake, just record the call."""
+        self.backfill_calls.append(engagement_id)
         return 0
 
     def fetch_engagement_state(
@@ -398,6 +404,118 @@ def test_loader_rejects_inline_token_and_non_kebab_label() -> None:
     d2["principals"] = [{"label": "Test_User_A"}]
     with pytest.raises(ValidationError):
         _build_config(d2)
+
+
+# ---------------------------------------------------------------------------
+# Credential slot (ADR-0049 / #116)
+# ---------------------------------------------------------------------------
+
+
+def test_declared_auth_context_slot_defaults_to_kind() -> None:
+    """Omitted `slot:` defaults to the credential's `kind` (ADR-0049)."""
+    d = _base_config_dict()
+    d["principals"] = [
+        {"label": "alice", "auth_contexts": [{"kind": "cookie", "token": "${TOK}"}]}
+    ]
+    cfg = _build_config(d)
+    assert cfg.principals[0].auth_contexts[0].slot == "cookie"
+
+
+def test_declared_auth_context_explicit_slot_kept() -> None:
+    """An explicit `slot:` overrides the kind default."""
+    d = _base_config_dict()
+    d["principals"] = [
+        {
+            "label": "alice",
+            "auth_contexts": [{"kind": "cookie", "token": "${TOK}", "slot": "stepup"}],
+        }
+    ]
+    cfg = _build_config(d)
+    assert cfg.principals[0].auth_contexts[0].slot == "stepup"
+
+
+def test_config_rejects_duplicate_principal_slot() -> None:
+    """Two ACs of the same kind under one principal collide on the default slot
+    (ADR-0049: `(label, slot)` is unique per engagement). Error names the pair."""
+    from pydantic import ValidationError
+
+    d = _base_config_dict()
+    d["principals"] = [
+        {
+            "label": "alice",
+            "auth_contexts": [
+                {"kind": "cookie", "token": "${TOK_A}"},
+                {"kind": "cookie", "token": "${TOK_B}"},
+            ],
+        }
+    ]
+    with pytest.raises(ValidationError) as exc:
+        _build_config(d)
+    msg = str(exc.value)
+    assert "alice" in msg and "cookie" in msg
+
+
+def test_config_same_slot_under_different_principals_is_legal() -> None:
+    """Uniqueness is `(label, slot)`, not slot alone."""
+    d = _base_config_dict()
+    d["principals"] = [
+        {"label": "alice", "auth_contexts": [{"kind": "cookie", "token": "${TOK_A}"}]},
+        {"label": "bob", "auth_contexts": [{"kind": "cookie", "token": "${TOK_B}"}]},
+    ]
+    _build_config(d)  # no raise
+
+
+def test_config_same_principal_different_explicit_slots_is_legal() -> None:
+    """The C4 weak/strong case: two cookies, distinct slots → distinct attacker
+    identities (ADR-0049 preserves ADR-0007's auth-state distinctness)."""
+    d = _base_config_dict()
+    d["principals"] = [
+        {
+            "label": "alice",
+            "auth_contexts": [
+                {"kind": "cookie", "token": "${TOK_A}", "slot": "session"},
+                {"kind": "cookie", "token": "${TOK_B}", "slot": "stepup"},
+            ],
+        }
+    ]
+    cfg = _build_config(d)
+    slots = {ac.slot for ac in cfg.principals[0].auth_contexts}
+    assert slots == {"session", "stepup"}
+
+
+def test_config_rejects_reserved_anonymous_slot() -> None:
+    """`slot: anonymous` is reserved for the C1 attacker sentinel."""
+    from pydantic import ValidationError
+
+    d = _base_config_dict()
+    d["principals"] = [
+        {
+            "label": "alice",
+            "auth_contexts": [{"kind": "cookie", "token": "${TOK}", "slot": "anonymous"}],
+        }
+    ]
+    with pytest.raises(ValidationError):
+        _build_config(d)
+
+
+def test_loader_emits_slot_on_auth_context_declare_and_backfills() -> None:
+    """The mutation carries `slot`; the ADR-0049 backfill runs on every load path."""
+    state = FakeGraphState()
+    d = _base_config_dict()
+    d["principals"] = [
+        {"label": "alice", "auth_contexts": [{"kind": "cookie", "token": "${TOK}"}]}
+    ]
+    config = _build_config(d)
+    result = load_engagement(config, state, env={"TOK": "session=abc"})
+    ac = next(m for m in result.mutations if m.kind == "auth_context_declare")
+    assert ac.properties["slot"] == "cookie"
+    # Backfill called on create.
+    assert state.backfill_calls == [config.engagement.id]
+
+    # And on a noop reload.
+    state.backfill_calls.clear()
+    load_engagement(config, state, env={"TOK": "session=abc"})
+    assert state.backfill_calls == [config.engagement.id]
 
 
 def test_loader_rejects_reserved_anon_label() -> None:

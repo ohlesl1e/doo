@@ -325,7 +325,19 @@ class DeclaredAuthContext(BaseModel):
 
     kind: AuthContextKind
     token: str = Field(min_length=1)
+    # Rotation-stable handle for this credential within its Principal (ADR-0049).
+    # Defaults to `kind` so a single-credential principal needs no explicit slot;
+    # explicit `slot:` is only required to disambiguate ≥2 ACs of the same kind
+    # (e.g. session vs. step-up cookie). `(principal.label, slot)` is unique per
+    # engagement — enforced on `EngagementConfig`.
+    slot: str | None = None
     refresh: RefreshConfig | None = None
+
+    @model_validator(mode="after")
+    def _default_slot_to_kind(self) -> Self:
+        if self.slot is None:
+            object.__setattr__(self, "slot", self.kind)
+        return self
 
     @model_validator(mode="after")
     def _token_is_env_ref(self) -> Self:
@@ -564,6 +576,34 @@ class EngagementConfig(BaseModel):
         labels = [p.label for p in self.principals]
         if len(set(labels)) != len(labels):
             raise ValueError("principal labels must be unique within an engagement")
+        return self
+
+    @model_validator(mode="after")
+    def _unique_principal_slots(self) -> Self:
+        """`(principal.label, slot)` is unique per engagement (ADR-0049).
+
+        The slot is the rotation-stable attacker identity; a collision would make
+        secrets lookup and TestCase keying ambiguous. The fix is an explicit
+        `slot:` on each colliding declaration.
+        """
+
+        seen: set[tuple[str, str]] = set()
+        for p in self.principals:
+            for ac in p.auth_contexts:
+                assert ac.slot is not None  # guaranteed by _default_slot_to_kind
+                if ac.slot == "anonymous":
+                    raise ValueError(
+                        f"principal {p.label!r}: slot 'anonymous' is reserved for the "
+                        "anonymous attacker sentinel (ADR-0049); choose another slot"
+                    )
+                key = (p.label, ac.slot)
+                if key in seen:
+                    raise ValueError(
+                        f"credential slot ({p.label!r}, {ac.slot!r}) declared more "
+                        f"than once. When a principal has multiple AuthContexts of "
+                        f"kind {ac.kind!r}, give each an explicit `slot:` (ADR-0049)."
+                    )
+                seen.add(key)
         return self
 
     @model_validator(mode="after")

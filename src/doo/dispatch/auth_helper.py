@@ -400,6 +400,7 @@ class AuthHelper:
             SET old.status = 'expired', old.last_seen = $now
             MERGE (new:AuthContext {engagement_id: $eid, auth_hash: $new_hash})
             ON CREATE SET new.id = $new_id, new.token_kind = $kind, new.tier = 'declared',
+                          new.slot = coalesce(old.slot, old.token_kind),
                           new.is_anonymous = false, new.source = 'auth-helper',
                           new.confidence = 1.0, new.confidence_method = 'heuristic',
                           new.first_seen = $now, new.ingested_at = $now
