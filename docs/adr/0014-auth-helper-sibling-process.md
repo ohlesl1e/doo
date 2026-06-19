@@ -23,3 +23,7 @@ Triggers are **proactive** (helper polls `AuthContext.validity_window`, refreshe
 - The refresh credential is the most sensitive material in the engagement. Out-of-band storage (env, secrets manager) is mandatory; it is never in the YAML.
 - The `command` refresh mechanism is intentionally broad — it shells out to tester code. Acceptable because the helper runs under the tester's authority, not the agent's; the agent never invokes it directly.
 - Slice-1 reviewers should expect to revisit setup-format ergonomics once the `refresh:` field lands (ADR-0012 anticipates schema bumps of this kind).
+
+## Amendment (ADR-0049) — helper manages credential *slots*, seeded from the graph
+
+The helper's `managed` set and the rotation file are keyed on `(principal_label, slot)`, not `auth_context_id`. At start the helper seeds `managed` by querying the graph for every `tier='declared'` AuthContext on the engagement (grouped by slot) — not by re-hashing its own env — so its reactive `auth_invalid → rotate` path covers ids minted before the helper ran. On rotation it writes **one** slot-keyed entry to the rotation file (the old↔new dual-write is removed) and copies `slot` to the new `AuthContext` node. The dispatcher's `SlotResolvingSecretStore` (ADR-0049) is the primary resolution path, so dispatch is correct whether or not the helper is up; the helper's role stays *refresh*, not *resolution*.

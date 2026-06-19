@@ -26,7 +26,30 @@ Resolved by the slice-1 implementation, never needed a formal grill. The write p
 
 ### G4. Body and secret blob layout ✅ resolved (in slice 1)
 
-Resolved by the slice-1 `blobs.py` implementation. Key layout is engagement-scoped + content-addressed: `engagement/{id}/source/{kind}/{sha256}.{ext}` for HAR blobs and a parallel body-key scheme. Secrets never store the full value — `kind ∈ {secret, token, opaque_token}` carry `value_hash` + length + preview only (**ADR-0009 / 0015 / 0024**), so the "JWT in a body is a secret too" case is handled at the L2 extraction boundary. Retention/cleanup is left to object-store lifecycle policy (not yet needed).
+Resolved by the slice-1 `blobs.py` implementation.
+
+### G5. Secrets lookup across token rotation — Principal indirection vs content-addressed `auth_context_id` ✅ resolved
+
+Closed 2026-06-18. Output: **ADR-0049** (credential **slot** is the rotation-stable attacker identity; secrets lookup, rotation file, helper `managed`, and the TestCase `key_hash` all key on `(principal_label, slot)`; `auth_context_id` stays as non-key evidence). Amends ADR-0007 (key_hash) and ADR-0014 (helper seeds `managed` from graph; slot-keyed rotation file). `CONTEXT.md` gained the **credential slot** term and the updated TestCase identity. Migration: `doo engagement migrate-testcase-keys` backfill ships with the implementation; the current staging engagement takes one round of duplicate proposals instead.
+
+Surfaced 2026-06-18 testing slice 4 (staging engagement, `kind=cookie`): `doo dispatch run` drained 13/13 approved TestCases as `hazard_unresolved: no live token material for auth_context_id …`. All three referenced ids are `tier=declared / source=manual / status=active` in the graph, yet `EnvSecretStore.material_for` misses every one.
+
+**Cause.** `auth_context_id = sha256(engagement_id, sha256(kind, canonical(token)))` — content-addressed on the token bytes (ADR-0015). The loader writes the id from the env value at `engagement start`; the planner commits TestCases referencing that id; `EnvSecretStore.from_config` recomputes from the env value at **run-arm**. Session cookies rotate between the two, so the dispatcher's index holds a different id and the TestCase's id is unreachable. The auth-helper's old↔new bridge (`auth_helper.py:357-363`) writes refreshed material under both ids it knows — but it keys `managed` on the env value at **helper-start**, so a rotation that happened *before* the helper ran (manual re-source, a `login-*.sh` regen) is invisible to it. The rotation file is keyed by `auth_context_id` too, so it has the same blind spot.
+
+**Tension.** Content-addressing is right for the *graph* (an `AuthContext` node *is* one specific credential; provenance/`HIT` edges hang off the exact token observed). But the *secrets lookup* wants the stable identity, which is the **Principal** (or `(principal_label, token_kind)` when a Principal has multiple ACs) — "give me the current live token for whatever credential `admin`/`cookie` is now", not "give me the bytes that hashed to X six hours ago".
+
+**Candidate resolutions to grill:**
+
+- **(a) `PrincipalIndirectSecretStore` decorator.** One Cypher at run-arm builds `{declared auth_context_id: (principal_label, kind)}` over every `tier='declared'` AC on the engagement (all generations, not just `status=active`). `EnvSecretStore` gains a secondary `by_label_kind` index. `material_for(stale_id)` → base miss → graph map → `by_label_kind[(label, kind)]`. Additive; no schema/TestCase change. Open: what if a Principal has ≥2 ACs of the same `kind` (e.g. two cookie tiers)? Need a discriminator beyond `kind` — `tier`? declaration order?
+- **(b) Auth-helper bootstraps from the graph.** At helper-start, query all `tier='declared'` ACs (not env-derived), immediately `rotate()` each, writing fresh material under the *graph* id. Closes the gap from the helper side and means the dispatcher only ever needs the rotation file. Downside: forces an IdP round-trip per AC at helper-start even when the env token is still valid; rate-limit interaction.
+- **(c) `TestCase` references `(principal_label, kind[, tier])` instead of `auth_context_id`.** Moves the indirection to propose-time. Cleanest long-term but a TestCase-schema + content-addressing change (ADR-0007/0037), and loses the ability to target a *specific* observed AC (which non-declared / freelance-mode tests may want).
+- **(d) Operational discipline only.** Document that `engagement start` must be re-run (or `planner propose` re-run) after every cred refresh. Rejected as the answer — session cookies on a real target rotate faster than a review cycle — but worth recording why.
+
+**Likely shape:** (a) as the slice-4 fix (small, additive, unblocks dispatch today), with (b) layered so the helper also reconciles graph-declared ids on start; (c) parked as a deeper ADR question. Either way the rotation file should also be searchable by `(principal_label, kind)` so a mid-run helper rotation reaches a TestCase referencing an engagement-start id.
+
+**Touches:** ADR-0012 (declared principals), ADR-0014 (auth-helper sibling), ADR-0015 (secrets boundary — unchanged: raw still never reaches the graph), ADR-0043 (`hazard_unresolved` surfacing), ADR-0048 (declared-credential identity claims). Will produce an ADR amendment (probably 0014).
+
+**Workaround until grilled:** shim the rotation file with entries keyed on the graph ids → current env tokens (`write_rotation_entry(rotation_path, auth_context_id=<graph-id>, raw=os.environ[<VAR>], kind='cookie', principal_label=…)` per principal); `RotatableSecretStore` then resolves them. Re-shim after every `login-*.sh` run. Key layout is engagement-scoped + content-addressed: `engagement/{id}/source/{kind}/{sha256}.{ext}` for HAR blobs and a parallel body-key scheme. Secrets never store the full value — `kind ∈ {secret, token, opaque_token}` carry `value_hash` + length + preview only (**ADR-0009 / 0015 / 0024**), so the "JWT in a body is a secret too" case is handled at the L2 extraction boundary. Retention/cleanup is left to object-store lifecycle policy (not yet needed).
 
 ## Pick a default and move
 
@@ -110,7 +133,7 @@ Until after slice 1+2 lands; revisit when the implementation forces the question
 - **Cap / rank C2 candidates before the LLM call (ADR-0036).** `C2Generator`
   makes one synchronous proposing call per `run_c2` row. C2 emits one row per
   *ordered* principal pair × endpoint where A reached and B did not — on a real
-  engagement (`fap-hd`, 5 principals, 74 endpoints) that's 306 rows ⇒ 306
+  engagement (the staging engagement, 5 principals, 74 endpoints) that's 306 rows ⇒ 306
   sequential LLM calls (~45 min on a slow gateway). Most of that fan-out is
   redundant: the same endpoint surfaces once per non-reaching principal, and the
   `(anon, X)` direction is rarely an authz lead. Options to grill: (a) collapse
@@ -168,5 +191,5 @@ Until after slice 1+2 lands; revisit when the implementation forces the question
    - **C5 = executed-to-verdict** — a boundary is *tested* only when a targeting TestCase has `dispatch_status = ok` **and** `interpreter_verdict ∈ {vulnerable, not_vulnerable}`; `inconclusive` is **untested** (fail-closed). C5a (no proposed) / C5b (no approved) are sibling sub-queries. (ADR-0047)
    - **Where slice-4 MVP stops** — ships: dispatch run + both `arming` values; **authz-class** request constructors only; Dispatcher gate (kill-switch + generated OPA + rate/budget guards); hazard resolvers `csrf_token`/`nonce`/`timestamp` + `hazard_unresolved` surfacing; liveness-probe classifier; Interpreter confirm loop + verdict + Finding@proposed; `doo dispatch run|review` + `doo finding review`; C5/C5a/C5b; auth-helper sibling process (ADR-0014); the new `EngagementConfig` fields. **Deferred:** `freelance` mode (seam only); **sink-class** constructors + `check_callback` + callback receiver; payload-synthesis library; `disclosure_status` transitions + reporting/disclosure templates; role/ownership `TrustBoundary` inference; planner→OPA wire.
 
-8. **Next — Slice-4 PRD + tracers.** `/to-prd` over ADR-0042–0047, then `/to-issues`. First vertical: arm a run on `fap-hd` staging → one IDOR `primary` + `baseline_victim` through the full Dispatcher gate → Interpreter verdict → `Finding` at `proposed` → human confirms.
+8. **Next — Slice-4 PRD + tracers.** `/to-prd` over ADR-0042–0047, then `/to-issues`. First vertical: arm a run on the staging engagement → one IDOR `primary` + `baseline_victim` through the full Dispatcher gate → Interpreter verdict → `Finding` at `proposed` → human confirms.
 9. **After slice 4 — grill third-party MCP behind the Executor.** Burp's MCP server / hexstrike-ai as the `executor.send` wire backend (replay fidelity, Burp session reuse) and/or hosting the Executor itself over MCP for process/egress isolation. Constraint already fixed (ADR-0043 amendment): never exposed straight to the Interpreter. Questions to grill: which third-party tools are gate-safe to wrap; whether MCP-server-hosted Executor is the right isolation boundary vs. a plain subprocess; how third-party tool output enters the graph with provenance.
