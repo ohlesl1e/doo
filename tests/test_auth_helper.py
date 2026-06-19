@@ -1,9 +1,9 @@
-"""Auth-helper unit tests (S6/#91, ADR-0014).
+"""Auth-helper unit tests (S6/#91, ADR-0014; ADR-0049 slot re-key).
 
 Rate-limit guard, proactive scheduling at `exp − margin`, reactive rotation on a
-stubbed stream event (respecting the rate limit), the rotation-file write, the
-`RotatableSecretStore` overlay, and `RefreshConfig` shape validation. The graph
-write is exercised by the integration e2e; here Neo4j is a no-op fake.
+stubbed stream event (respecting the rate limit), the rotation-file write, and
+`RefreshConfig` shape validation. The graph write is exercised by the
+integration e2e; here Neo4j is a no-op fake.
 """
 
 from __future__ import annotations
@@ -17,26 +17,26 @@ from pydantic import ValidationError
 from doo.canonical.identity import auth_context_id, compute_auth_hash
 from doo.dispatch.auth_helper import AuthHelper, ManagedAuthContext, RateLimiter
 from doo.dispatch.reactive import AUTH_REACTIVE_STREAM, REACTIVE_AUTH_INVALID
-from doo.dispatch.secrets import (
-    AuthMaterial,
-    EnvSecretStore,
-    RotatableSecretStore,
-    write_rotation_entry,
-)
+from doo.dispatch.secrets import AuthMaterial, EnvSecretStore
 from doo.ids import AuthContextId, EngagementId
 from doo.setup.config import RefreshConfig
 
 ENG = EngagementId("eng-helper")
 AC = AuthContextId("ac-1")
+SLOT = ("attacker-b", "bearer")
 
 
 class _FakeNeo4j:
-    def __init__(self) -> None:
+    def __init__(self, read_rows: list[dict[str, Any]] | None = None) -> None:
         self.writes: list[dict[str, Any]] = []
+        self._read_rows = read_rows or []
 
     def execute_write(self, query: str, **params: Any) -> list[dict[str, Any]]:
         self.writes.append({"_query": query, **params})
         return []
+
+    def execute_read(self, query: str, **params: Any) -> list[dict[str, Any]]:
+        return list(self._read_rows)
 
 
 def _refresh(**kw: Any) -> RefreshConfig:
@@ -51,7 +51,12 @@ def _helper(tmp_path: Path, *, clock_box: dict[str, float], **rc_kw: Any) -> Aut
         engagement_id=ENG,
         neo4j=_FakeNeo4j(),  # type: ignore[arg-type]
         rotation_path=tmp_path / "rotation.json",
-        managed={AC: ManagedAuthContext(AC, "bearer", "attacker-b", rc)},
+        managed={
+            SLOT: ManagedAuthContext(
+                principal_label="attacker-b", slot="bearer", kind="bearer", refresh=rc
+            )
+        },
+        id_to_slot={AC: SLOT},
         env={},
         clock=lambda: clock_box["t"],
         mechanisms={"command": lambda rc, env: "NEW-TOKEN"},
@@ -85,7 +90,7 @@ def test_due_proactively_fires_at_exp_minus_margin(tmp_path: Path) -> None:
     box["t"] = 1089.0
     assert helper.due_proactively() == []
     box["t"] = 1090.0
-    assert helper.due_proactively() == [AC]
+    assert helper.due_proactively() == [SLOT]
 
 
 # --- rotate ----------------------------------------------------------------
@@ -94,25 +99,26 @@ def test_due_proactively_fires_at_exp_minus_margin(tmp_path: Path) -> None:
 def test_rotate_writes_rotation_file_and_graph(tmp_path: Path) -> None:
     box = {"t": 0.0}
     helper = _helper(tmp_path, clock_box=box, validity_window_s=100, max_refreshes_per_hour=2)
-    assert helper.rotate(AC, reason="reactive") is True
+    assert helper.rotate(SLOT, reason="reactive") is True
 
     import json
 
     data = json.loads((tmp_path / "rotation.json").read_text())
-    # New material written under BOTH the old id and the freshly-computed new id.
     new_id = auth_context_id(ENG, compute_auth_hash("bearer", "NEW-TOKEN"))
-    assert data[str(AC)]["raw"] == "NEW-TOKEN"
-    assert data[str(new_id)]["raw"] == "NEW-TOKEN"
-    # Graph write happened (old expired + new node + OF_PRINCIPAL).
-    assert helper.neo4j.writes  # type: ignore[attr-defined]
-    assert helper.neo4j.writes[0]["old_id"] == str(AC)  # type: ignore[attr-defined]
-    # ADR-0049 / #116: the rotation Cypher copies the slot forward from `old`.
-    assert (
-        "new.slot = coalesce(old.slot, old.token_kind)"
-        in helper.neo4j.writes[0]["_query"]  # type: ignore[attr-defined]
-    )
-    # The new id is now also managed (a later reactive event on it works).
-    assert new_id in helper.managed
+    # ADR-0049: one rotation-stable key per slot, overwritten each rotation.
+    assert data == {"attacker-b:bearer": {"raw": "NEW-TOKEN", "kind": "bearer"}}
+    # No per-id keys (the dual-write under the old/new auth_context_id is gone).
+    assert str(AC) not in data and str(new_id) not in data
+    # Graph write: matches on (label, slot), not the old content-addressed id;
+    # the new node's slot is written from the parameter.
+    write = helper.neo4j.writes[0]  # type: ignore[attr-defined]
+    assert write["label"] == "attacker-b"
+    assert write["slot"] == "bearer"
+    assert "old_id" not in write
+    assert "new.slot = $slot" in write["_query"]
+    # The new content-addressed id now maps back to the slot for later
+    # reactive events on the rotated token.
+    assert helper.id_to_slot[new_id] == SLOT
 
 
 def test_rotate_writes_identity_claims_and_validity_window(tmp_path: Path) -> None:
@@ -128,7 +134,7 @@ def test_rotate_writes_identity_claims_and_validity_window(tmp_path: Path) -> No
     )
     helper = _helper(tmp_path, clock_box=box)
     helper.mechanisms["command"] = lambda rc, env: rotated
-    assert helper.rotate(AC, reason="proactive") is True
+    assert helper.rotate(SLOT, reason="proactive") is True
 
     write = helper.neo4j.writes[0]  # type: ignore[attr-defined]
     import json as _json
@@ -141,7 +147,7 @@ def test_rotate_writes_identity_claims_and_validity_window(tmp_path: Path) -> No
     # Opaque (non-JWT) credential → empty claims, no window; non-fatal.
     helper2 = _helper(tmp_path, clock_box=box)
     helper2.mechanisms["command"] = lambda rc, env: "opaque-not-a-jwt"
-    assert helper2.rotate(AC, reason="proactive") is True
+    assert helper2.rotate(SLOT, reason="proactive") is True
     write2 = helper2.neo4j.writes[0]  # type: ignore[attr-defined]
     assert _json.loads(write2["identity_claims"]) == {}
     assert write2["validity_window"] is None
@@ -157,38 +163,41 @@ def test_rotate_quoted_cookie_hashes_canonical_writes_wire_raw(tmp_path: Path) -
 
     box = {"t": 0.0}
     rc = _refresh()
-    ac_cookie = AuthContextId("ac-cookie")
+    cookie_slot = ("user-c", "cookie")
     bare = "deadbeefdeadbeef"
     wire = f'"{bare}"'
     helper = AuthHelper(
         engagement_id=ENG,
         neo4j=_FakeNeo4j(),  # type: ignore[arg-type]
         rotation_path=tmp_path / "rotation.json",
-        managed={ac_cookie: ManagedAuthContext(ac_cookie, "cookie", "user-c", rc)},
+        managed={
+            cookie_slot: ManagedAuthContext(
+                principal_label="user-c", slot="cookie", kind="cookie", refresh=rc
+            )
+        },
         env={},
         clock=lambda: box["t"],
         mechanisms={"command": lambda rc, env: wire},
     )
     helper._schedule_all()
-    assert helper.rotate(ac_cookie, reason="reactive") is True
+    assert helper.rotate(cookie_slot, reason="reactive") is True
 
     import json
 
     data = json.loads((tmp_path / "rotation.json").read_text())
     new_id = auth_context_id(ENG, compute_auth_hash("cookie", bare))
     # Hashed on the canonical (bare) form → same id the loader/L2 would compute.
-    assert str(new_id) in data
-    # Wire-form raw survives un-stripped, under both old and new ids.
-    assert data[str(new_id)]["raw"] == wire
-    assert data[str(ac_cookie)]["raw"] == wire
+    assert helper.id_to_slot[new_id] == cookie_slot
+    # Wire-form raw survives un-stripped under the slot key.
+    assert data["user-c:cookie"]["raw"] == wire
 
 
 def test_rotate_respects_rate_limit(tmp_path: Path) -> None:
     box = {"t": 0.0}
     helper = _helper(tmp_path, clock_box=box, max_refreshes_per_hour=2)
-    assert helper.rotate(AC, reason="reactive") is True
-    assert helper.rotate(AC, reason="reactive") is True
-    assert helper.rotate(AC, reason="reactive") is False  # 3rd within the hour blocked
+    assert helper.rotate(SLOT, reason="reactive") is True
+    assert helper.rotate(SLOT, reason="reactive") is True
+    assert helper.rotate(SLOT, reason="reactive") is False  # 3rd within the hour blocked
 
 
 def test_rotate_failed_mechanism_returns_false(tmp_path: Path) -> None:
@@ -199,7 +208,7 @@ def test_rotate_failed_mechanism_returns_false(tmp_path: Path) -> None:
         raise RuntimeError("idp down")
 
     helper.mechanisms["command"] = boom
-    assert helper.rotate(AC, reason="proactive") is False
+    assert helper.rotate(SLOT, reason="proactive") is False
     assert not (tmp_path / "rotation.json").exists()  # nothing written on failure
 
 
@@ -224,6 +233,8 @@ class _FakeStream:
 
 
 def test_poll_reactive_rotates_on_event(tmp_path: Path) -> None:
+    """Reactive event carries the content-addressed id; the helper translates
+    via `id_to_slot` to the rotation-stable slot key and rotates that."""
     box = {"t": 0.0}
     helper = _helper(tmp_path, clock_box=box)
     helper.streams = _FakeStream(  # type: ignore[assignment]
@@ -243,6 +254,29 @@ def test_poll_reactive_rotates_on_event(tmp_path: Path) -> None:
     assert (tmp_path / "rotation.json").exists()
 
 
+def test_poll_reactive_unmapped_id_is_acked_not_rotated(tmp_path: Path) -> None:
+    """An `auth_invalid` for an id absent from `id_to_slot` (discovered-tier
+    or another engagement's helper) is acked and dropped — never rotated."""
+    box = {"t": 0.0}
+    helper = _helper(tmp_path, clock_box=box)
+    helper.streams = _FakeStream(  # type: ignore[assignment]
+        [
+            (
+                "1-0",
+                {
+                    "kind": REACTIVE_AUTH_INVALID,
+                    "engagement_id": str(ENG),
+                    "auth_context_id": "ac-unmapped",
+                },
+            )
+        ]
+    )
+    assert helper.poll_reactive(block_ms=0) == 0
+    assert helper.streams.acked == ["1-0"]  # type: ignore[attr-defined]
+    assert not (tmp_path / "rotation.json").exists()
+    assert helper.neo4j.writes == []  # type: ignore[attr-defined]
+
+
 def test_poll_reactive_ignores_other_engagement(tmp_path: Path) -> None:
     box = {"t": 0.0}
     helper = _helper(tmp_path, clock_box=box)
@@ -252,24 +286,51 @@ def test_poll_reactive_ignores_other_engagement(tmp_path: Path) -> None:
     assert helper.poll_reactive(block_ms=0) == 0
 
 
-# --- RotatableSecretStore --------------------------------------------------
+# --- from_config -----------------------------------------------------------
 
 
-class _BaseStore:
-    def material_for(self, ac: AuthContextId) -> AuthMaterial | None:
-        if ac == AC:
-            return AuthMaterial(kind="bearer", raw="OLD", principal_label="attacker-b")
-        return None
+def test_from_config_seeds_managed_by_slot_and_id_to_slot_from_graph(
+    tmp_path: Path,
+) -> None:
+    """ADR-0049 / #119: `managed` keys on the declared `(principal_label, slot)`
+    (one entry per refreshable slot, regardless of how many AuthContext
+    generations exist); `id_to_slot` is seeded from the graph so a reactive
+    event on ANY historical generation maps to the same slot."""
+
+    from doo.setup.config import EngagementConfig
+    from tests.test_loader import _base_config_dict
+
+    d = _base_config_dict()
+    d["engagement"]["id"] = str(ENG)
+    d["principals"] = [
+        {
+            "label": "attacker-b",
+            "auth_contexts": [
+                {
+                    "kind": "bearer",
+                    "token": "${T}",
+                    "refresh": {"mechanism": "command", "command": "true"},
+                }
+            ],
+        }
+    ]
+    config = EngagementConfig.model_validate(d)
+    fake = _FakeNeo4j(
+        read_rows=[
+            {"id": "ac-gen1", "label": "attacker-b", "slot": "bearer"},
+            {"id": "ac-gen2", "label": "attacker-b", "slot": "bearer"},
+        ]
+    )
+    helper = AuthHelper.from_config(
+        config, neo4j=fake, rotation_path=tmp_path / "r.json", env={"T": "tok"}  # type: ignore[arg-type]
+    )
+    assert set(helper.managed) == {("attacker-b", "bearer")}
+    assert helper.managed[("attacker-b", "bearer")].kind == "bearer"
+    assert helper.id_to_slot[AuthContextId("ac-gen1")] == ("attacker-b", "bearer")
+    assert helper.id_to_slot[AuthContextId("ac-gen2")] == ("attacker-b", "bearer")
 
 
-def test_rotatable_overlay_wins(tmp_path: Path) -> None:
-    path = tmp_path / "rot.json"
-    store = RotatableSecretStore(base=_BaseStore(), rotation_path=path)
-    # No file yet → base material.
-    assert store.material_for(AC).raw == "OLD"  # type: ignore[union-attr]
-    write_rotation_entry(path, auth_context_id=AC, raw="ROTATED", kind="bearer", principal_label="attacker-b")
-    mat = store.material_for(AC)
-    assert mat is not None and mat.raw == "ROTATED" and mat.kind == "bearer"
+# --- EnvSecretStore --------------------------------------------------------
 
 
 def test_env_secret_store_quoted_cookie_keys_canonical_keeps_wire_raw() -> None:
@@ -297,12 +358,6 @@ def test_env_secret_store_quoted_cookie_keys_canonical_keeps_wire_raw() -> None:
     assert mat.raw == wire  # un-stripped: this is what the Executor sends.
 
 
-def test_rotatable_falls_back_when_no_entry(tmp_path: Path) -> None:
-    store = RotatableSecretStore(base=_BaseStore(), rotation_path=tmp_path / "absent.json")
-    assert store.material_for(AC).raw == "OLD"  # type: ignore[union-attr]
-    assert store.material_for(AuthContextId("unknown")) is None
-
-
 # --- RefreshConfig validation ----------------------------------------------
 
 
@@ -325,3 +380,7 @@ def test_refresh_http_requires_url() -> None:
 
 def test_unused_stream_constant_importable() -> None:
     assert AUTH_REACTIVE_STREAM == "auth-reactive"
+
+
+def test_auth_material_importable() -> None:
+    assert AuthMaterial(kind="bearer", raw="x", principal_label="p").tier == "declared"

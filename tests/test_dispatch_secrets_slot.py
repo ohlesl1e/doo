@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from doo.canonical.identity import (
@@ -14,6 +16,7 @@ from doo.dispatch.secrets import (
     EnvSecretStore,
     SlotMaterialMissing,
     SlotResolvingSecretStore,
+    write_rotation_entry,
 )
 from doo.ids import AuthContextId, EngagementId
 
@@ -69,6 +72,41 @@ def test_slot_mapped_but_no_material_raises() -> None:
     with pytest.raises(SlotMaterialMissing) as exc:
         store.material_for(stale)
     assert exc.value.principal_label == "alice" and exc.value.slot == "cookie"
+
+
+def test_rotation_overlay_wins_over_env_by_slot(tmp_path: Path) -> None:
+    """ADR-0049 / #119: a stale plan-time id maps to its slot; the helper has
+    since rotated that slot and written the rotation file. Overlay wins over
+    the (now-stale) env-by-slot material."""
+    rot = tmp_path / "rotation.json"
+    write_rotation_entry(
+        rot, principal_label="alice", slot="cookie", raw="sid=ROTATED", kind="cookie"
+    )
+    stale = AuthContextId("ac-stale")
+    old_mat = AuthMaterial(kind="cookie", raw="sid=OLD", principal_label="alice")
+    store = SlotResolvingSecretStore(
+        graph_map={stale: ("alice", "cookie")},
+        env=_env_store({}, {("alice", "cookie"): old_mat}),
+        anon_id=ANON,
+        rotation_path=rot,
+    )
+    mat = store.material_for(stale)
+    assert mat is not None
+    assert mat.raw == "sid=ROTATED"
+    assert mat.kind == "cookie"
+    assert mat.principal_label == "alice"
+
+
+def test_slot_store_without_rotation_path_falls_back_to_by_slot() -> None:
+    stale = AuthContextId("ac-stale")
+    old_mat = AuthMaterial(kind="cookie", raw="sid=OLD", principal_label="alice")
+    store = SlotResolvingSecretStore(
+        graph_map={stale: ("alice", "cookie")},
+        env=_env_store({}, {("alice", "cookie"): old_mat}),
+        anon_id=ANON,
+        rotation_path=None,
+    )
+    assert store.material_for(stale) is old_mat
 
 
 def test_env_store_from_config_builds_by_slot() -> None:

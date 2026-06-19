@@ -32,7 +32,6 @@ from doo.dispatch.ontology import NoopBodyStore
 from doo.dispatch.run import RunDependencies, arm_run, execute_run
 from doo.dispatch.secrets import (
     EnvSecretStore,
-    RotatableSecretStore,
     SlotResolvingSecretStore,
     build_declared_slot_map,
 )
@@ -373,12 +372,10 @@ def run_cmd(
             unsafe_stub=unsafe_stub_opa,
         ),
         sender=HttpxSender(),
-        secrets=RotatableSecretStore(
-            base=SlotResolvingSecretStore(
-                graph_map=graph_map,
-                env=EnvSecretStore.from_config(cfg),
-                anon_id=anon,
-            ),
+        secrets=SlotResolvingSecretStore(
+            graph_map=graph_map,
+            env=EnvSecretStore.from_config(cfg),
+            anon_id=anon,
             rotation_path=_rotation_path(),
         ),
         bodies=_build_body_store(),  # type: ignore[arg-type]
@@ -650,7 +647,7 @@ def auth_helper_run_cmd(
     Proactive (per `validity_window_s`) + reactive (consumes the `auth_invalid`
     events the dispatcher emits) rotation, rate-limited per AuthContext. Refresh
     credentials come from THIS process's env. New material lands in the rotation
-    file the dispatcher's `RotatableSecretStore` reads.
+    file the dispatcher's `SlotResolvingSecretStore` reads.
     """
 
     from typing import cast
