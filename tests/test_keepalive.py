@@ -21,17 +21,16 @@ import time
 
 import pytest
 
+from doo.engagement.cli_keepalive import _Neo4jLeaseConfigReader
 from doo.engagement.keepalive import (
     EngagementNotFoundError,
     KeepaliveConfig,
     resolve_keepalive_config,
     run_keepalive,
 )
-from doo.engagement.cli_keepalive import _Neo4jLeaseConfigReader
 from doo.ids import EngagementId
 from doo.infra.redis_lease import LEASE_VALUE_ACTIVE, RedisLease, lease_key
 from doo.setup.config import KillSwitchConfig
-
 
 # --- _Neo4jLeaseConfigReader unit -------------------------------------------
 # Regression for the `TypeError: string indices must be integers` on
