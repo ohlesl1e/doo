@@ -278,6 +278,46 @@ def authbypass_primary(
     )
 
 
+def authz_baseline_anonymous(
+    testcase: DispatchTestCase,
+    evidence: EvidenceObservation,
+    auth: AuthMaterial,
+) -> ConcreteRequest:
+    """Anonymous-baseline probe for priv-esc / boundary tests (#126, ADR-0043).
+
+    Same evidence request as `primary` but with ALL auth stripped (mirrors
+    `authbypass_primary`). Answers "is this endpoint auth-gated at all?" when
+    `baseline_victim` is un-armable (the C2b discovered-tier-victim case,
+    ADR-0049): anon-200-same-body ⇒ CWE-306 (the endpoint has no auth check —
+    a real finding, just not the priv-esc the test was looking for); anon-4xx
+    ⇒ the attacker's credential WAS the gate, and without the victim baseline
+    the priv-esc question is `inconclusive`. Attributed to the engagement's
+    anonymous-singleton AuthContext (so `OBSERVED_UNDER → anon`). The `auth`
+    argument is ignored (no credential is spliced).
+    """
+
+    from doo.canonical.identity import auth_context_id, compute_anonymous_auth_hash
+
+    path, query = _apply_hold(evidence=evidence, hold=testcase.hold)
+    headers = {
+        k: v for k, v in evidence.headers.items() if k.lower() not in _AUTH_HEADERS
+    }
+    return ConcreteRequest(
+        method=evidence.method,
+        host=evidence.host,
+        path=path,
+        path_template=evidence.path_template,
+        query=tuple(sorted(query.items())),
+        headers=tuple(sorted(headers.items())),
+        cookies=(),  # drop the session cookie(s) — anonymous send.
+        body=None,
+        body_content_type=evidence.body_content_type,
+        auth_context_id=auth_context_id(
+            testcase.engagement_id, compute_anonymous_auth_hash()
+        ),
+    )
+
+
 def _swap_path_variable(concrete: str, template: str, replacement: str) -> str:
     """Replace each `{…}`-template segment's concrete value with `replacement`.
 
@@ -323,8 +363,10 @@ _REGISTRY: dict[_Key, Constructor] = {
     _Key("bola", "baseline_negative"): idor_baseline_negative,
     _Key("privilege-escalation", "primary"): idor_primary,
     _Key("privilege-escalation", "baseline_victim"): idor_baseline_victim,
+    _Key("privilege-escalation", "baseline_anonymous"): authz_baseline_anonymous,
     _Key("boundary-violation", "primary"): idor_primary,
     _Key("boundary-violation", "baseline_victim"): idor_baseline_victim,
+    _Key("boundary-violation", "baseline_anonymous"): authz_baseline_anonymous,
     _Key("auth-bypass", "primary"): authbypass_primary,
     _Key("auth-bypass", "baseline_victim"): idor_baseline_victim,
 }

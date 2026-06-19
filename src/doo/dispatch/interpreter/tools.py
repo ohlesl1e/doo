@@ -119,6 +119,14 @@ def send_http_request_within_scope(ctx: ToolContext, *, role: str) -> SendToolRe
                 "bypass."
             )
         material = victim_mat
+    if typed_role == "baseline_anonymous":
+        # The constructor strips all auth; `material` is unused on the wire.
+        # A no-auth sentinel keeps `principal_tier` for the OPA input
+        # consistent with how `auth-bypass primary` already passes the gate
+        # (the attacker's `tier='declared'` flows through; same here, #126).
+        material = AuthMaterial(
+            kind="bearer", raw="", principal_label="anonymous", tier="declared"
+        )
 
     request = construct(ctx.testcase, ctx.evidence, material)
     now = datetime.now(UTC)

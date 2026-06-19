@@ -18,6 +18,7 @@ import pytest
 
 from doo.canonical.value_objects import HostRef
 from doo.dispatch.executor.constructors import (
+    authz_baseline_anonymous,
     idor_baseline_negative,
     idor_baseline_victim,
 )
@@ -174,6 +175,24 @@ def test_idor_baseline_victim_uses_victim_auth_and_victim_ac() -> None:
     assert req.auth_context_id == "ac-victim"
 
 
+def test_authz_baseline_anonymous_strips_all_auth() -> None:
+    """#126: same evidence request as `primary`, NO auth header / cookies,
+    attributed to the engagement's anonymous-singleton AuthContext."""
+    from doo.canonical.identity import auth_context_id, compute_anonymous_auth_hash
+
+    req = authz_baseline_anonymous(
+        _testcase(),
+        _evidence(),
+        AuthMaterial(kind="bearer", raw="ATK", principal_label="b"),  # ignored
+    )
+    assert req.path == "/orders/123"
+    assert "Authorization" not in dict(req.headers)
+    assert req.cookies == ()
+    assert req.auth_context_id == auth_context_id(
+        EngagementId("eng-x"), compute_anonymous_auth_hash()
+    )
+
+
 def test_idor_baseline_negative_swaps_path_variable_to_sentinel() -> None:
     """`baseline_negative`: held `{order_id}` segment → sentinel, attacker's auth."""
     req = idor_baseline_negative(
@@ -224,6 +243,29 @@ def test_send_tool_counts_against_run_budget() -> None:
     assert dict(sender.sent[1].headers).get("Authorization") == "Bearer VIC"
 
 
+def test_send_tool_baseline_anonymous_allowed_for_priv_esc_not_idor() -> None:
+    """#126: `baseline_anonymous` is in priv-esc/boundary's role enum (the
+    confirm-mode boundary), NOT in idor's. The wire send carries no auth."""
+    import dataclasses
+
+    # idor (the default _testcase()) → not in role set.
+    ctx_idor, _, _ = _ctx()
+    with pytest.raises(ToolError, match="confirm-mode boundary"):
+        send_http_request_within_scope(ctx_idor, role="baseline_anonymous")
+
+    # privilege-escalation → allowed; one wire send, no Authorization header.
+    ctx, sender, tracker = _ctx()
+    ctx = dataclasses.replace(
+        ctx,
+        testcase=dataclasses.replace(ctx.testcase, test_class="privilege-escalation"),
+    )
+    out = send_http_request_within_scope(ctx, role="baseline_anonymous")
+    assert out.dispatch_status == "ok"
+    assert tracker.sent == 1
+    assert "Authorization" not in dict(sender.sent[0].headers)
+    assert sender.sent[0].cookies == ()
+
+
 def test_send_tool_baseline_victim_without_victim_material_raises_toolerror() -> None:
     """No declared victim material → surfaced as a `ToolError`, not a crash.
 
@@ -271,16 +313,40 @@ def test_pack_primary_sent_as_none_when_unmigrated() -> None:
     assert pack["primary_sent_as"] is None
 
 
-def test_system_prompt_tells_model_not_to_assume_unauth() -> None:
-    """#124: the prompt names `primary_sent_as`; the auth-bypass guidance no longer
-    hard-codes "NO credential" (that was only true for C1, not C2/C2b)."""
-    from doo.dispatch.interpreter.loop import SYSTEM_PROMPT, system_prompt_for
+def test_system_prompt_names_primary_sent_as() -> None:
+    """#124: the base prompt names `primary_sent_as` (the TestCase's attacker
+    identity). The "do NOT assume unauthenticated" steer applies to the
+    *general* case — per-class guidance overrides for `auth-bypass` (whose
+    constructor strips all auth, so its `primary` IS anonymous on the wire)."""
+    from doo.dispatch.interpreter.loop import SYSTEM_PROMPT
 
     assert "primary_sent_as" in SYSTEM_PROMPT
     assert "do NOT assume it was unauthenticated" in SYSTEM_PROMPT
+
+
+def test_authbypass_guidance_says_no_credential() -> None:
+    """#126 corrects a #124 regression: `authbypass_primary` strips ALL auth
+    regardless of `primary_sent_as`, so the per-class guidance must say so."""
+    from doo.dispatch.interpreter.loop import system_prompt_for
+
     ab = system_prompt_for("auth-bypass")
-    assert "NO credential" not in ab
-    assert "do NOT assume anonymous" in ab
+    assert "NO credential" in ab
+    assert "strips all auth" in ab
+    # `baseline_anonymous` is NOT offered for auth-bypass (primary IS anonymous).
+    assert "baseline_anonymous" not in ab
+
+
+def test_privesc_and_boundary_guidance_offer_baseline_anonymous() -> None:
+    """#126: priv-esc / boundary `primary` splices the attacker's auth, so the
+    anonymous probe is a genuinely-different baseline when victim is un-armable."""
+    from doo.dispatch.interpreter.loop import system_prompt_for
+
+    for cls in ("privilege-escalation", "boundary-violation"):
+        guidance = system_prompt_for(cls)
+        assert "baseline_anonymous" in guidance
+        assert "CWE-306" in guidance
+    # idor/bola unchanged.
+    assert "baseline_anonymous" not in system_prompt_for("idor")
 
 
 def test_read_response_body_unknown_ref_is_tool_error() -> None:
@@ -497,6 +563,23 @@ def test_guard_keeps_vulnerable_when_baseline_ok() -> None:
         },
     )
     assert out is v  # unchanged object
+
+
+def test_guard_keeps_vulnerable_when_baseline_anonymous_ok() -> None:
+    """#126: `baseline_anonymous` reaching `ok` satisfies the differential guard
+    (any non-`primary` `ok` counts)."""
+    from doo.dispatch.run import _guard_differential_verdict
+
+    v = _vuln()
+    out = _guard_differential_verdict(
+        v,
+        test_class="privilege-escalation",
+        sent_roles={
+            "primary": _send("primary"),
+            "baseline_anonymous": _send("baseline_anonymous"),
+        },
+    )
+    assert out is v
 
 
 def test_guard_passthrough_on_non_differential_class() -> None:
