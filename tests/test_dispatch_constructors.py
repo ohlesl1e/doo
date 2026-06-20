@@ -13,9 +13,11 @@ import pytest
 from doo.canonical.value_objects import HostRef
 from doo.dispatch.executor.constructors import (
     ConstructorMissingError,
+    _splice_auth,
     authbypass_primary,
     constructor_for,
     has_constructor,
+    idor_baseline_victim,
     idor_primary,
 )
 from doo.dispatch.executor.evidence import DispatchTestCase, EvidenceObservation
@@ -168,3 +170,70 @@ def test_authbypass_primary_strips_all_credentials() -> None:
     assert req.cookies == ()  # session cookie dropped
     assert headers.get("Accept") == "application/json"  # non-auth header kept
     assert req.auth_context_id == "ac-attacker"  # provenance still the TC's context
+
+
+# ---------------------------------------------------------------------------
+# #135 — `_splice_auth` anonymous arm: "send as anon" = strip auth, add nothing.
+# ---------------------------------------------------------------------------
+
+
+def test_splice_auth_anonymous_strips_and_adds_nothing() -> None:
+    """`kind='anonymous'`: every evidence auth carrier is dropped and no carrier
+    is added back. The session cookie is dropped too (when named).
+    """
+    h, c = _splice_auth(
+        headers={"Authorization": "Bearer victim-tok", "Accept": "*/*"},
+        cookies={"sid": "victim-sess", "ui_theme": "dark"},
+        material=AuthMaterial(
+            kind="anonymous", raw="", principal_label="anonymous"
+        ),
+        session_cookie_name="sid",
+    )
+    assert "Authorization" not in h
+    assert "X-API-Key" not in h
+    assert h.get("Accept") == "*/*"  # non-auth headers preserved
+    assert "sid" not in c
+    assert c.get("ui_theme") == "dark"  # non-session cookies preserved
+
+
+def test_idor_baseline_victim_with_anonymous_material_is_no_auth_send() -> None:
+    """#135 repro: `('auth-bypass', 'baseline_victim')` → `idor_baseline_victim`.
+    When the victim is the anonymous AC, the baseline send must carry NO auth
+    header — not the degenerate `Authorization: Bearer ` the placeholder
+    `kind='bearer', raw=''` previously produced.
+    """
+    anon = AuthMaterial(kind="anonymous", raw="", principal_label="anonymous")
+    ev = _evidence(
+        headers={"Authorization": "Bearer victim-tok", "Accept": "application/json"},
+        cookies={"session": "victim-sess"},
+    )
+    req = idor_baseline_victim(_testcase(test_class="auth-bypass"), ev, anon)
+
+    headers = dict(req.headers)
+    assert "Authorization" not in headers
+    assert "X-API-Key" not in headers
+    assert headers.get("Accept") == "application/json"
+    # `OBSERVED_UNDER` the victim's (anon) AC, not the TestCase's attacker AC.
+    assert req.auth_context_id == "ac-victim"
+
+
+@pytest.mark.parametrize(
+    "kind", ["bearer", "basic_auth", "api_key", "cookie", "anonymous"]
+)
+def test_splice_auth_never_emits_empty_carrier(kind: str) -> None:
+    """Guard against the #135 shape recurring under any kind: a non-anonymous
+    `raw` is non-empty by construction (env-derived), and `anonymous` adds no
+    carrier at all — so no header value ends in a bare scheme + space, and no
+    cookie value is the empty string.
+    """
+    raw = "" if kind == "anonymous" else "TOKEN"
+    h, c = _splice_auth(
+        headers={"Authorization": "Bearer evidence-tok"},
+        cookies={"sid": "evidence-sess"},
+        material=AuthMaterial(kind=kind, raw=raw, principal_label="p"),  # type: ignore[arg-type]
+        session_cookie_name="sid",
+    )
+    for v in h.values():
+        assert not v.endswith(" "), f"{kind}: header value {v!r} has trailing space"
+    for v in c.values():
+        assert v != "", f"{kind}: empty cookie value"

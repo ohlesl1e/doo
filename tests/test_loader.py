@@ -421,6 +421,20 @@ def test_declared_auth_context_slot_defaults_to_kind() -> None:
     assert cfg.principals[0].auth_contexts[0].slot == "cookie"
 
 
+def test_declared_auth_context_rejects_anonymous_kind() -> None:
+    """#135: `'anonymous'` is in `AuthContextKind` so `AuthMaterial.kind` can carry
+    it, but it is never a *declared* credential — config rejects it.
+    """
+    from pydantic import ValidationError
+
+    d = _base_config_dict()
+    d["principals"] = [
+        {"label": "alice", "auth_contexts": [{"kind": "anonymous", "token": "${TOK}"}]}
+    ]
+    with pytest.raises(ValidationError, match="reserved for the no-auth sentinel"):
+        _build_config(d)
+
+
 def test_declared_auth_context_explicit_slot_kept() -> None:
     """An explicit `slot:` overrides the kind default."""
     d = _base_config_dict()

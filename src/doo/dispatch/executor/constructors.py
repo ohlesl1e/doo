@@ -56,7 +56,8 @@ def _splice_auth(
     """Swap the auth-carrying header/cookie to `material`; strip other auth.
 
     `bearer` / `basic_auth` / `api_key` → an `Authorization` (or kind-specific)
-    header. `cookie` → the engagement's `session_cookie_names[0]`. Any *other*
+    header. `cookie` → the engagement's `session_cookie_names[0]`. `anonymous` →
+    **nothing added** (the strip below IS the no-auth send, #135). Any *other*
     auth-shaped header from the evidence is dropped so the victim's credential
     cannot ride along (which would mask an authz hole).
     """
@@ -67,6 +68,12 @@ def _splice_auth(
     if session_cookie_name is not None:
         c.pop(session_cookie_name, None)
 
+    if material.kind == "anonymous":
+        # No carrier added back — "send as anonymous" means the stripped request.
+        # Guarding this explicitly (rather than relying on a placeholder kind)
+        # is the #135 fix: a placeholder `kind='bearer', raw=''` previously fell
+        # through and emitted `Authorization: Bearer ` which strict edges drop.
+        return h, c
     if material.kind == "bearer":
         h["Authorization"] = f"Bearer {material.raw}"
     elif material.kind == "basic_auth":

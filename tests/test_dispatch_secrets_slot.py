@@ -53,6 +53,9 @@ def test_anonymous_short_circuits() -> None:
     )
     out = store.material_for(ANON)
     assert out is not None and out.principal_label == "anonymous" and out.raw == ""
+    # #135: `kind='anonymous'` so `_splice_auth` strips-and-adds-nothing instead
+    # of falling through a placeholder `'bearer'` arm.
+    assert out.kind == "anonymous"
 
 
 def test_unknown_id_returns_none() -> None:

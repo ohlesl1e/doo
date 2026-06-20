@@ -34,8 +34,9 @@ class AuthMaterial:
 
     `kind` says where to splice it (`bearer` → `Authorization: Bearer <raw>`;
     `cookie` → the `session_cookie_names[0]` cookie; `api_key` → the declared
-    header; `basic_auth` → `Authorization: Basic <raw>`). `principal_label` and
-    `tier` ride along for the OPA `principal_tier` field (ADR-0046).
+    header; `basic_auth` → `Authorization: Basic <raw>`; `anonymous` → nothing
+    spliced, evidence auth stripped — #135). `principal_label` and `tier` ride
+    along for the OPA `principal_tier` field (ADR-0046).
     """
 
     kind: AuthContextKind
@@ -193,9 +194,12 @@ class SlotResolvingSecretStore:
 
     def material_for(self, auth_context_id: AuthContextId) -> AuthMaterial | None:
         if auth_context_id == self.anon_id:
-            # The anon constructors ignore `auth`; placeholder satisfies the
-            # `AuthMaterial` Literal type and the OPA `principal_tier` field.
-            return AuthMaterial(kind="bearer", raw="", principal_label="anonymous")
+            # `kind='anonymous'` (#135): `_splice_auth` strips evidence auth and
+            # adds nothing. The OPA `principal_tier` field still reads
+            # `principal_label='anonymous'`.
+            return AuthMaterial(
+                kind="anonymous", raw="", principal_label="anonymous"
+            )
         slot_key = self.graph_map.get(auth_context_id)
         if slot_key is not None:
             entry = self._overlay().get(f"{slot_key[0]}:{slot_key[1]}")

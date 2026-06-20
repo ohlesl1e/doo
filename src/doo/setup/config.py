@@ -238,8 +238,12 @@ class EngagementMeta(BaseModel):
 
 # Auth schemes a tester may declare for a Principal's AuthContext. These are the
 # token *kinds* understood by the L2 secrets-hashing boundary (ADR-0015) and the
-# `auth_hash` identity rule (ADR-0017).
-AuthContextKind = Literal["bearer", "cookie", "api_key", "basic_auth"]
+# `auth_hash` identity rule (ADR-0017). `"anonymous"` is the no-credential
+# sentinel (#135) — never declared in config (the validator below rejects it),
+# but admitted as an `AuthMaterial.kind` so `_splice_auth` can treat "send as
+# anonymous" as "strip auth, add nothing" instead of falling through a
+# placeholder branch.
+AuthContextKind = Literal["bearer", "cookie", "api_key", "basic_auth", "anonymous"]
 
 # `${ENV_VAR}` reference. Tokens never appear inline per ADR-0012 — only the name
 # of the environment variable the loader resolves at load time.
@@ -337,6 +341,19 @@ class DeclaredAuthContext(BaseModel):
     def _default_slot_to_kind(self) -> Self:
         if self.slot is None:
             object.__setattr__(self, "slot", self.kind)
+        return self
+
+    @model_validator(mode="after")
+    def _kind_is_not_anonymous(self) -> Self:
+        # `'anonymous'` is in `AuthContextKind` so `AuthMaterial.kind` can carry
+        # it (#135), but it is never a *declared* credential — the anonymous
+        # singleton is minted by ingestion, not config.
+        if self.kind == "anonymous":
+            raise ValueError(
+                "auth_contexts[].kind 'anonymous' is reserved for the no-auth "
+                "sentinel; declare a real credential kind (bearer/cookie/"
+                "api_key/basic_auth)"
+            )
         return self
 
     @model_validator(mode="after")
