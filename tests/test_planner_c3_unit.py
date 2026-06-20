@@ -24,7 +24,13 @@ from doo.planner.models import (
 _VALUE_HASH = Sha256Hex("a" * 64)
 
 
-def _pack(*, with_value: bool = True, target_kind: str = "parameter") -> ContextPack:
+def _pack(
+    *,
+    with_value: bool = True,
+    target_kind: str = "parameter",
+    auth_tier: str | None = "declared",
+    auth_slot: str | None = "cookie",
+) -> ContextPack:
     return ContextPack(
         engagement_id=EngagementId("eng-1"),
         candidate_kind="C3",
@@ -48,9 +54,10 @@ def _pack(*, with_value: bool = True, target_kind: str = "parameter") -> Context
             PackAuthContext(
                 handle="A1",
                 principal_label="user",
+                tier=auth_tier,
                 is_attacker_candidate=False,
                 auth_context_id=AuthContextId("ac-user"),
-                slot="cookie",
+                slot=auth_slot,
             ),
         ),
         observed_value_hash=_VALUE_HASH if with_value else None,
@@ -118,3 +125,44 @@ def test_resolve_c3_classifies_leak_replay_default() -> None:
     proposal = resolve_c3_draft(_pack(), _draft(test_class="leak_replay"))
     assert isinstance(proposal, PlannerProposal)
     assert proposal.test_class == "leak_replay"
+
+
+def test_resolve_c3_rejects_discovered_tier_send_as() -> None:
+    """#129: a discovered-tier send-as AC carries `slot=None` (the assembler's
+    tier-aware projection guarantees this) and is rejected as un-armable, so the
+    proposal never commits with an `auth_context_id` the dispatcher can't slot-
+    resolve. ADR-0049: slot-resolution is total over committed `tc.auth_context_id`.
+    """
+    out = resolve_c3_draft(
+        _pack(auth_tier="discovered", auth_slot=None), _draft(test_class="idor")
+    )
+    assert isinstance(out, DraftRejected) and out.code == "attacker_no_slot"
+    # The reason carries the tier and is NOT the hallucination-guard's "...not a
+    # handle present in the context pack" suffix (#129 drive-by: `_reject_no_slot`
+    # is its own builder; `_reject` is for `unknown_*` codes only).
+    assert "tier='discovered'" in out.reason
+    assert "hallucinated" not in out.reason
+
+
+def test_resolve_c3_accepts_anonymous_send_as() -> None:
+    """#129: `tier='anonymous'` is armable (the dispatcher's no-auth short-circuit)
+    and surfaces `slot='anonymous'` (the ADR-0049 sentinel), so the resolver
+    accepts it. Only `tier='discovered'` is the un-armable case.
+    """
+    proposal = resolve_c3_draft(
+        _pack(auth_tier="anonymous", auth_slot="anonymous"), _draft()
+    )
+    assert isinstance(proposal, PlannerProposal)
+    assert proposal.attacker_slot == "anonymous"
+
+
+def test_resolve_c3_accepts_pre_adr0049_declared_via_token_kind_fallback() -> None:
+    """#129: the `coalesce(ac.slot, ac.token_kind)` fallback still applies to a
+    *declared* AC that predates ADR-0049 (no explicit `slot` property on the node);
+    the assembler surfaces `slot=<token_kind>` and the resolver accepts it.
+    """
+    proposal = resolve_c3_draft(
+        _pack(auth_tier="declared", auth_slot="bearer"), _draft()
+    )
+    assert isinstance(proposal, PlannerProposal)
+    assert proposal.attacker_slot == "bearer"

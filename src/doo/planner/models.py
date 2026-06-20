@@ -333,8 +333,10 @@ class PackAuthContext(BaseModel):
     auth_context_id: AuthContextId
     # ADR-0049: the credential slot — the rotation-stable half of the attacker
     # identity `(principal_label, slot)`. Resolver-side only; NEVER serialised to
-    # the LLM. `None` for a discovered-tier or pre-ADR-0049 AuthContext (the
-    # resolver rejects an attacker pick whose slot is None).
+    # the LLM. `None` ⇔ NOT a declared credential (un-armable as the attacker
+    # side); the assembler is responsible for never coalescing a discovered-tier
+    # AC's `token_kind` into this field (#129). The resolver rejects an attacker
+    # pick whose slot is None.
     slot: str | None = None
     # Optional human-readable label for the prompt (e.g. `"scope-weaker-tier"`,
     # `"tenant:42"`) when the real `principal_label` would be opaque or repetitive.

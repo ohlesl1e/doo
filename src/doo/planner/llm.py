@@ -642,11 +642,7 @@ def resolve_draft(
     if auth.tier != "declared":
         return _reject_non_declared(pack, draft, auth)
     if auth.slot is None:
-        return _reject(
-            "attacker_no_slot", pack, draft,
-            f"auth_context_ref {draft.auth_context_ref!r} has no credential slot "
-            "(discovered-tier or pre-ADR-0049 node)",
-        )
+        return _reject_no_slot(pack, draft, auth)
 
     held: list[str] = []
     for h in draft.hold:
@@ -717,11 +713,7 @@ def resolve_c3_draft(
     if auth is None:
         return _reject("unknown_auth", pack, draft, f"auth_context_ref {draft.auth_context_ref!r}")
     if auth.slot is None:
-        return _reject(
-            "attacker_no_slot", pack, draft,
-            f"auth_context_ref {draft.auth_context_ref!r} has no credential slot "
-            "(discovered-tier or pre-ADR-0049 node)",
-        )
+        return _reject_no_slot(pack, draft, auth)
 
     return PlannerProposal(
         engagement_id=pack.engagement_id,
@@ -766,11 +758,7 @@ def resolve_sink_draft(
     if auth is None:
         return _reject("unknown_auth", pack, draft, f"auth_context_ref {draft.auth_context_ref!r}")
     if auth.slot is None:
-        return _reject(
-            "attacker_no_slot", pack, draft,
-            f"auth_context_ref {draft.auth_context_ref!r} has no credential slot "
-            "(discovered-tier or pre-ADR-0049 node)",
-        )
+        return _reject_no_slot(pack, draft, auth)
 
     return PlannerProposal(
         engagement_id=pack.engagement_id,
@@ -828,6 +816,32 @@ def _reject_non_declared(
         tier=auth.tier,
     )
     return DraftRejected(code="non_declared_attacker", reason=reason)
+
+
+def _reject_no_slot(
+    pack: ContextPack, draft: LLMProposalDraft, auth: PackAuthContext
+) -> DraftRejected:
+    """Reject an attacker pick whose `slot is None` — un-armable (ADR-0049, #129).
+
+    Distinct from the hallucination-guard `_reject` (which appends a "...not a
+    handle present in the pack" suffix that's wrong here): the handle IS in the
+    pack, it just resolves to a discovered-tier AC the dispatcher cannot arm.
+    """
+
+    reason = (
+        f"auth_context_ref {draft.auth_context_ref!r} (tier={auth.tier!r}) has no "
+        "credential slot — un-armable as the attacker (discovered-tier, or a "
+        "pre-ADR-0049 declared node missing both slot and token_kind)"
+    )
+    log.warning(
+        "planner.llm.draft_rejected",
+        engagement_id=pack.engagement_id,
+        code="attacker_no_slot",
+        reason=reason,
+        auth_handle=auth.handle,
+        tier=auth.tier,
+    )
+    return DraftRejected(code="attacker_no_slot", reason=reason)
 
 
 # Structural type for `_hold_label` (a PackTarget); avoids importing the concrete
