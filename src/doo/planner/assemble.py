@@ -78,7 +78,12 @@ class _AuthView:
     tier: str | None
     claims_summary: str | None
     # ADR-0049: the credential slot (rotation-stable attacker-identity half).
-    # `None` for a discovered-tier / pre-ADR-0049 node.
+    # `None` ⇔ un-armable as the attacker side. The Cypher projections in this
+    # module are responsible for that contract: the `coalesce(ac.slot,
+    # ac.token_kind)` fallback (for pre-ADR-0049 declared nodes) is gated on
+    # `ac.tier` so a discovered-tier AC never surfaces a non-None slot (#129).
+    # `tier='anonymous'` resolves to the `'anonymous'` sentinel — armable
+    # (the dispatcher's no-auth short-circuit), reserved in `setup/config.py`.
     slot: str | None = None
 
 
@@ -120,7 +125,10 @@ def _fetch_principal_auth(
                ac.tier AS tier,
                ac.is_anonymous AS is_anonymous,
                ac.identity_claims AS identity_claims,
-               coalesce(ac.slot, ac.token_kind) AS slot
+               CASE ac.tier
+                 WHEN 'declared' THEN coalesce(ac.slot, ac.token_kind)
+                 WHEN 'anonymous' THEN 'anonymous'
+               END AS slot
         ORDER BY coalesce(ac.is_anonymous, false) ASC, ac.tier ASC, ac.id ASC
         LIMIT 1
         """,
@@ -146,9 +154,10 @@ def _fetch_send_as_auth(
     C3 is not an authz swap: the leaked value is replayed *as* some identity. We
     pick, deterministically, one active AuthContext that was `OBSERVED_UNDER` a
     request that `HIT` the (input) endpoint — the natural identity the input is
-    sent under — preferring a real token over the anonymous singleton, then by id.
-    Returns the `_AuthView` + the principal's display label, or None when none
-    resolves.
+    sent under — preferring a real token over the anonymous singleton, then a
+    **declared** credential over a discovered one (#129: a discovered AC is
+    un-armable, ADR-0049), then by id. Returns the `_AuthView` + the principal's
+    display label, or None when none resolves.
     """
 
     frag = for_engagement(engagement_id, var="r")
@@ -159,9 +168,12 @@ def _fetch_send_as_auth(
         {frag.and_("r.status = 'active' AND e.status = 'active' AND ac.status = 'active' AND p.status = 'active'")}
         RETURN ac.id AS id, ac.tier AS tier, ac.identity_claims AS identity_claims,
                coalesce(ac.is_anonymous, false) AS ac_anon,
-               coalesce(ac.slot, ac.token_kind) AS slot,
+               CASE ac.tier
+                 WHEN 'declared' THEN coalesce(ac.slot, ac.token_kind)
+                 WHEN 'anonymous' THEN 'anonymous'
+               END AS slot,
                p.is_anonymous AS p_anon, p.label AS label, p.identity_key AS identity_key
-        ORDER BY ac_anon ASC, ac.id ASC
+        ORDER BY ac_anon ASC, ac.tier ASC, ac.id ASC
         LIMIT 1
         """,
         endpoint_id=endpoint_id,
@@ -733,7 +745,11 @@ def _capability_auth_contexts(
               (ac:AuthContext)-[:OF_PRINCIPAL]->(p:Principal)
         {frag.and_("(ac.status IS NULL OR ac.status = 'active')")}
         RETURN ac.id AS id, ac.identity_claims AS claims, ac.tier AS tier,
-               p.label AS p_label, coalesce(ac.slot, ac.token_kind) AS slot
+               p.label AS p_label,
+               CASE ac.tier
+                 WHEN 'declared' THEN coalesce(ac.slot, ac.token_kind)
+                 WHEN 'anonymous' THEN 'anonymous'
+               END AS slot
         ORDER BY ac.id
         """,
         tbid=boundary_id,
@@ -794,7 +810,11 @@ def _tenant_auth_contexts(
             MATCH (t:Tenant {{id: $tid}})<-[:OF_TENANT]-(p:Principal)<-[:OF_PRINCIPAL]-(ac:AuthContext)
             {afrag.and_("(ac.status IS NULL OR ac.status = 'active')")}
             RETURN ac.id AS id, ac.tier AS tier, ac.identity_claims AS claims,
-                   p.label AS p_label, coalesce(ac.slot, ac.token_kind) AS slot
+                   p.label AS p_label,
+                   CASE ac.tier
+                     WHEN 'declared' THEN coalesce(ac.slot, ac.token_kind)
+                     WHEN 'anonymous' THEN 'anonymous'
+                   END AS slot
             ORDER BY coalesce(ac.is_anonymous, false) ASC, ac.id ASC
             LIMIT 1
             """,
