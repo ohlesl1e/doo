@@ -291,7 +291,8 @@ def test_c2b_proposal_is_stamped_generator_c2b() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 3. #110 resolver guard: the chosen attacker auth must be declared-tier.
+# 3. #110/#131 resolver guard: the chosen attacker auth must be an ARMABLE tier
+#    (declared / anonymous). Discovered / None are rejected.
 # ---------------------------------------------------------------------------
 
 
@@ -300,9 +301,9 @@ def _c2b_pack_with_a2_tier(tier: str | None) -> ContextPack:
 
     base = _c2b_pack()
     a1, a2 = base.auth_contexts
-    # A non-declared tier carries no slot (ADR-0049: discovered-tier ACs are
-    # un-armable so have no credential slot).
-    a2_slot = "cookie" if tier == "declared" else None
+    # ADR-0049: an armable tier carries a slot (declared → its credential slot;
+    # anonymous → the 'anonymous' sentinel). Discovered / unknown → None.
+    a2_slot = {"declared": "cookie", "anonymous": "anonymous"}.get(tier or "")
     return base.model_copy(
         update={
             "auth_contexts": (
@@ -320,14 +321,14 @@ def test_resolve_draft_rejects_discovered_tier_attacker() -> None:
         _c2b_pack_with_a2_tier("discovered"), _c2b_draft(), generator="c2b"
     )
     assert isinstance(out, DraftRejected)
-    assert out.code == "non_declared_attacker"
+    assert out.code == "unarmable_attacker"
     assert "'A2'" in out.reason and "'discovered'" in out.reason
 
 
 def test_resolve_draft_rejects_none_tier_attacker() -> None:
     out = resolve_draft(_c2b_pack_with_a2_tier(None), _c2b_draft(), generator="c2b")
     assert isinstance(out, DraftRejected)
-    assert out.code == "non_declared_attacker"
+    assert out.code == "unarmable_attacker"
 
 
 def test_resolve_draft_accepts_declared_tier_attacker() -> None:
@@ -338,9 +339,21 @@ def test_resolve_draft_accepts_declared_tier_attacker() -> None:
     assert isinstance(out, PlannerProposal)
 
 
+def test_resolve_draft_accepts_anonymous_tier_attacker() -> None:
+    """#131: `tier='anonymous'` is armable (the dispatcher's no-auth short-circuit)
+    so the C2/C2b/C4 resolver accepts it; the auth-bypass shape is proposable.
+    """
+    out = resolve_draft(
+        _c2b_pack_with_a2_tier("anonymous"), _c2b_draft(), generator="c2b"
+    )
+    assert isinstance(out, PlannerProposal)
+    assert out.attacker_slot == "anonymous"
+
+
 # ---------------------------------------------------------------------------
-# 4. #110 assembly filter: only declared-tier ACs are offered as attacker
-#    candidates; an all-discovered gap is unproposable (None + structured warn).
+# 4. #110/#131 assembly filter: only ARMABLE-tier ACs (declared / anonymous) are
+#    offered as attacker candidates; an all-discovered gap is unproposable
+#    (None + structured warn).
 # ---------------------------------------------------------------------------
 
 
@@ -384,30 +397,55 @@ def _patch_auth_by_tier(
     monkeypatch.setattr(assemble_mod, "_fetch_exemplar", lambda *a, **k: None)
 
 
-def test_assemble_c2b_marks_only_declared_as_attacker_candidate(
+def test_assemble_c2b_marks_armable_tiers_as_attacker_candidate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # {declared: admin, discovered: outlier} -> both in pack; only admin is a
-    # candidate attacker.
+    # {declared: admin, anonymous: anon, discovered: outlier} -> all three in the
+    # pack; admin + anon are candidate attackers (#131), outlier is evidence-only.
     _patch_auth_by_tier(
-        monkeypatch, {"p-admin": "declared", "p-outlier": "discovered"}
+        monkeypatch,
+        {"p-admin": "declared", "p-anon": "anonymous", "p-outlier": "discovered"},
     )
     pack = assemble_c2b_pack(
         cast("Neo4jClient", None),
-        gap=_c2b_gap("admin", "outlier"),
+        gap=_c2b_gap("admin", "anon", "outlier"),
         code_version="test",
         now=datetime.now(UTC),
     )
     assert pack is not None
     by_label = {a.principal_label: a for a in pack.auth_contexts}
-    assert set(by_label) == {"admin", "outlier"}
+    assert set(by_label) == {"admin", "anon", "outlier"}
     assert by_label["admin"].is_attacker_candidate is True
     assert by_label["admin"].tier == "declared"
+    assert by_label["anon"].is_attacker_candidate is True
+    assert by_label["anon"].tier == "anonymous"
     assert by_label["outlier"].is_attacker_candidate is False
     assert by_label["outlier"].tier == "discovered"
 
 
-def test_assemble_c2b_returns_none_when_no_declared_attacker(
+def test_assemble_c2b_builds_pack_with_only_anonymous_attacker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#131: {anonymous, discovered} → pack (NOT None); anon is the sole candidate
+    and ranks at A1 (rank 1 < discovered's 2).
+    """
+    _patch_auth_by_tier(
+        monkeypatch, {"p-anon": "anonymous", "p-disc": "discovered"}
+    )
+    pack = assemble_c2b_pack(
+        cast("Neo4jClient", None),
+        gap=_c2b_gap("disc", "anon"),  # evidence order disc-first → rank reorders
+        code_version="test",
+        now=datetime.now(UTC),
+    )
+    assert pack is not None
+    by_label = {a.principal_label: a for a in pack.auth_contexts}
+    assert by_label["anon"].is_attacker_candidate is True
+    assert by_label["anon"].handle == "A1"
+    assert by_label["disc"].is_attacker_candidate is False
+
+
+def test_assemble_c2b_returns_none_when_no_armable_attacker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # All reaching principals are discovered-tier -> no controlled credential to
@@ -424,7 +462,7 @@ def test_assemble_c2b_returns_none_when_no_declared_attacker(
         )
     assert pack is None
     events = {entry["event"] for entry in logs}
-    assert "planner.assemble.c2b.no_declared_attacker" in events
+    assert "planner.assemble.c2b.no_armable_attacker" in events
     assert "planner.assemble.c2b.too_few_auth_contexts" not in events
 
 
@@ -549,10 +587,11 @@ def test_holds_outlier_body_serialized_only_when_true() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 4c. #113 handle ordering: A1, A2, ... assigned in attacker-preference order
-#     (declared∧¬outlier → declared∧outlier → discovered), stable within a tier,
-#     so a positionally-biased weak model defaults to a meaningful pick. Pure
-#     reorder — same entries, same flag values; exemplar selection unaffected.
+# 4c. #113/#131 handle ordering: A1, A2, ... assigned in attacker-preference
+#     order (declared∧¬outlier → declared∧outlier → anonymous → discovered),
+#     stable within a rank, so a positionally-biased weak model defaults to a
+#     meaningful pick. Pure reorder — same entries, same flag values; exemplar
+#     selection unaffected.
 # ---------------------------------------------------------------------------
 
 
@@ -641,6 +680,21 @@ def test_c2b_handles_stable_on_tie(monkeypatch: pytest.MonkeyPatch) -> None:
         ("A3", "system-test"),
         ("A4", "guest"),
     ]
+
+
+def test_c2b_handles_rank_anonymous_between_declared_and_discovered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#131: the 3-way rank `declared(0) < anonymous(1) < discovered(2)`. All-
+    distinct bodies → tie → no outlier → rank is the only sort key. Evidence order
+    is reverse-rank (disc, anon, decl) → handles should fully reorder.
+    """
+    order = _handle_order(
+        monkeypatch,
+        bodies={"disc": "X", "anon": "Y", "decl": "Z"},
+        tiers={"disc": "discovered", "anon": "anonymous", "decl": "declared"},
+    )
+    assert order == [("A1", "decl"), ("A2", "anon"), ("A3", "disc")]
 
 
 def test_c2b_exemplar_independent_of_handle_order(

@@ -28,6 +28,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from doo.observability.logging import get_logger
 from doo.planner.models import (
+    ARMABLE_ATTACKER_TIERS,
     ContextPack,
     GeneratorId,
     LLMProposalDraft,
@@ -604,8 +605,9 @@ class DraftRejected:
     """A draft whose handles do not resolve against the pack (ADR-0037).
 
     `code` is a stable discriminator (`unknown_target`, `unknown_auth`,
-    `unknown_hold`, `non_declared_attacker`); the proposal is discarded and logged,
-    never committed.
+    `unknown_hold`, `unarmable_attacker`, `attacker_no_slot`,
+    `missing_observed_value`); the proposal is discarded and logged, never
+    committed.
     """
 
     code: str
@@ -620,9 +622,10 @@ def resolve_draft(
     Shared by C2 / C2b (endpoint target) and the capability/tenant **boundary**
     generators (a `boundary` target → `TARGETS_BOUNDARY`, ADR-0039). Rejects any
     handle absent from the pack (hallucination guard) before building the proposal,
-    and rejects an attacker `auth_context_ref` whose tier is not `"declared"`
-    (defense-in-depth: an authz replay only ever swaps in a credential the tester
-    controls — ADR-0010/0048; the assembler should already have withheld
+    and rejects an attacker `auth_context_ref` whose tier is not **armable**
+    (`ARMABLE_ATTACKER_TIERS` = declared / anonymous — defense-in-depth: an authz
+    replay only ever swaps in a credential the tester controls or can omit,
+    ADR-0010/0048/0049; the assembler should already have withheld
     `is_attacker_candidate`, this guard catches a model that picks one anyway).
     `payload_class`/`payload_spec` are fixed for an authz replay (`auth-token-swap` /
     `none`); `hold` handles resolve to human-readable labels. `generator` stamps the
@@ -639,8 +642,8 @@ def resolve_draft(
     auth = auths.get(draft.auth_context_ref)
     if auth is None:
         return _reject("unknown_auth", pack, draft, f"auth_context_ref {draft.auth_context_ref!r}")
-    if auth.tier != "declared":
-        return _reject_non_declared(pack, draft, auth)
+    if auth.tier not in ARMABLE_ATTACKER_TIERS:
+        return _reject_unarmable_attacker(pack, draft, auth)
     if auth.slot is None:
         return _reject_no_slot(pack, draft, auth)
 
@@ -799,23 +802,23 @@ def _reject(
     return DraftRejected(code=code, reason=reason)
 
 
-def _reject_non_declared(
+def _reject_unarmable_attacker(
     pack: ContextPack, draft: LLMProposalDraft, auth: PackAuthContext
 ) -> DraftRejected:
     reason = (
-        f"auth_context_ref {draft.auth_context_ref!r} (tier={auth.tier!r}) is not a "
-        "declared-tier AuthContext; an authz replay only swaps in a credential the "
-        "tester controls"
+        f"auth_context_ref {draft.auth_context_ref!r} (tier={auth.tier!r}) is not an "
+        "armable AuthContext (declared/anonymous); an authz replay only swaps in a "
+        "credential the tester controls or can omit"
     )
     log.warning(
         "planner.llm.draft_rejected",
         engagement_id=pack.engagement_id,
-        code="non_declared_attacker",
+        code="unarmable_attacker",
         reason=reason,
         auth_handle=auth.handle,
         tier=auth.tier,
     )
-    return DraftRejected(code="non_declared_attacker", reason=reason)
+    return DraftRejected(code="unarmable_attacker", reason=reason)
 
 
 def _reject_no_slot(

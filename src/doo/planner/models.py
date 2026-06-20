@@ -301,6 +301,13 @@ class PackTarget(BaseModel):
         return d
 
 
+#: AuthContext tiers the dispatcher can arm as the attacker side of an authz
+#: replay (ADR-0049). `'declared'` = a credential the tester controls;
+#: `'anonymous'` = no credential (the no-auth sentinel, trivially controlled).
+#: `'discovered'` / `None` are evidence-only — un-armable (#110, #131).
+ARMABLE_ATTACKER_TIERS: frozenset[str] = frozenset({"declared", "anonymous"})
+
+
 class PackAuthContext(BaseModel):
     """One AuthContext the LLM may pick as the attacker side, by `handle`.
 
@@ -333,10 +340,10 @@ class PackAuthContext(BaseModel):
     auth_context_id: AuthContextId
     # ADR-0049: the credential slot — the rotation-stable half of the attacker
     # identity `(principal_label, slot)`. Resolver-side only; NEVER serialised to
-    # the LLM. `None` ⇔ NOT a declared credential (un-armable as the attacker
-    # side); the assembler is responsible for never coalescing a discovered-tier
-    # AC's `token_kind` into this field (#129). The resolver rejects an attacker
-    # pick whose slot is None.
+    # the LLM. `None` ⇔ un-armable as the attacker (discovered-tier or unknown);
+    # the assembler is responsible for never coalescing a discovered-tier AC's
+    # `token_kind` into this field (#129). The resolver rejects an attacker pick
+    # whose slot is None.
     slot: str | None = None
     # Optional human-readable label for the prompt (e.g. `"scope-weaker-tier"`,
     # `"tenant:42"`) when the real `principal_label` would be opaque or repetitive.
