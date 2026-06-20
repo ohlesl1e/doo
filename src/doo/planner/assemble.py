@@ -108,17 +108,33 @@ def _summarise_claims(identity_claims_json: object) -> str | None:
 
 
 def _fetch_principal_auth(
-    client: Neo4jClient, engagement_id: EngagementId, principal_id: str
+    client: Neo4jClient,
+    engagement_id: EngagementId,
+    principal_id: str,
+    *,
+    prefer_token_kind: str | None = None,
 ) -> _AuthView | None:
     """Resolve one active AuthContext for a principal (the replay token handle).
 
     A principal may hold several AuthContexts; we pick one deterministically,
-    preferring a real (non-anonymous) token over the anonymous singleton, then by
-    `id` for stability. Returns None when the principal has no active AuthContext
-    (a Principal is always created from one, so this is the defensive empty case).
+    preferring a real (non-anonymous) token over the anonymous singleton, then a
+    declared/anonymous AC over a discovered one (`ac.tier ASC`), then — when
+    `prefer_token_kind` is set (ADR-0050) — an AC of that `token_kind` over any
+    other, with the AC whose `slot` literal *equals* the kind (the ADR-0049
+    default-slot convention) preferred among same-kind ACs. When the Principal
+    declares ≥2 slots of the same kind and neither's `slot` equals the kind, the
+    `ac.id` tie-break decides — deterministic but arbitrary; document in the
+    proposal's justification if it matters. `prefer_token_kind=None` (the C2/C2b
+    callers) keeps the pre-ADR-0050 ordering exactly.
+
+    Returns None when the principal has no active AuthContext (a Principal is
+    always created from one, so this is the defensive empty case).
     """
 
     frag = for_engagement(engagement_id, var="ac")
+    # `prefer_token_kind` adds two boolean DESC terms ahead of the `ac.id`
+    # tie-break; with `$kind = null` both compare against null → null → all rows
+    # tie on those terms → ordering collapses to the pre-ADR-0050 shape.
     rows = client.execute_read(
         f"""
         MATCH (ac:AuthContext)-[:OF_PRINCIPAL]->(p:Principal {{id: $principal_id}})
@@ -131,10 +147,15 @@ def _fetch_principal_auth(
                  WHEN 'declared' THEN coalesce(ac.slot, ac.token_kind)
                  WHEN 'anonymous' THEN 'anonymous'
                END AS slot
-        ORDER BY coalesce(ac.is_anonymous, false) ASC, ac.tier ASC, ac.id ASC
+        ORDER BY coalesce(ac.is_anonymous, false) ASC,
+                 ac.tier ASC,
+                 (ac.token_kind = $kind) DESC,
+                 (coalesce(ac.slot, ac.token_kind) = $kind) DESC,
+                 ac.id ASC
         LIMIT 1
         """,
         principal_id=principal_id,
+        kind=prefer_token_kind,
         **frag.parameters,
     )
     if not rows:
@@ -153,13 +174,25 @@ def _fetch_send_as_auth(
 ) -> tuple[_AuthView, str] | None:
     """Resolve one identity that hit the endpoint — the C3 'send-as' auth context.
 
-    C3 is not an authz swap: the leaked value is replayed *as* some identity. We
-    pick, deterministically, one active AuthContext that was `OBSERVED_UNDER` a
-    request that `HIT` the (input) endpoint — the natural identity the input is
-    sent under — preferring a real token over the anonymous singleton, then a
-    **declared** credential over a discovered one (#129: a discovered AC is
-    un-armable, ADR-0049), then by id. Returns the `_AuthView` + the principal's
-    display label, or None when none resolves.
+    C3 is not an authz swap: the leaked value is replayed *as* some identity. Per
+    ADR-0050 the send-as identity is the **Principal** that reached the endpoint
+    (CONTEXT.md: *reached* is defined as a Principal), and the AC is resolved from
+    that Principal exactly as C2/C2b do — so a discovered cookie of a declared
+    Principal yields the Principal's *declared* AC (the armable resolution handle),
+    not the observed token snapshot.
+
+    Two steps:
+      1. Rank the **distinct Principals** whose AuthContexts were `OBSERVED_UNDER` a
+         request that `HIT` the endpoint: declared > anonymous > discovered (mirrors
+         `ARMABLE_ATTACKER_TIERS` at the Principal level), tie-break `p.label`.
+         For the top Principal, also surface one observed `ac.token_kind` (the
+         auth mechanism the traffic used).
+      2. Resolve that Principal's armable AC via
+         `_fetch_principal_auth(p.id, prefer_token_kind=<observed kind>)`.
+
+    Returns the `_AuthView` (which may be `slot=None` when the top Principal is
+    discovered/non-anon — `resolve_c3_draft` then rejects with `attacker_no_slot`)
+    + the principal's display label, or `None` when nothing hit the endpoint.
     """
 
     frag = for_engagement(engagement_id, var="r")
@@ -168,14 +201,17 @@ def _fetch_send_as_auth(
         MATCH (r:RequestObservation)-[:HIT]->(e:Endpoint {{id: $endpoint_id}}),
               (r)-[:OBSERVED_UNDER]->(ac:AuthContext)-[:OF_PRINCIPAL]->(p:Principal)
         {frag.and_("r.status = 'active' AND e.status = 'active' AND ac.status = 'active' AND p.status = 'active'")}
-        RETURN ac.id AS id, ac.tier AS tier, ac.identity_claims AS identity_claims,
-               coalesce(ac.is_anonymous, false) AS ac_anon,
-               CASE ac.tier
-                 WHEN 'declared' THEN coalesce(ac.slot, ac.token_kind)
-                 WHEN 'anonymous' THEN 'anonymous'
-               END AS slot,
-               p.is_anonymous AS p_anon, p.label AS label, p.identity_key AS identity_key
-        ORDER BY ac_anon ASC, ac.tier ASC, ac.id ASC
+        WITH p,
+             CASE
+               WHEN p.tier = 'declared' THEN 0
+               WHEN coalesce(p.is_anonymous, false) THEN 1
+               ELSE 2
+             END AS p_rank,
+             coalesce(p.label, p.identity_key) AS label,
+             coalesce(p.is_anonymous, false) AS p_anon,
+             collect(DISTINCT ac.token_kind)[0] AS observed_kind
+        RETURN p.id AS principal_id, p_rank, p_anon, label, observed_kind
+        ORDER BY p_rank ASC, label ASC
         LIMIT 1
         """,
         endpoint_id=endpoint_id,
@@ -184,16 +220,20 @@ def _fetch_send_as_auth(
     if not rows:
         return None
     row = rows[0]
-    if bool(row["p_anon"]):
-        label = "anon"
-    else:
-        label = str(row["label"]) if row["label"] else str(row["identity_key"])
-    view = _AuthView(
-        auth_context_id=AuthContextId(str(row["id"])),
-        tier=str(row["tier"]) if row["tier"] is not None else None,
-        claims_summary=_summarise_claims(row["identity_claims"]),
-        slot=str(row["slot"]) if row["slot"] is not None else None,
+    label = "anon" if bool(row["p_anon"]) else str(row["label"])
+    observed_kind = (
+        str(row["observed_kind"]) if row["observed_kind"] is not None else None
     )
+    view = _fetch_principal_auth(
+        client,
+        engagement_id,
+        str(row["principal_id"]),
+        prefer_token_kind=observed_kind,
+    )
+    if view is None:
+        # The Principal hit the endpoint, so it has ≥1 active AC; this is the
+        # defensive empty-after-retraction case.
+        return None
     return view, label
 
 
@@ -799,7 +839,14 @@ def _capability_auth_contexts(
 def _tenant_auth_contexts(
     client: Neo4jClient, engagement_id: EngagementId, boundary_id: str
 ) -> tuple[PackAuthContext, PackAuthContext] | None:
-    """The (victim=tenant-A, attacker=tenant-B) auth contexts of a tenant boundary."""
+    """The (victim=tenant-A, attacker=tenant-B) auth contexts of a tenant boundary.
+
+    Per ADR-0050 the per-tenant identity is resolved **Principal-first**: rank the
+    tenant's Principals (declared > anonymous > discovered, tie-break `p.label`),
+    take the top one, and resolve its armable AC via `_fetch_principal_auth` — so
+    a tenant whose only observed traffic is a discovered cookie of a declared
+    Principal still yields that Principal's declared AC.
+    """
 
     frag = for_engagement(engagement_id, var="tb")
     tenants = client.execute_read(
@@ -815,41 +862,52 @@ def _tenant_auth_contexts(
     if len(tenants) != 2:
         return None
 
-    def _auth_for_tenant(tenant_id: str) -> dict[str, object] | None:
-        afrag = for_engagement(engagement_id, var="ac")
+    def _auth_for_tenant(tenant_id: str) -> tuple[_AuthView, str] | None:
+        pfrag = for_engagement(engagement_id, var="p")
         rows = client.execute_read(
             f"""
-            MATCH (t:Tenant {{id: $tid}})<-[:OF_TENANT]-(p:Principal)<-[:OF_PRINCIPAL]-(ac:AuthContext)
-            {afrag.and_("(ac.status IS NULL OR ac.status = 'active')")}
-            RETURN ac.id AS id, ac.tier AS tier, ac.identity_claims AS claims,
-                   p.label AS p_label,
-                   CASE ac.tier
-                     WHEN 'declared' THEN coalesce(ac.slot, ac.token_kind)
-                     WHEN 'anonymous' THEN 'anonymous'
-                   END AS slot
-            ORDER BY coalesce(ac.is_anonymous, false) ASC, ac.id ASC
+            MATCH (t:Tenant {{id: $tid}})<-[:OF_TENANT]-(p:Principal)
+            {pfrag.and_("(p.status IS NULL OR p.status = 'active')")}
+            RETURN p.id AS principal_id,
+                   coalesce(p.label, p.identity_key) AS label,
+                   CASE
+                     WHEN p.tier = 'declared' THEN 0
+                     WHEN coalesce(p.is_anonymous, false) THEN 1
+                     ELSE 2
+                   END AS p_rank
+            ORDER BY p_rank ASC, label ASC
             LIMIT 1
             """,
             tid=tenant_id,
-            **afrag.parameters,
+            **pfrag.parameters,
         )
-        return rows[0] if rows else None
+        if not rows:
+            return None
+        view = _fetch_principal_auth(
+            client, engagement_id, str(rows[0]["principal_id"])
+        )
+        if view is None:
+            return None
+        return view, str(rows[0]["label"])
 
     a, b = _auth_for_tenant(str(tenants[0]["id"])), _auth_for_tenant(str(tenants[1]["id"]))
     if a is None or b is None:
         return None
 
-    def _ctx(row: dict[str, object], tval: object, *, attacker: bool) -> PackAuthContext:
+    def _ctx(
+        pair: tuple[_AuthView, str], tval: object, *, attacker: bool
+    ) -> PackAuthContext:
+        view, p_label = pair
         # ADR-0049: `principal_label` is the REAL `p.label`; the synthetic
         # `tenant:<value>` description moves to `display_label` (LLM-facing only).
         return PackAuthContext(
             handle="A2" if attacker else "A1",
-            principal_label=str(row["p_label"]),
-            tier=str(row["tier"]) if row["tier"] is not None else None,
-            claims_summary=_summarise_claims(row["claims"]),
+            principal_label=p_label,
+            tier=view.tier,
+            claims_summary=view.claims_summary,
             is_attacker_candidate=attacker,
-            auth_context_id=AuthContextId(str(row["id"])),
-            slot=str(row["slot"]) if row["slot"] is not None else None,
+            auth_context_id=view.auth_context_id,
+            slot=view.slot,
             display_label=f"tenant:{tval}",
         )
 
