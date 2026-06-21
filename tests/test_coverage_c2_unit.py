@@ -163,6 +163,30 @@ def test_anonymous_participates_in_pairing() -> None:
     assert labels == {("admin", "anon")}  # anon reads as "anon"
 
 
+def test_evidence_a_carries_is_anonymous_flag() -> None:
+    # #137: the reached side (A) exposes `is_anonymous` so the planner can drop
+    # anon-as-A gaps (the noise case) while keeping anon-as-B (canonical auth-bypass).
+    # Anon-as-A → True.
+    anon_a = _run(
+        principals=[_ANON, _ADMIN],
+        endpoints=[_endpoint("e1")],
+        reached=[_reached("e1", "pAnon")],  # only anon reached → anon is A
+    )
+    assert [(r.principal_a_label, r.evidence_a.is_anonymous) for r in anon_a] == [
+        ("anon", True)
+    ]
+    # Anon-as-B (declared A, anonymous B): the discriminator is on A, so
+    # evidence_a.is_anonymous is False and the planner will NOT drop it.
+    anon_b = _run(
+        principals=[_ADMIN, _ANON],
+        endpoints=[_endpoint("e1")],
+        reached=[_reached("e1", "pAdmin")],  # only admin reached → admin is A, anon is B
+    )
+    assert [(r.principal_a_label, r.principal_b_label, r.evidence_a.is_anonymous) for r in anon_b] == [
+        ("admin", "anon", False)
+    ]
+
+
 def test_pin_as_and_not_as() -> None:
     eps = [_endpoint("e1"), _endpoint("e2", path="/reports")]
     reached = [
