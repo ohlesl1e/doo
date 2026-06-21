@@ -34,6 +34,15 @@ Each emitted proposal traces back to the deterministic candidate (and thus the
 coverage gap / generator) that produced it — the provenance story that matters
 for bug-bounty disclosure ("why did the tool propose this?").
 
+A generator **may filter its coverage input** when a row is semantically void as
+an attacker hypothesis — coverage stays exhaustive (ADR-0033: "all active
+principal pairs"), the generator decides relevance. First instance:
+`C2Generator` drops rows where the reached side is the anonymous singleton
+(`evidence_a.is_anonymous`), since "send as a more-privileged actor what anon
+already gets" inverts the authz direction (#137); the coverage CLI still emits
+those rows. Filtered rows are logged (`planner.generator.<id>.skip_*`), never
+silently dropped.
+
 ## Deterministic vs LLM-proposing generators
 
 A generator either **proposes deterministically** or **proposes via the LLM**:

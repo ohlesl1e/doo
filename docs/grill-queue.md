@@ -139,8 +139,12 @@ Until after slice 1+2 lands; revisit when the implementation forces the question
   `(anon, X)` direction is rarely an authz lead. Options to grill: (a) collapse
   C2 rows by endpoint and let the LLM pick the attacker from the full
   per-principal evidence (the C2b pack shape already does this); (b) apply the
-  ADR-0036 deterministic prioritiser *before* proposing and truncate top-N; (c)
-  drop ordered pairs where the A side is `anon`. Per-gap progress logging + a
+  ADR-0036 deterministic prioritiser *before* proposing and truncate top-N; ~~(c)
+  drop ordered pairs where the A side is `anon`~~ — **(c) resolved 2026-06-20 by
+  #137** at the planner seam: `PrincipalEvidence` gains `is_anonymous: bool`,
+  `C2Generator` skips `evidence_a.is_anonymous` rows before assembly (logged
+  `planner.generator.c2.skip_anon_a`); `run_c2` still emits them per ADR-0033.
+  (a)/(b) remain open. Per-gap progress logging + a
   configurable per-call timeout landed 2026-06-11 so the run is observable and
   bounded; the fan-out itself is unchanged. Revisit alongside slice 4 (the same
   cap will gate dispatch volume).
