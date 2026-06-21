@@ -25,6 +25,7 @@ from doo.canonical.identity import (
     auth_context_id,
     compute_anonymous_auth_hash,
 )
+from doo.coverage.models import C2Result
 from doo.coverage.queries import _load_principals, run_c1, run_c2, run_c2b, run_c3
 from doo.ids import EngagementId
 from doo.infra.neo4j_driver import Neo4jClient
@@ -414,7 +415,24 @@ class C2Generator:
         on_progress: LLMProgressCallback | None = None,
     ) -> LLMRunResult:
         run_at = now or datetime.now(UTC)
-        gaps = run_c2(client, engagement_id, now=run_at)
+        # Drop gaps whose reached side (A) is the anonymous singleton (#137,
+        # ADR-0036): "can a more-privileged actor reach what anon already gets"
+        # is direction-void as an attacker hypothesis (the LLM calls it auth-bypass
+        # and the dispatcher trivially confirms 200, since anon already reached it).
+        # Anon-as-B (the canonical auth-bypass test) and C2b anon-in-set are kept.
+        # Coverage still surfaces these rows (`doo coverage c2`); only the planner
+        # skips them, before any pack assembly or model call.
+        gaps: list[C2Result] = []
+        for gap in run_c2(client, engagement_id, now=run_at):
+            if gap.evidence_a.is_anonymous:
+                log.info(
+                    "planner.generator.c2.skip_anon_a",
+                    engagement_id=engagement_id,
+                    endpoint_id=gap.endpoint_id,
+                    principal_b_label=gap.principal_b_label,
+                )
+                continue
+            gaps.append(gap)
         principal_ids = {
             pv.label: pv.principal_id
             for pv in _load_principals(client, engagement_id)

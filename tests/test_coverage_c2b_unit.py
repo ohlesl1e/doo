@@ -201,6 +201,21 @@ def test_three_principals_one_differs() -> None:
     assert {ev.label for ev in out[0].evidence} == {"admin", "user", "anon"}
 
 
+def test_evidence_carries_is_anonymous_per_principal() -> None:
+    # #137: each C2b evidence entry exposes `is_anonymous` (present but unread by
+    # the C2b generator — anon-in-set is a valid content-divergence signal, kept).
+    out = _run(
+        principals=[_ADMIN, _ANON],
+        endpoints=[_endpoint("e1")],
+        reached=[
+            _reached("e1", "pAdmin", size=100, sha="aaa"),
+            _reached("e1", "pAnon", size=200, sha="bbb"),
+        ],
+    )
+    anon_by_label = {ev.label: ev.is_anonymous for ev in out[0].evidence}
+    assert anon_by_label == {"admin": False, "anon": True}
+
+
 def test_out_of_scope_endpoint_excluded() -> None:
     out = _run(
         principals=[_ADMIN, _USER],

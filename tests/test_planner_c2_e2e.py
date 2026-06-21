@@ -27,7 +27,9 @@ from datetime import UTC, datetime
 
 import jwt
 import pytest
+import structlog
 
+from doo.coverage.queries import run_c2
 from doo.ids import EngagementId
 from doo.infra.blobs import BlobClient
 from doo.infra.neo4j_driver import Neo4jClient
@@ -188,6 +190,90 @@ def _seed_one_gap(neo4j_client, redis_client, blob_client, eid: str) -> None:
         "WHERE coalesce(ac.is_anonymous, false) = false SET ac.tier = 'declared'",
         eid=eid,
     )
+
+
+def _entry_noauth(*, second: int, path: str, status: int) -> dict:
+    """A request with no Authorization header — resolves to the anonymous singleton."""
+    body = json.dumps({"ok": status < 400, "path": path})
+    return {
+        "startedDateTime": f"2026-06-06T09:00:{second:02d}.000Z",
+        "request": {
+            "method": "GET",
+            "url": f"https://api.example.com{path}",
+            "queryString": [],
+            "headers": [],
+            "cookies": [],
+            "headersSize": -1,
+            "bodySize": 0,
+        },
+        "response": {
+            "status": status,
+            "bodySize": len(body),
+            "headers": [{"name": "Content-Type", "value": "application/json"}],
+            "content": {"mimeType": "application/json", "text": body},
+        },
+    }
+
+
+def _seed_anon_a_gap(neo4j_client, redis_client, blob_client, eid: str) -> None:
+    """anon (no auth) 200, user 401 on /admin/panel — the sole C2 gap is anon-as-A."""
+
+    _seed_engagement_in_scope(neo4j_client, eid)
+    user = jwt.encode({"sub": "c2-user", "role": "user"}, SIGNING_KEY, algorithm="HS256")
+    entries = [
+        _entry_noauth(second=1, path="/admin/panel", status=200),  # anon reaches
+        _entry(second=2, bearer=user, path="/admin/panel", status=401),  # user blocked
+    ]
+    har = json.dumps({"log": {"version": "1.2", "entries": entries}}).encode()
+    _run_pipeline(
+        neo4j=neo4j_client,
+        redis_client=redis_client,
+        blob_client=blob_client,
+        engagement_id=eid,
+        har_bytes=har,
+        filename="c2-anon-a.har",
+    )
+    neo4j_client.execute_write(
+        "MATCH (ac:AuthContext {engagement_id: $eid}) "
+        "WHERE coalesce(ac.is_anonymous, false) = false SET ac.tier = 'declared'",
+        eid=eid,
+    )
+
+
+def test_c2_generator_skips_anon_as_a(neo4j_client, redis_client, blob_client) -> None:
+    """#137: a gap whose reached side (A) is anonymous is dropped by the planner
+    before any pack assembly or model call — coverage still surfaces it.
+    """
+    eid = "eng-c2-skip-anon-a"
+    _seed_anon_a_gap(neo4j_client, redis_client, blob_client, eid)
+
+    # Coverage is unchanged (ADR-0033): the anon-as-A row is still surfaced.
+    rows = run_c2(neo4j_client, EngagementId(eid))
+    assert [(r.principal_a_label, r.principal_b_label) for r in rows] == [
+        ("anon", "discovered:sub:c2-user")
+    ]
+    assert rows[0].evidence_a.is_anonymous is True
+
+    sink = InMemoryLLMAuditSink()
+    with structlog.testing.capture_logs() as caplog:
+        result = propose(
+            neo4j_client,
+            engagement_id=EngagementId(eid),
+            config=_C2_ONLY,
+            llm_caller=FakeLLMCaller(_draft()),
+            llm_audit_sink=sink,
+        )
+
+    # The planner dropped the only gap: no candidate reached the LLM, nothing
+    # committed, and — crucially — no model call was persisted (no assemble/LLM).
+    assert result.candidates == 0
+    assert result.committed == 0 and result.created == 0
+    assert result.llm_skipped == () and result.llm_rejected == ()
+    assert len(sink.stored) == 0
+
+    skips = [e for e in caplog if e.get("event") == "planner.generator.c2.skip_anon_a"]
+    assert len(skips) == 1
+    assert skips[0]["principal_b_label"] == "discovered:sub:c2-user"
 
 
 def _draft(**over: object) -> LLMProposalDraft:

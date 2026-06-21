@@ -287,6 +287,7 @@ class _PrincipalView:
 
     principal_id: str
     label: str
+    is_anonymous: bool
 
 
 def _principal_label(*, is_anonymous: bool, label: object, identity_key: str) -> str:
@@ -331,6 +332,7 @@ def _load_principals(
                 label=row["label"],
                 identity_key=str(row["identity_key"]),
             ),
+            is_anonymous=bool(row["is_anonymous"]),
         )
         for row in rows
     ]
@@ -409,7 +411,7 @@ def _load_in_scope_endpoints(
 
 
 def _evidence(
-    label: str, reached: ReachedEvidence | None
+    label: str, is_anonymous: bool, reached: ReachedEvidence | None
 ) -> PrincipalEvidence | None:
     if reached is None:
         return None
@@ -419,6 +421,7 @@ def _evidence(
         status=reached.status,
         response_size_bytes=reached.response_size_bytes,
         response_body_sha256=reached.response_body_sha256,
+        is_anonymous=is_anonymous,
     )
 
 
@@ -493,7 +496,7 @@ def run_c2(
                 if eff < min_confidence:
                     continue
 
-                evidence_a = _evidence(a.label, ev_a)
+                evidence_a = _evidence(a.label, a.is_anonymous, ev_a)
                 assert evidence_a is not None  # ev_a is not None here.
                 results.append(
                     C2Result(
@@ -506,7 +509,7 @@ def run_c2(
                         principal_a_label=a.label,
                         principal_b_label=b.label,
                         evidence_a=evidence_a,
-                        evidence_b=_evidence(b.label, ev_b),
+                        evidence_b=_evidence(b.label, b.is_anonymous, ev_b),
                         effective_confidence=eff,
                     )
                 )
@@ -588,6 +591,7 @@ def run_c2b(
     reached = reached_map(client, engagement_id)
 
     label_by_id = {p.principal_id: p.label for p in principals}
+    anon_by_id = {p.principal_id: p.is_anonymous for p in principals}
 
     # Group the reached evidence per endpoint, keeping only active principals.
     groups: dict[str, list[ReachedEvidence]] = {}
@@ -615,6 +619,7 @@ def run_c2b(
                 status=ev.status,
                 response_size_bytes=ev.response_size_bytes,
                 response_body_sha256=ev.response_body_sha256,
+                is_anonymous=anon_by_id[ev.principal_id],
             )
             for ev in sorted(group, key=lambda e: label_by_id[e.principal_id])
         )

@@ -63,6 +63,12 @@ class PrincipalEvidence(BaseModel):
     status: int
     response_size_bytes: int | None = None
     response_body_sha256: str | None = None
+    # ADR-0033/0036 (#137): True iff this side is the anonymous singleton. The C2
+    # planner generator drops gaps whose reached side (A) is anonymous — "can a
+    # more-privileged actor reach what anon already gets" tests no boundary. Set
+    # by the coverage layer from the same `Principal.is_anonymous` read that backs
+    # the display label; C4's strong-side evidence is never anonymous (default).
+    is_anonymous: bool = False
 
 
 class C2Result(CoverageResult):
