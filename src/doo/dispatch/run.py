@@ -457,6 +457,7 @@ def _execute_one(
         request=request,
         response=result.response,
         dispatch_status=final_status,
+        reason=result.reason,
         role="primary",
         auth_context_id=tc.auth_context_id,
         bodies=deps.bodies,

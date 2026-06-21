@@ -174,6 +174,30 @@ def test_executed_as_edge_dispatch_status_enum() -> None:
     )
     assert edge.dispatch_status == "ok"
     assert edge.request_role == "primary"
+    # `dispatch_reason` is optional and defaults to None (#136).
+    assert edge.dispatch_reason is None
+
+
+def test_executed_as_edge_dispatch_reason_carries_cause() -> None:
+    """The #136 `dispatch_reason` holds the dispatcher's human-readable cause
+    (e.g. the stringified transport exception) when `dispatch_status != ok`."""
+    edge = ExecutedAsEdge(
+        source="agent",
+        confidence=1.0,
+        confidence_method="manual",
+        first_seen=_now(),
+        last_seen=_now(),
+        ingested_at=_now(),
+        testcase_key_hash="a" * 64,
+        request_observation_id="ro-1",
+        engagement_id="acme-2026",
+        dispatch_status="transport_error",
+        dispatch_reason="connection refused",
+        request_role="primary",
+        run_id="run-aaaaaaaaaaaa",
+    )
+    assert edge.dispatch_status == "transport_error"
+    assert edge.dispatch_reason == "connection refused"
 
 
 def test_executed_as_edge_rejects_unknown_status() -> None:

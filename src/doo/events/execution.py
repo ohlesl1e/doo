@@ -230,6 +230,12 @@ class ExecutedAsEdge(Provenanced):
     a baseline and group sends by the dispatch run that authorised them. The
     edge is the per-execution record; coverage queries filter to
     `dispatch_status = "ok"` when computing "tested and clean."
+
+    `dispatch_reason` is the dispatcher's human-readable cause when
+    `dispatch_status != "ok"` — today the stringified transport exception on a
+    `transport_error` send; `None` for `ok`. Blocked sends (`sent=False`) commit
+    no edge at all (ADR-0006: nothing observed); their reason lives on the
+    dispatch-ledger `RunOutcome.reason`, not here.
     """
 
     model_config = ConfigDict(strict=True, extra="forbid")
@@ -238,6 +244,7 @@ class ExecutedAsEdge(Provenanced):
     request_observation_id: ObservationId
     engagement_id: EngagementId
     dispatch_status: DispatchStatus
+    dispatch_reason: str | None = None
     # ADR-0043: which constructor produced this send (`primary`, `baseline_*`,
     # `liveness`, `hazard_warmup`). Kept as a free `str` here (not the
     # `RequestRole` Literal) because the role enum is keyed on `test_class` and

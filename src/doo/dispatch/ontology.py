@@ -4,8 +4,10 @@ An agent send is committed via the **same** `RequestObservation` shape as a
 parsed observation (ADR-0006: agent traffic and passive traffic are one
 observation set), with `source = "agent"` and full ADR-0005 cross-cutting
 provenance. The `EXECUTED_AS` edge from the `TestCase` carries
-`dispatch_status` + `request_role` + `run_id` (ADR-0013/0042/0043) so coverage
-and audit can group sends by the run that authorised them.
+`dispatch_status` + `dispatch_reason` + `request_role` + `run_id`
+(ADR-0013/0042/0043) so coverage and audit can group sends by the run that
+authorised them. `dispatch_reason` is the human-readable cause when
+`dispatch_status != ok` (today the transport exception string); `null` otherwise.
 
 Kept separate from `ontology/resolve.py` (the L2-ingest commit path) because the
 agent send already knows its `AuthContext` and `Host` directly (no cue
@@ -88,6 +90,7 @@ def commit_agent_send(
     request: ConcreteRequest,
     response: HttpResponse | None,
     dispatch_status: DispatchStatus,
+    reason: str | None = None,
     role: RequestRole,
     auth_context_id: AuthContextId,
     bodies: BodyStore,
@@ -98,9 +101,11 @@ def commit_agent_send(
     The observation node carries the same property names as the L2-ingest path
     (`method`, `concrete_path`, `response_status`, …) so coverage queries read it
     identically. The `EXECUTED_AS` edge is the per-execution record (ADR-0013);
-    it carries `dispatch_status` + `request_role` + `run_id` and the ADR-0005
-    cross-cutting fields. `OBSERVED_UNDER` → the (known) `AuthContext` and
-    `ON_HOST` → the (known) `Host` are wired directly — no cue resolution.
+    it carries `dispatch_status` + `dispatch_reason` + `request_role` + `run_id`
+    and the ADR-0005 cross-cutting fields. `dispatch_reason` is the dispatcher's
+    human-readable cause (the transport exception string on `transport_error`);
+    `None` for `ok`. `OBSERVED_UNDER` → the (known) `AuthContext` and `ON_HOST` →
+    the (known) `Host` are wired directly — no cue resolution.
 
     A `dispatcher_blocked` send (no bytes left the process) writes **no**
     observation: there is nothing observed. The caller records that as a
@@ -169,6 +174,7 @@ def commit_agent_send(
         MATCH (t:TestCase {engagement_id: $eid, key_hash: $key_hash})
         MERGE (t)-[x:EXECUTED_AS {run_id: $run_id, request_role: $role}]->(r)
         ON CREATE SET x.dispatch_status = $dispatch_status,
+                      x.dispatch_reason = $dispatch_reason,
                       x.engagement_id = $eid,
                       x.at = $now,
                       x.source = $source, x.source_id = $run_id,
@@ -202,6 +208,7 @@ def commit_agent_send(
         key_hash=key_hash,
         role=role,
         dispatch_status=dispatch_status,
+        dispatch_reason=reason,
         now=run_at,
     )
     log.info(
