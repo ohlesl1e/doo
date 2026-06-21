@@ -153,6 +153,7 @@ def send_http_request_within_scope(ctx: ToolContext, *, role: str) -> SendToolRe
             request=request,
             response=result.response,
             dispatch_status=result.dispatch_status,
+            reason=result.reason,
             role=typed_role,
             auth_context_id=request.auth_context_id,
             bodies=ctx.bodies,

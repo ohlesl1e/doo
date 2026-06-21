@@ -26,7 +26,7 @@ import redis
 
 from doo.canonical.identity import auth_context_id, compute_auth_hash
 from doo.dispatch.executor.dispatcher import RedisLeaseReader, StubOpaClient
-from doo.dispatch.executor.send import HttpResponse, StubSender
+from doo.dispatch.executor.send import HttpResponse, StubSender, TransportError
 from doo.dispatch.finding import (
     InMemoryFindingLedger,
     list_proposed_findings,
@@ -332,6 +332,18 @@ class _PathScriptedSender:
         return self._by_path.get(path, HttpResponse(status=500, body=b"unscripted"))
 
 
+class _RaisingSender:
+    """`Sender` that fails at the wire with a `TransportError` (e.g. conn refused)."""
+
+    def __init__(self, message: str) -> None:
+        self._message = message
+        self.sent: list[object] = []
+
+    def send(self, request: object) -> HttpResponse:
+        self.sent.append(request)
+        raise TransportError(self._message)
+
+
 def _liveness_config(eng: str) -> EngagementConfig:
     """Attacker principal declares a `liveness_endpoint` (ADR-0044)."""
     return EngagementConfig.model_validate(
@@ -625,6 +637,55 @@ def test_csrf_hazard_resolution_e2e(
     assert len(refused) == 1 and refused[0].hazard is not None
 
 
+def test_transport_error_reason_on_edge_e2e(
+    neo4j_client: Neo4jClient, redis_url: str, engagement_config: EngagementConfig
+) -> None:
+    """#136: a `transport_error` send (bytes went out, the wire failed) commits an
+    `EXECUTED_AS` edge whose `dispatch_reason` is the stringified transport exception.
+    """
+    env = {"E2E_VICTIM": VICTIM_TOKEN, "E2E_ATTACKER": ATTACKER_TOKEN}
+    secrets = EnvSecretStore.from_config(engagement_config, env=env)
+    attacker_ac_id = auth_context_id(
+        EngagementId(ENG), compute_auth_hash("bearer", ATTACKER_TOKEN)
+    )
+    key_hash = _seed_graph(neo4j_client, attacker_ac_id=attacker_ac_id)
+
+    lease = RedisLease(redis.Redis.from_url(redis_url), EngagementId(ENG))
+    lease.set_active(ttl_seconds=60)
+
+    sender = _RaisingSender("connection refused")
+    run = arm_run(
+        config=engagement_config,
+        selection=DispatchSelection(test_classes=("idor",), limit=1),
+        actor="e2e-tester",
+    )
+    deps = RunDependencies(
+        neo4j=neo4j_client,
+        lease=RedisLeaseReader(lease=lease),
+        opa=StubOpaClient(allow=True),
+        sender=sender,  # type: ignore[arg-type]
+        secrets=secrets,
+        bodies=NoopBodyStore(),
+        ledger=InMemoryDispatchLedger(),
+    )
+    execute_run(run, deps)
+
+    # Bytes left the process (sent=True), so the edge is committed — with the cause.
+    assert len(sender.sent) == 1
+    rows = neo4j_client.execute_read(
+        """
+        MATCH (t:TestCase {engagement_id: $eid, key_hash: $kh})
+              -[x:EXECUTED_AS {request_role: 'primary'}]->(:RequestObservation)
+        RETURN x.dispatch_status AS status, x.dispatch_reason AS reason
+        """,
+        eid=ENG,
+        kh=key_hash,
+    )
+    assert len(rows) == 1
+    assert rows[0]["status"] == "transport_error"
+    assert rows[0]["reason"] == "connection refused"
+
+
 def test_dispatch_spine_e2e(
     neo4j_client: Neo4jClient, redis_url: str, engagement_config: EngagementConfig
 ) -> None:
@@ -693,6 +754,7 @@ def test_dispatch_spine_e2e(
               -[x:EXECUTED_AS]->(r:RequestObservation)
         OPTIONAL MATCH (r)-[:OBSERVED_UNDER]->(ac:AuthContext)
         RETURN x.dispatch_status AS status, x.request_role AS role, x.run_id AS run_id,
+               x.dispatch_reason AS reason,
                r.source AS source, r.concrete_path AS path, r.response_status AS http,
                ac.id AS ac_id
         """,
@@ -704,6 +766,8 @@ def test_dispatch_spine_e2e(
     assert row["status"] == "ok"
     assert row["role"] == "primary"
     assert row["run_id"] == run.run_id
+    # An `ok` send carries no `dispatch_reason` (#136).
+    assert row["reason"] is None
     assert row["source"] == "agent"
     assert row["path"] == "/orders/123"
     assert row["http"] == 200
