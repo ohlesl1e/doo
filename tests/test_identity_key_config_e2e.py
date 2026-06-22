@@ -248,6 +248,72 @@ def test_identity_key_get_identity_key_getter(neo4j_client, redis_client, blob_c
     assert state.get_identity_key(EngagementId("nonexistent")) is None
 
 
+def test_get_engagement_llm_models_roundtrip(neo4j_client) -> None:
+    """ADR-0051: `llm_model` / `llm_interpreter_model` written via
+    `engagement_create` round-trip through `get_engagement_llm_models`;
+    unset / absent properties read back as ``None`` (no reader-side fallback)."""
+    now = datetime.now(UTC)
+    state = Neo4jGraphState(neo4j_client)
+    cross = {
+        "source": "manual",
+        "source_id": None,
+        "confidence": 1.0,
+        "confidence_method": "manual",
+        "first_seen": now,
+        "last_seen": now,
+        "ingested_at": now,
+        "status": "active",
+    }
+
+    def _seed(eid: str, *, llm_model: str | None, llm_interpreter_model: str | None) -> None:
+        state.apply_mutations(
+            (
+                PlannedMutation(
+                    kind="scope_create",
+                    properties={"content_hash": f"scope-{eid}", "rules": {}, **cross},
+                ),
+                PlannedMutation(
+                    kind="engagement_create",
+                    properties={
+                        "id": eid,
+                        "name": eid,
+                        "description": None,
+                        "time_window": None,
+                        "kill_switch": {"backend": "redis"},
+                        "identity_key": None,
+                        "llm_model": llm_model,
+                        "llm_interpreter_model": llm_interpreter_model,
+                        **cross,
+                    },
+                ),
+                PlannedMutation(
+                    kind="engagement_under_scope",
+                    properties={
+                        "engagement_id": eid,
+                        "scope_content_hash": f"scope-{eid}",
+                    },
+                ),
+            )
+        )
+
+    eid_both = "eng-llm-both"
+    eid_planner_only = "eng-llm-planner-only"
+    _seed(eid_both, llm_model="anthropic/m-planner", llm_interpreter_model="anthropic/m-interp")
+    _seed(eid_planner_only, llm_model="anthropic/m-planner", llm_interpreter_model=None)
+
+    assert state.get_engagement_llm_models(EngagementId(eid_both)) == (
+        "anthropic/m-planner",
+        "anthropic/m-interp",
+    )
+    # No reader-side interpreter→planner fallback: None stays None.
+    assert state.get_engagement_llm_models(EngagementId(eid_planner_only)) == (
+        "anthropic/m-planner",
+        None,
+    )
+    # Absent engagement → (None, None).
+    assert state.get_engagement_llm_models(EngagementId("nonexistent")) == (None, None)
+
+
 def test_identity_key_heuristic_fallback_when_claim_absent(
     neo4j_client, redis_client, blob_client
 ) -> None:

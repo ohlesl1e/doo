@@ -107,6 +107,11 @@ class CurrentEngagementState:
     # the dispatcher's OPA `input.environment` (ADR-0046) and the mode-matrix
     # check can read it without re-loading the YAML.
     environment: str | None = None
+    # ADR-0051: per-engagement, per-role LLM model defaults, persisted so
+    # `planner propose` / `dispatch run` resolve a model id-only without
+    # re-reading the YAML. An llm-only diff is cosmetic (no confirm prompt).
+    llm_model: str | None = None
+    llm_interpreter_model: str | None = None
     declared_principals: dict[str, dict[str, Any]] = dataclasses.field(default_factory=dict)
 
 
@@ -649,6 +654,8 @@ def load_engagement(
                     "session_cookie_names": list(config.auth.session_cookie_names),
                     "identity_key": config.auth.identity_key,
                     "environment": config.environment,
+                    "llm_model": config.llm.model,
+                    "llm_interpreter_model": config.llm.interpreter_model,
                     # Cross-cutting fields per ADR-0005.
                     "source": "manual",
                     "source_id": None,
@@ -721,6 +728,12 @@ def load_engagement(
     )
     identity_key_changed = current.identity_key != config.auth.identity_key
     environment_changed = current.environment != config.environment
+    # ADR-0051: model selection is operator preference, not a scope/identity
+    # fact — an llm-only diff is cosmetic (applied silently, no confirm prompt).
+    llm_model_changed = current.llm_model != config.llm.model
+    llm_interpreter_model_changed = (
+        current.llm_interpreter_model != config.llm.interpreter_model
+    )
 
     # Principal diff (ADR-0019): adds, removes, and mods are material. The
     # comparison is over the secret-free `_principal_view` dicts.
@@ -748,7 +761,12 @@ def load_engagement(
         or identity_key_changed
         or environment_changed
     )
-    cosmetic = name_changed or description_changed
+    cosmetic = (
+        name_changed
+        or description_changed
+        or llm_model_changed
+        or llm_interpreter_model_changed
+    )
 
     if not material and not cosmetic:
         # ADR-0049 slot backfill + ADR-0048 retroactive sweep both run on EVERY
@@ -844,6 +862,8 @@ def load_engagement(
         or session_cookies_changed
         or identity_key_changed
         or environment_changed
+        or llm_model_changed
+        or llm_interpreter_model_changed
     ):
         mutations.append(
             PlannedMutation(
@@ -856,6 +876,8 @@ def load_engagement(
                     "session_cookie_names": list(config.auth.session_cookie_names),
                     "identity_key": config.auth.identity_key,
                     "environment": config.environment,
+                    "llm_model": config.llm.model,
+                    "llm_interpreter_model": config.llm.interpreter_model,
                     "last_seen": now,
                 },
             )

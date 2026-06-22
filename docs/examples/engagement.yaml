@@ -60,12 +60,12 @@ kill_switch:
   lease_ttl_seconds: 60
   refresh_interval_seconds: 30
 
-# Reserved for per-engagement model routing — NOT wired yet. The Planner and
-# Interpreter pick their model from the DOO_PLANNER_* env, not this block, so
-# `model:` here has no effect today. Safe to omit. See docs/engagement-config.md.
+# Per-engagement, per-role LLM model defaults (ADR-0051). Persisted on the
+# Engagement node at `engagement start`; `--model` and `DOO_*_MODEL` env take
+# precedence at run time. See docs/engagement-config.md.
 llm:
-  provider: gateway
   model: claude-opus-4-8
+  # interpreter_model: anthropic/claude-sonnet-4-6  # optional; falls back to model
 
 # Dispatch defaults. On `production` only review+confirm loads.
 dispatch:

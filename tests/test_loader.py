@@ -73,6 +73,8 @@ class FakeGraphState:
             session_cookie_names=base.session_cookie_names,
             identity_key=base.identity_key,
             environment=base.environment,
+            llm_model=base.llm_model,
+            llm_interpreter_model=base.llm_interpreter_model,
             declared_principals=dict(self.principals.get(engagement_id, {})),
         )
 
@@ -136,6 +138,8 @@ class FakeGraphState:
                     session_cookie_names=tuple(m.properties.get("session_cookie_names") or ()),
                     identity_key=m.properties.get("identity_key"),
                     environment=m.properties.get("environment"),
+                    llm_model=m.properties.get("llm_model"),
+                    llm_interpreter_model=m.properties.get("llm_interpreter_model"),
                 )
             elif m.kind == "engagement_rebind_scope":
                 eid = m.properties["engagement_id"]
@@ -150,6 +154,8 @@ class FakeGraphState:
                     session_cookie_names=prev.session_cookie_names,
                     identity_key=prev.identity_key,
                     environment=prev.environment,
+                    llm_model=prev.llm_model,
+                    llm_interpreter_model=prev.llm_interpreter_model,
                 )
             elif m.kind == "engagement_update":
                 eid = m.properties["id"]
@@ -178,6 +184,16 @@ class FakeGraphState:
                         m.properties.get("environment")
                         if "environment" in m.properties
                         else prev.environment
+                    ),
+                    llm_model=(
+                        m.properties.get("llm_model")
+                        if "llm_model" in m.properties
+                        else prev.llm_model
+                    ),
+                    llm_interpreter_model=(
+                        m.properties.get("llm_interpreter_model")
+                        if "llm_interpreter_model" in m.properties
+                        else prev.llm_interpreter_model
                     ),
                 )
 
@@ -612,3 +628,79 @@ def test_loader_identity_key_with_session_cookie_names_coexist() -> None:
     create = next(m for m in state.applied if m.kind == "engagement_create")
     assert create.properties["session_cookie_names"] == ["sid"]
     assert create.properties["identity_key"] == "username"
+
+
+# ---------------------------------------------------------------------------
+# LLMConfig reshape + Engagement.llm_* persistence (ADR-0051 / #144)
+# ---------------------------------------------------------------------------
+
+
+def test_llm_config_rejects_provider() -> None:
+    """ADR-0051: `provider` is gone; `extra="forbid"` makes any YAML carrying
+    `llm.provider:` fail validation."""
+    from pydantic import ValidationError
+
+    from doo.setup.config import LLMConfig
+
+    with pytest.raises(ValidationError):
+        LLMConfig(provider="gateway")  # type: ignore[call-arg]
+
+    d = _base_config_dict()
+    d["llm"] = {"provider": "gateway", "model": "x"}
+    with pytest.raises(ValidationError):
+        _build_config(d)
+
+
+def test_llm_config_interpreter_model_defaults_none() -> None:
+    """ADR-0051: `interpreter_model` defaults to None — the interpreter→planner
+    fallback is the resolver's job, not a validator default."""
+    from doo.setup.config import LLMConfig
+
+    assert LLMConfig(model="x").interpreter_model is None
+    assert LLMConfig().interpreter_model is None
+
+
+def test_engagement_create_persists_llm_models() -> None:
+    """`engagement start` writes `llm_model` / `llm_interpreter_model` on the
+    Engagement node (ADR-0051)."""
+    state = FakeGraphState()
+    d = _base_config_dict()
+    d["llm"] = {"model": "anthropic/m-planner", "interpreter_model": "anthropic/m-interp"}
+    load_engagement(_build_config(d), state)
+    create = next(m for m in state.applied if m.kind == "engagement_create")
+    assert create.properties["llm_model"] == "anthropic/m-planner"
+    assert create.properties["llm_interpreter_model"] == "anthropic/m-interp"
+
+
+def test_engagement_create_null_interpreter_model() -> None:
+    """Omitting `interpreter_model` persists `llm_interpreter_model = None`
+    (no validator-side defaulting to `model`)."""
+    state = FakeGraphState()
+    d = _base_config_dict()
+    d["llm"] = {"model": "anthropic/m-planner"}
+    load_engagement(_build_config(d), state)
+    create = next(m for m in state.applied if m.kind == "engagement_create")
+    assert create.properties["llm_model"] == "anthropic/m-planner"
+    assert create.properties["llm_interpreter_model"] is None
+
+
+def test_llm_only_change_is_cosmetic() -> None:
+    """ADR-0051 / ADR-0019: changing only `llm.*` is a cosmetic update —
+    applied silently, no confirm prompt, and the new value is written."""
+    state = FakeGraphState()
+    load_engagement(_build_config(), state)
+
+    d2 = _base_config_dict()
+    d2["llm"] = {"model": "anthropic/other", "interpreter_model": "anthropic/cheap"}
+    # No `apply=True`, no stdin — a material diff would raise here.
+    result = load_engagement(_build_config(d2), state)
+    assert result.cosmetic_only
+    assert not result.noop
+    assert not result.material_changes_applied
+    update = next(m for m in result.mutations if m.kind == "engagement_update")
+    assert update.properties["llm_model"] == "anthropic/other"
+    assert update.properties["llm_interpreter_model"] == "anthropic/cheap"
+
+    # And a second identical reload is a true noop (round-trips through the diff).
+    result2 = load_engagement(_build_config(d2), state)
+    assert result2.noop

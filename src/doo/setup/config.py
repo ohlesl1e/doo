@@ -560,22 +560,26 @@ class DispatchConfig(BaseModel):
 
 
 class LLMConfig(BaseModel):
-    """LLM provider routing for the slice-3 planner (ADR-0037, S2a).
+    """Per-engagement, per-role LLM model defaults (ADR-0051).
 
-    The planner is the highest-leverage reasoning task, so it codes against one
-    gateway client and the concrete provider is *config, not code*. `provider`
-    routes through the org-standard LiteLLM gateway by default; a per-engagement
-    `local` override keeps structural/claims data on-network for internal
-    engagements under org data-policy (opt-in — bug-bounty external defaults to the
-    API). `model` is the gateway model id (default Claude Opus 4.8). Tokens / API
-    keys are never declared here — the gateway resolves credentials at call time,
-    the same env-reference discipline as ADR-0012.
+    `model` is the litellm model id used by the Planner role (and the durable
+    fallback for any role that doesn't declare its own). `interpreter_model` is an
+    optional per-engagement override for the Interpreter role; when ``None`` the
+    Interpreter falls back to `model` *at resolution time* — that fallback is the
+    resolver's job (ADR-0051 resolution table), not a validator default here, so
+    this field stays ``None`` rather than mirroring `model`.
+
+    Both values are persisted as `llm_model` / `llm_interpreter_model` on the
+    `Engagement` node by the loader so `planner propose` / `dispatch run` can read
+    them id-only without re-loading the YAML. Provider routing is litellm's (model
+    prefix → provider env vars); doo does not model it. API keys / endpoints are
+    never declared here — env-only, same discipline as ADR-0012.
     """
 
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
 
-    provider: Literal["gateway", "local"] = "gateway"
     model: str = "claude-opus-4-8"
+    interpreter_model: str | None = None
 
 
 class EngagementConfig(BaseModel):
