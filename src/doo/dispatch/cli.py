@@ -199,10 +199,18 @@ def _resolve_interpreter_model(
 def _build_interpreter(model: str) -> MultiTurnLLMCaller | None:
     """Build the multi-turn Interpreter caller (ADR-0043: native loop, litellm).
 
-    Same env vars as the Planner (`DOO_PLANNER_MODEL`, `DOO_PLANNER_API_BASE`,
-    `DOO_PLANNER_TEMPERATURE`) so one model id serves both. `DOO_NO_INTERPRETER=1`
-    disables it (S1/S2 behaviour: `primary` only, no verdict) — useful for a
-    smoke run before the model is configured.
+    The model id is resolved upstream by :func:`_resolve_interpreter_model`
+    (ADR-0051). ``api_base`` / ``api_key`` resolve via
+    ``resolve_llm_api_base("interpreter")`` (``DOO_INTERPRETER_API_BASE`` →
+    ``DOO_LLM_API_BASE`` → ``None``, and the matching ``*_API_KEY`` chain).
+    ``None`` is the **normal state** — litellm prefix-routes via its own
+    per-provider env vars. Set ``DOO_INTERPRETER_API_BASE`` or
+    ``DOO_LLM_API_BASE`` only to *force-pin* every interpreter call to one
+    endpoint regardless of model prefix; a non-``openai/`` prefix against a
+    pinned base is a protocol mismatch and fails loud.
+
+    ``DOO_NO_INTERPRETER=1`` disables it (S1/S2 behaviour: ``primary`` only, no
+    verdict) — useful for a smoke run before the model is configured.
     """
 
     if os.environ.get("DOO_NO_INTERPRETER"):
@@ -213,6 +221,7 @@ def _build_interpreter(model: str) -> MultiTurnLLMCaller | None:
         )
         return None
 
+    from doo.cli_env import resolve_llm_api_base, resolve_llm_api_key
     from doo.dispatch.interpreter.loop import LiteLLMMultiTurnCaller
 
     temperature_raw = os.environ.get("DOO_PLANNER_TEMPERATURE", "0.0").strip()
@@ -227,8 +236,8 @@ def _build_interpreter(model: str) -> MultiTurnLLMCaller | None:
     return LiteLLMMultiTurnCaller(
         model,
         temperature=temperature,
-        api_base=os.environ.get("DOO_PLANNER_API_BASE") or None,
-        api_key=os.environ.get("DOO_PLANNER_API_KEY") or None,
+        api_base=resolve_llm_api_base("interpreter"),
+        api_key=resolve_llm_api_key("interpreter"),
         timeout_s=120.0,
     )
 

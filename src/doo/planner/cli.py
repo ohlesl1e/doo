@@ -117,24 +117,32 @@ def _resolve_planner_model(
 def _build_llm_deps(model: str) -> tuple[LLMCaller, LLMAuditSink]:
     """Build the model caller + audit sink for an LLM-proposing planner run (ADR-0037).
 
-    The model is `DOO_PLANNER_MODEL` (default Claude Opus 4.8). Two routing modes,
-    both via litellm:
-    - **Anthropic direct** — `DOO_PLANNER_MODEL=anthropic/claude-sonnet-4-6` with
-      `ANTHROPIC_API_KEY` in the environment.
-    - **Provider URL + key** (LiteLLM/OpenAI-compatible gateway, local proxy) —
-      set `DOO_PLANNER_API_BASE` (+ `DOO_PLANNER_API_KEY`) and an `openai/<name>` id.
-    `DOO_PLANNER_API_BASE` / `DOO_PLANNER_API_KEY` are optional overrides; unset, litellm
-    resolves credentials from its provider env vars. `DOO_PLANNER_TIMEOUT_S` bounds
-    a single proposing attempt (default 60s; `0`/empty disables) and
-    `DOO_PLANNER_NUM_RETRIES` is the litellm per-call retry count (default 0 —
-    re-running `propose` is the retry, idempotent per ADR-0007). Generators call
-    the model once per gap sequentially, so an unbounded stalled call would
-    otherwise hang the whole run; with the bound the run is capped at roughly
-    `gaps × timeout_s × (num_retries + 1)`. The audit sink persists every proposing
-    call to the same object storage as the rest of the CLI (`DOO_S3_*`). Built only
-    when an LLM generator (C2) is actually requested.
+    The model id is resolved upstream by :func:`_resolve_planner_model`
+    (ADR-0051); this function only builds the caller for that id.
+
+    ``api_base`` / ``api_key`` resolve via ``resolve_llm_api_base("planner")``
+    (``DOO_PLANNER_API_BASE`` → ``DOO_LLM_API_BASE`` → ``None``, and the matching
+    ``*_API_KEY`` chain). ``None`` is the **normal state** — litellm prefix-routes
+    (``anthropic/…`` via ``ANTHROPIC_API_KEY``, ``openai/…`` via
+    ``OPENAI_API_BASE``/``OPENAI_API_KEY``, etc.) using its own per-provider env
+    vars. Set ``DOO_PLANNER_API_BASE`` or ``DOO_LLM_API_BASE`` only to *force-pin*
+    every planner call to one endpoint regardless of model prefix; the model id
+    must then be whatever that endpoint registered (typically ``openai/<name>``
+    for an OpenAI-compat proxy). A non-``openai/`` prefix against a pinned base
+    is a protocol mismatch and fails loud at the proxy.
+
+    ``DOO_PLANNER_TIMEOUT_S`` bounds a single proposing attempt (default 60s;
+    ``0``/empty disables) and ``DOO_PLANNER_NUM_RETRIES`` is the litellm per-call
+    retry count (default 0 — re-running ``propose`` is the retry, idempotent per
+    ADR-0007). Generators call the model once per gap sequentially, so an
+    unbounded stalled call would otherwise hang the whole run; with the bound the
+    run is capped at roughly ``gaps × timeout_s × (num_retries + 1)``. The audit
+    sink persists every proposing call to the same object storage as the rest of
+    the CLI (``DOO_S3_*``). Built only when an LLM generator (C2) is actually
+    requested.
     """
 
+    from doo.cli_env import resolve_llm_api_base, resolve_llm_api_key
     from doo.infra.blobs import BlobClient
 
     timeout_raw = os.environ.get("DOO_PLANNER_TIMEOUT_S", "60")
@@ -164,8 +172,8 @@ def _build_llm_deps(model: str) -> tuple[LLMCaller, LLMAuditSink]:
     caller = LiteLLMCaller(
         model,
         temperature=temperature,
-        api_base=os.environ.get("DOO_PLANNER_API_BASE") or None,
-        api_key=os.environ.get("DOO_PLANNER_API_KEY") or None,
+        api_base=resolve_llm_api_base("planner"),
+        api_key=resolve_llm_api_key("planner"),
         timeout_s=timeout_s,
         num_retries=num_retries,
         tool_choice_mode=tool_choice_mode,
