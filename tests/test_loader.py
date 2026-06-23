@@ -660,6 +660,14 @@ def test_llm_config_interpreter_model_defaults_none() -> None:
     assert LLMConfig().interpreter_model is None
 
 
+def test_llm_config_model_default_is_prefixed() -> None:
+    """ADR-0051: schema default must agree with the resolver default and be
+    litellm-prefix-routable (#151)."""
+    from doo.setup.config import LLMConfig
+
+    assert LLMConfig().model == "anthropic/claude-opus-4-8"
+
+
 def test_engagement_create_persists_llm_models() -> None:
     """`engagement start` writes `llm_model` / `llm_interpreter_model` on the
     Engagement node (ADR-0051)."""

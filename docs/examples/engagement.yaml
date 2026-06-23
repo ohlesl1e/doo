@@ -64,7 +64,7 @@ kill_switch:
 # Engagement node at `engagement start`; `--model` and `DOO_*_MODEL` env take
 # precedence at run time. See docs/engagement-config.md.
 llm:
-  model: claude-opus-4-8
+  model: anthropic/claude-opus-4-8
   # interpreter_model: anthropic/claude-sonnet-4-6  # optional; falls back to model
 
 # Dispatch defaults. On `production` only review+confirm loads.
