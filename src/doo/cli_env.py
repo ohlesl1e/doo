@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import typer
 
@@ -79,3 +79,32 @@ def connect_neo4j_or_exit(uri: str, user: str, password: str) -> Neo4jClient:
             err=True,
         )
         raise typer.Exit(code=2) from exc
+
+
+_LLMRole = Literal["planner", "interpreter"]
+
+
+def resolve_llm_api_base(role: _LLMRole) -> str | None:
+    """ADR-0051 ``api_base`` precedence for ``role``: role-specific
+    (``DOO_<ROLE>_API_BASE``) → shared (``DOO_LLM_API_BASE``) → ``None``.
+
+    ``None`` is the normal state — litellm prefix-routes (``anthropic/…``,
+    ``openai/…``) using its own per-provider env vars. Setting any of these is
+    a *force-pin*: every call for that role goes to that one endpoint
+    regardless of model prefix.
+    """
+    return (
+        os.environ.get(f"DOO_{role.upper()}_API_BASE")
+        or os.environ.get("DOO_LLM_API_BASE")
+        or None
+    )
+
+
+def resolve_llm_api_key(role: _LLMRole) -> str | None:
+    """ADR-0051 ``api_key`` precedence — same chain shape as
+    :func:`resolve_llm_api_base`."""
+    return (
+        os.environ.get(f"DOO_{role.upper()}_API_KEY")
+        or os.environ.get("DOO_LLM_API_KEY")
+        or None
+    )
