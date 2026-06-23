@@ -578,7 +578,7 @@ class LLMConfig(BaseModel):
 
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
 
-    model: str = "claude-opus-4-8"
+    model: str = "anthropic/claude-opus-4-8"
     interpreter_model: str | None = None
 
 

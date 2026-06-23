@@ -56,7 +56,7 @@ kill_switch:                      # external lease; refresh < ttl
   refresh_interval_seconds: 30
 
 llm:                              # per-role model defaults (ADR-0051)
-  model: claude-opus-4-8          # planner default; persisted on the Engagement node
+  model: anthropic/claude-opus-4-8  # planner default; persisted on the Engagement node
   # interpreter_model: anthropic/claude-sonnet-4-6   # optional; falls back to model
 
 dispatch:                         # production ⇒ review+confirm only
@@ -152,7 +152,7 @@ outside the agent). The dispatcher reads the lease on every send.
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `model` | str | `claude-opus-4-8` | Planner default; persisted as `Engagement.llm_model`. |
+| `model` | str | `anthropic/claude-opus-4-8` | Planner default; persisted as `Engagement.llm_model`. |
 | `interpreter_model` | str \| null | `null` | Interpreter override; persisted as `Engagement.llm_interpreter_model`. Falls back to `model` at resolution time when unset. |
 
 > Persisted on the `Engagement` node at `engagement start`. Per-role resolution order is
