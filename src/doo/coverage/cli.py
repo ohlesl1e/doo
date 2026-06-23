@@ -81,11 +81,13 @@ def c1(
         help="Emit the typed result models as JSON (round-trippable) instead of a table.",
     ),
 ) -> None:
-    """C1: in-scope endpoints with no `HIT` edge of any kind (dead endpoints).
+    """C1: in-scope endpoints with no `HIT` edge of any kind (dead endpoints). [→ surface discovery]
 
     Endpoints that exist in scope but were never exercised by any principal in
     the captured traffic — the untouched attack surface. `--min-confidence`
     filters by decayed confidence; `--json` emits the typed rows.
+
+    Vuln class: n/a — attack-surface discovery; feeds all other classes.
     """
 
     from doo.observability.ids import new_span_id, new_trace_id
@@ -160,11 +162,14 @@ def c2(
         help="Emit the typed result models as JSON (round-trippable) instead of a table.",
     ),
 ) -> None:
-    """C2: endpoints reached (2xx) as principal A but not as principal B.
+    """C2: endpoints reached (2xx) as principal A but not as principal B. [→ bola / priv-esc]
 
     Presence-differential authz gaps: a 2xx for A and a non-2xx (or absent) for
     B is a candidate broken-access-control lead. Pin sides with `--as` /
     `--not-as`; `--json` emits the typed rows.
+
+    Vuln class: `bola` / `privilege-escalation` (horizontal when A,B are peers;
+    vertical when one is a higher-role principal).
     """
 
     from doo.observability.ids import new_span_id, new_trace_id
@@ -229,11 +234,13 @@ def c2b(
         help="Emit the typed result models as JSON (round-trippable) instead of a table.",
     ),
 ) -> None:
-    """C2b: endpoints reached (2xx) by ≥2 principals whose responses differ (body/size).
+    """C2b: endpoints reached (2xx) by ≥2 principals whose responses differ (body/size). [→ bola / idor]
 
     Content-differential gaps: multiple principals get a 2xx but the response
     body or size differs by role — the handle on role-differentiated 200s.
     `--json` emits the typed rows.
+
+    Vuln class: `bola` / `idor` (object-level data leakage behind a shared 200).
     """
 
     from doo.observability.ids import new_span_id, new_trace_id
@@ -307,11 +314,13 @@ def c3(
         help="Emit the typed result models as JSON (round-trippable) instead of a table.",
     ),
 ) -> None:
-    """C3: values leaked in one endpoint's response and sent as input to another.
+    """C3: values leaked in one endpoint's response and sent as input to another. [→ idor / bola]
 
     Leak-to-input pivots: a value observed in endpoint X's response later
     appears as input to in-scope endpoint Y, ranked by shape specificity then
     confidence. `--json` emits the typed rows.
+
+    Vuln class: `idor` / `bola` (a leaked object id with a sink that consumes it).
     """
 
     from doo.observability.ids import new_span_id, new_trace_id
@@ -377,11 +386,14 @@ def c4(
         help="Emit the typed result models as JSON (round-trippable) instead of a table.",
     ),
 ) -> None:
-    """C4: endpoints a principal's stronger token reached that its weaker token did not.
+    """C4: endpoints a principal's stronger token reached that its weaker token did not. [→ priv-esc / auth-bypass]
 
     Capability-tier gaps: the same principal's higher-capability AuthContext
     reached an endpoint its lower-capability one did not — a privilege boundary
     worth testing. `--json` emits the typed rows.
+
+    Vuln class: `privilege-escalation` (vertical) / `auth-bypass` (scope / MFA
+    step-up / re-auth bypass).
     """
 
     from doo.observability.ids import new_span_id, new_trace_id
@@ -460,11 +472,15 @@ def c5(
         help="Emit the typed result models as JSON (round-trippable) instead of a table.",
     ),
 ) -> None:
-    """C5: TrustBoundaries with no TestCase executed to an Interpreter verdict.
+    """C5: TrustBoundaries with no TestCase executed to an Interpreter verdict. [→ cross-tenant / step-up bypass]
 
     Boundaries never tested to a conclusion: tested requires a targeting
     TestCase that ran to `ok` AND a vulnerable/not_vulnerable verdict. An
     inconclusive verdict counts as untested (fail-closed). `--json` emits rows.
+
+    Vuln class: `boundary-violation` — cross-tenant access (reading another
+    org/account's data) or step-up bypass (skipping a required scope / MFA /
+    re-auth check). Each row's `kind` says which.
     """
 
     _coverage_c5("C5", engagement, min_confidence, as_json)
@@ -485,10 +501,14 @@ def c5a(
         help="Emit the typed result models as JSON (round-trippable) instead of a table.",
     ),
 ) -> None:
-    """C5a: TrustBoundaries with no *proposed* TestCase (the Planner skipped them).
+    """C5a: TrustBoundaries with no *proposed* TestCase (the Planner skipped them). [→ cross-tenant / step-up bypass]
 
     The weaker sibling of C5: boundaries the Planner never even proposed a test
     for — a gap in proposal coverage, not execution. `--json` emits the rows.
+
+    Vuln class: `boundary-violation` — cross-tenant access (reading another
+    org/account's data) or step-up bypass (skipping a required scope / MFA /
+    re-auth check). Each row's `kind` says which.
     """
 
     _coverage_c5("C5a", engagement, min_confidence, as_json)
@@ -509,10 +529,14 @@ def c5b(
         help="Emit the typed result models as JSON (round-trippable) instead of a table.",
     ),
 ) -> None:
-    """C5b: TrustBoundaries with no *approved* TestCase (nothing armed-able).
+    """C5b: TrustBoundaries with no *approved* TestCase (nothing armed-able). [→ cross-tenant / step-up bypass]
 
     Boundaries with proposals but none approved for dispatch — nothing a run
     could arm against them yet. `--json` emits the rows.
+
+    Vuln class: `boundary-violation` — cross-tenant access (reading another
+    org/account's data) or step-up bypass (skipping a required scope / MFA /
+    re-auth check). Each row's `kind` says which.
     """
 
     _coverage_c5("C5b", engagement, min_confidence, as_json)
