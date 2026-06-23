@@ -95,7 +95,25 @@ def _build_client() -> Neo4jClient:
     )
 
 
-def _build_llm_deps() -> tuple[LLMCaller, LLMAuditSink]:
+def _resolve_planner_model(
+    cli_model: str | None,
+    *,
+    graph_model: str | None = None,
+) -> str:
+    """ADR-0051 model precedence for the Planner role.
+
+    ``--model`` > ``DOO_PLANNER_MODEL`` > ``Engagement.llm_model`` > default
+    (``anthropic/claude-opus-4-8``).
+    """
+    return (
+        cli_model
+        or os.environ.get("DOO_PLANNER_MODEL")
+        or graph_model
+        or "anthropic/claude-opus-4-8"
+    )
+
+
+def _build_llm_deps(model: str) -> tuple[LLMCaller, LLMAuditSink]:
     """Build the model caller + audit sink for an LLM-proposing planner run (ADR-0037).
 
     The model is `DOO_PLANNER_MODEL` (default Claude Opus 4.8). Two routing modes,
@@ -118,7 +136,6 @@ def _build_llm_deps() -> tuple[LLMCaller, LLMAuditSink]:
 
     from doo.infra.blobs import BlobClient
 
-    model = os.environ.get("DOO_PLANNER_MODEL", "anthropic/claude-opus-4-8")
     timeout_raw = os.environ.get("DOO_PLANNER_TIMEOUT_S", "60")
     timeout_s: float | None
     try:
@@ -267,6 +284,12 @@ def propose_cmd(
     as_json: bool = typer.Option(
         False, "--json", help="Run-summary as JSON instead of a table."
     ),
+    model: str | None = typer.Option(
+        None,
+        "--model",
+        help="Override the planner LLM model id for this run (ADR-0051: beats "
+        "DOO_PLANNER_MODEL and the engagement default).",
+    ),
 ) -> None:
     """Run the deterministic generators and commit proposed `TestCase`s (no dispatch).
 
@@ -300,15 +323,17 @@ def propose_cmd(
         if requested is not None
         else PlannerConfig()
     )
-    # Build the model caller + audit sink only when an LLM generator (C2) is in the
-    # requested set; a deterministic-only run stays free of model / object-storage deps.
-    llm_caller: LLMCaller | None = None
-    llm_audit_sink: LLMAuditSink | None = None
-    if requested_llm_generator_ids(config):
-        llm_caller, llm_audit_sink = _build_llm_deps()
-
     client = _build_client()
     try:
+        # Build the model caller + audit sink only when an LLM generator (C2) is in
+        # the requested set; a deterministic-only run stays free of model /
+        # object-storage deps.
+        llm_caller: LLMCaller | None = None
+        llm_audit_sink: LLMAuditSink | None = None
+        if requested_llm_generator_ids(config):
+            resolved = _resolve_planner_model(model)
+            llm_caller, llm_audit_sink = _build_llm_deps(resolved)
+
         with _llm_progress_bar(
             enabled=bool(llm_caller) and not as_json
         ) as on_progress:

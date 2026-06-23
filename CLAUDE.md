@@ -71,7 +71,7 @@ Build vertically through one slice before broadening. Do not scaffold all five l
 
 ## What to do at the start of a session
 
-1. Read `ARCHITECTURE.md` (esp. "Build order (the slices)" — the canonical roadmap), `ONTOLOGY.md`, `CONTEXT.md` (domain language), and `docs/adr/` (decisions to date — 0001 through 0050).
+1. Read `ARCHITECTURE.md` (esp. "Build order (the slices)" — the canonical roadmap), `ONTOLOGY.md`, `CONTEXT.md` (domain language), and `docs/adr/` (decisions to date — 0001 through 0051).
 2. Check `docs/grill-queue.md` — open design decisions worth grilling, plus deliberate deferrals.
 3. Confirm which slice we're working on. **Slices 1–4 are shipped** (slice 4 = bounded agent execution: Executor + Interpreter). The MVP five-layer vertical is complete; if unclear what's next, ask before generating code.
 

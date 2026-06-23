@@ -173,7 +173,29 @@ def _build_opa(
         return StubOpaClient(allow=True)
 
 
-def _build_interpreter() -> MultiTurnLLMCaller | None:
+def _resolve_interpreter_model(
+    cli_model: str | None,
+    *,
+    graph_interpreter_model: str | None = None,
+    graph_model: str | None = None,
+) -> str:
+    """ADR-0051 model precedence for the Interpreter role.
+
+    ``--model`` > ``DOO_INTERPRETER_MODEL`` > ``DOO_PLANNER_MODEL``
+    > ``Engagement.llm_interpreter_model`` > ``Engagement.llm_model``
+    > default (``anthropic/claude-opus-4-8``).
+    """
+    return (
+        cli_model
+        or os.environ.get("DOO_INTERPRETER_MODEL")
+        or os.environ.get("DOO_PLANNER_MODEL")
+        or graph_interpreter_model
+        or graph_model
+        or "anthropic/claude-opus-4-8"
+    )
+
+
+def _build_interpreter(model: str) -> MultiTurnLLMCaller | None:
     """Build the multi-turn Interpreter caller (ADR-0043: native loop, litellm).
 
     Same env vars as the Planner (`DOO_PLANNER_MODEL`, `DOO_PLANNER_API_BASE`,
@@ -192,7 +214,6 @@ def _build_interpreter() -> MultiTurnLLMCaller | None:
 
     from doo.dispatch.interpreter.loop import LiteLLMMultiTurnCaller
 
-    model = os.environ.get("DOO_PLANNER_MODEL", "anthropic/claude-opus-4-8")
     temperature_raw = os.environ.get("DOO_PLANNER_TEMPERATURE", "0.0").strip()
     temperature: float | None
     if temperature_raw == "" or temperature_raw.lower() == "none":
@@ -305,6 +326,12 @@ def run_cmd(
         "--actor",
         help="Tester identity for the dispatch ledger (stays out of the graph).",
     ),
+    model: str | None = typer.Option(
+        None,
+        "--model",
+        help="Override the interpreter LLM model id for this run (ADR-0051: beats "
+        "DOO_INTERPRETER_MODEL/DOO_PLANNER_MODEL and the engagement default).",
+    ),
 ) -> None:
     """Arm and drain one dispatch run over approved TestCases.
 
@@ -355,6 +382,7 @@ def run_cmd(
             raise typer.Exit(code=0)
 
     neo4j = _build_neo4j()
+    resolved_model = _resolve_interpreter_model(model)
     # ADR-0049: one read at run-arm — every declared AuthContext id (all
     # generations) → its rotation-stable (principal_label, slot). Shared by the
     # secret store and the liveness policy so a stale plan-time id still arms.
@@ -380,7 +408,7 @@ def run_cmd(
         ),
         bodies=_build_body_store(),  # type: ignore[arg-type]
         ledger=_default_ledger(),
-        interpreter=_build_interpreter(),
+        interpreter=_build_interpreter(resolved_model),
         # ADR-0044: declared liveness endpoints + body matchers, and the reactive
         # refresh emitter for a dead token.
         liveness=LivenessPolicy.from_config(cfg, graph_map=graph_map),
