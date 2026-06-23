@@ -39,6 +39,7 @@ from doo.ids import EngagementId
 from doo.infra.neo4j_driver import Neo4jClient
 from doo.infra.redis_lease import RedisLease
 from doo.observability.logging import configure_logging, get_logger
+from doo.ontology.graph_state import Neo4jGraphState
 from doo.setup.config import ArmingMode, EngagementConfig
 
 __all__ = ["dispatch_app", "finding_app", "auth_helper_app", "StubOpaClient"]
@@ -382,7 +383,14 @@ def run_cmd(
             raise typer.Exit(code=0)
 
     neo4j = _build_neo4j()
-    resolved_model = _resolve_interpreter_model(model)
+    graph_llm_model, graph_llm_interpreter_model = Neo4jGraphState(
+        neo4j
+    ).get_engagement_llm_models(cfg.engagement.id)
+    resolved_model = _resolve_interpreter_model(
+        model,
+        graph_interpreter_model=graph_llm_interpreter_model,
+        graph_model=graph_llm_model,
+    )
     # ADR-0049: one read at run-arm — every declared AuthContext id (all
     # generations) → its rotation-stable (principal_label, slot). Shared by the
     # secret store and the liveness policy so a stale plan-time id still arms.

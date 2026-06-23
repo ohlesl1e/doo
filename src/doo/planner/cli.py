@@ -31,6 +31,7 @@ import typer
 
 from doo.ids import EngagementId, TestCaseKeyHash
 from doo.infra.neo4j_driver import Neo4jClient
+from doo.ontology.graph_state import Neo4jGraphState
 from doo.planner.generators import (
     LLMProgressCallback,
     PlannerConfig,
@@ -331,7 +332,10 @@ def propose_cmd(
         llm_caller: LLMCaller | None = None
         llm_audit_sink: LLMAuditSink | None = None
         if requested_llm_generator_ids(config):
-            resolved = _resolve_planner_model(model)
+            graph_llm_model, _ = Neo4jGraphState(client).get_engagement_llm_models(
+                EngagementId(engagement)
+            )
+            resolved = _resolve_planner_model(model, graph_model=graph_llm_model)
             llm_caller, llm_audit_sink = _build_llm_deps(resolved)
 
         with _llm_progress_bar(
