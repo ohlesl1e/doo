@@ -55,9 +55,9 @@ kill_switch:                      # external lease; refresh < ttl
   lease_ttl_seconds: 60
   refresh_interval_seconds: 30
 
-llm:                              # Planner/Interpreter routing
-  provider: gateway               # or `local`; creds resolve from DOO_PLANNER_* env
-  model: claude-opus-4-8
+llm:                              # per-role model defaults (ADR-0051)
+  model: claude-opus-4-8          # planner default; persisted on the Engagement node
+  # interpreter_model: anthropic/claude-sonnet-4-6   # optional; falls back to model
 
 dispatch:                         # production ⇒ review+confirm only
   arming: review                  # human presses go before each run (`auto` = staging-only)
@@ -148,17 +148,17 @@ default all seven, must be unique.
 Run the keeper with `doo engagement keepalive <id>` (a separate process — the kill switch lives
 outside the agent). The dispatcher reads the lease on every send.
 
-### `llm` — model routing (`LLMConfig`)
+### `llm` — per-role model defaults (`LLMConfig`, ADR-0051)
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `provider` | `gateway` \| `local` | `gateway` | Intended per-engagement provider routing. |
-| `model` | str | `claude-opus-4-8` | Intended per-engagement model id. |
+| `model` | str | `claude-opus-4-8` | Planner default; persisted as `Engagement.llm_model`. |
+| `interpreter_model` | str \| null | `null` | Interpreter override; persisted as `Engagement.llm_interpreter_model`. Falls back to `model` at resolution time when unset. |
 
-> **Not wired yet.** The Planner and Interpreter select their model from the **environment**, not
-> this block — nothing reads `llm:` at runtime today. Setting `llm.model` here has no effect; use the
-> `DOO_PLANNER_*` env instead. The block is reserved for moving model routing into per-engagement
-> config later.
+> Persisted on the `Engagement` node at `engagement start`. Per-role resolution order is
+> `--model` flag → `DOO_*_MODEL` env → these graph-persisted values → built-in default
+> (ADR-0051). Provider routing is litellm's (model prefix → provider env vars); doo does not
+> model a `provider` field.
 
 The model the Planner and Interpreter actually use comes from the `DOO_PLANNER_*` env, resolved at
 call time (credentials are never in the YAML):

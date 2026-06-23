@@ -53,7 +53,9 @@ class Neo4jGraphState:
                    e.kill_switch AS kill_switch,
                    e.session_cookie_names AS session_cookie_names,
                    e.identity_key AS identity_key,
-                   e.environment AS environment
+                   e.environment AS environment,
+                   e.llm_model AS llm_model,
+                   e.llm_interpreter_model AS llm_interpreter_model
             LIMIT 1
             """,
             engagement_id=engagement_id,
@@ -76,6 +78,8 @@ class Neo4jGraphState:
             session_cookie_names=tuple(row.get("session_cookie_names") or ()),
             identity_key=row.get("identity_key"),
             environment=row.get("environment"),
+            llm_model=row.get("llm_model"),
+            llm_interpreter_model=row.get("llm_interpreter_model"),
             declared_principals=self._fetch_declared_principals(engagement_id),
         )
 
@@ -110,6 +114,27 @@ class Neo4jGraphState:
         if not rows:
             return None
         return rows[0].get("identity_key")
+
+    def get_engagement_llm_models(
+        self, engagement_id: EngagementId
+    ) -> tuple[str | None, str | None]:
+        """Return ``(llm_model, llm_interpreter_model)`` from the Engagement node.
+
+        ``(None, None)`` if the engagement predates ADR-0051 persistence or the
+        properties are unset. Reader-side fallback (interpreter→planner model) is
+        the resolver's job, not this function's.
+        """
+
+        rows = self._client.execute_read(
+            "MATCH (e:Engagement {id: $engagement_id}) "
+            "RETURN e.llm_model AS llm_model, "
+            "e.llm_interpreter_model AS llm_interpreter_model LIMIT 1",
+            engagement_id=engagement_id,
+        )
+        if not rows:
+            return (None, None)
+        row = rows[0]
+        return (row.get("llm_model"), row.get("llm_interpreter_model"))
 
     def _fetch_declared_principals(
         self, engagement_id: EngagementId
@@ -305,6 +330,8 @@ def _engagement_update(client: Neo4jClient, m: PlannedMutation) -> None:
             e.session_cookie_names = $props.session_cookie_names,
             e.identity_key = $props.identity_key,
             e.environment = $props.environment,
+            e.llm_model = $props.llm_model,
+            e.llm_interpreter_model = $props.llm_interpreter_model,
             e.last_seen = $props.last_seen
         """,
         id=props["id"],
