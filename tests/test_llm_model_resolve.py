@@ -7,6 +7,8 @@ on both commands' `--help`. No Neo4j, no network.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 from typer.testing import CliRunner
 
@@ -14,6 +16,15 @@ from doo.dispatch.cli import _resolve_interpreter_model
 from doo.planner.cli import _resolve_planner_model
 
 DEFAULT = "anthropic/claude-opus-4-8"
+
+# Rich force-enables colour under GITHUB_ACTIONS and renders option flags as
+# two styled spans (``\x1b[1;36m-\x1b[0m\x1b[1;36m-model\x1b[0m``), so a literal
+# ``"--model"`` substring check fails in CI. Strip ANSI before asserting.
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _plain(s: str) -> str:
+    return _ANSI.sub("", s)
 
 
 @pytest.fixture(autouse=True)
@@ -139,8 +150,9 @@ def test_planner_propose_help_mentions_model_flag() -> None:
         app, ["planner", "propose", "--help"], env={"COLUMNS": "200"}
     )
     assert result.exit_code == 0, result.output
-    assert "--model" in result.output
-    assert "DOO_PLANNER_MODEL" in result.output
+    out = _plain(result.output)
+    assert "--model" in out
+    assert "DOO_PLANNER_MODEL" in out
 
 
 def test_dispatch_run_help_mentions_model_flag() -> None:
@@ -150,5 +162,6 @@ def test_dispatch_run_help_mentions_model_flag() -> None:
         app, ["dispatch", "run", "--help"], env={"COLUMNS": "200"}
     )
     assert result.exit_code == 0, result.output
-    assert "--model" in result.output
-    assert "DOO_INTERPRETER_MODEL" in result.output
+    out = _plain(result.output)
+    assert "--model" in out
+    assert "DOO_INTERPRETER_MODEL" in out
