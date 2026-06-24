@@ -28,7 +28,10 @@ from doo.ids import (
     TestCaseKeyHash,
 )
 from doo.infra.neo4j_driver import Neo4jClient
+from doo.observability.logging import get_logger
 from doo.ontology.queries import for_engagement
+
+log = get_logger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,9 +40,17 @@ class EvidenceObservation:
 
     Carries only what request construction needs: the concrete request shape
     (method, host, path, query/header/cookie name→value pairs) plus the
-    Endpoint's current `path_template` (for `OpaInput`, ADR-0046) and the victim
-    `auth_context_id` (for `baseline_victim` in S5+). Bodies stay as blob refs
-    (ADR-0015); raw secret-shaped values are already scrubbed at L2.
+    Endpoint's current `path_template` (for `OpaInput`, ADR-0046) and the live AC
+    to send `baseline_victim` under (S5+). Bodies stay as blob refs (ADR-0015);
+    raw secret-shaped values are already scrubbed at L2.
+
+    `baseline_victim_auth_context_id` (ADR-0052) is "the live AC to send
+    `baseline_victim` under," which may differ from the AC the evidence was
+    *observed* under: when the observed victim AC is discovered-tier (an expired
+    HAR session with no slot), `load_evidence` walks the shared Principal's
+    declared siblings and substitutes the live declared id whose `slot` matches
+    the observed carrier. Observed provenance stays recoverable via
+    `observation_id → OBSERVED_UNDER → AuthContext`.
     """
 
     observation_id: ObservationId
@@ -52,7 +63,7 @@ class EvidenceObservation:
     cookies: dict[str, str] = field(default_factory=dict)
     body_blob_key: str | None = None
     body_content_type: str | None = None
-    victim_auth_context_id: AuthContextId | None = None
+    baseline_victim_auth_context_id: AuthContextId | None = None
     confidence: float = 1.0
 
 
@@ -145,7 +156,9 @@ def load_evidence(
                h.canonical_hostname AS host,
                h.port AS port,
                h.is_ip_literal AS is_ip,
-               ac.id AS victim_ac_id
+               ac.id AS victim_ac_id,
+               ac.tier AS victim_ac_tier,
+               ac.token_kind AS victim_ac_carrier
         """,
         key_hash=testcase.key_hash,
         **frag.parameters,
@@ -153,6 +166,32 @@ def load_evidence(
     if not rows:
         return None
     row = rows[0]
+    observed_victim_ac = (
+        AuthContextId(str(row["victim_ac_id"]))
+        if row.get("victim_ac_id") is not None
+        else None
+    )
+    # ADR-0052: when the observed victim AC is discovered-tier (an expired HAR
+    # session with no slot, so `material_for` would miss), follow the shared
+    # Principal's `OF_PRINCIPAL` edge to a live declared sibling whose `slot`
+    # matches the observed carrier. Strictly additive: a declared observed AC, a
+    # miss, or an ambiguous walk all leave the observed (discovered) id in place
+    # → the existing un-armable path.
+    baseline_victim_ac = observed_victim_ac
+    if observed_victim_ac is not None and str(row.get("victim_ac_tier")) == "discovered":
+        resolved = _walk_baseline_victim_sibling(
+            client,
+            engagement_id=engagement_id,
+            key_hash=testcase.key_hash,
+            observed_auth_context_id=observed_victim_ac,
+            observed_carrier=(
+                str(row["victim_ac_carrier"])
+                if row.get("victim_ac_carrier") is not None
+                else None
+            ),
+        )
+        if resolved is not None:
+            baseline_victim_ac = resolved
     return EvidenceObservation(
         observation_id=ObservationId(str(row["observation_id"])),
         method=str(row["method"]),
@@ -169,13 +208,133 @@ def load_evidence(
         cookies=_kv(row.get("cookies")),
         body_blob_key=row.get("body_blob_key"),
         body_content_type=row.get("body_content_type"),
-        victim_auth_context_id=(
-            AuthContextId(str(row["victim_ac_id"]))
-            if row.get("victim_ac_id") is not None
-            else None
-        ),
+        baseline_victim_auth_context_id=baseline_victim_ac,
         confidence=float(row["confidence"]),
     )
+
+
+@dataclass(frozen=True, slots=True)
+class _DeclaredSibling:
+    """A declared `AuthContext` sharing the observed victim's Principal (ADR-0052).
+
+    `slot` is the ADR-0049 rotation-stable label (defaults to `token_kind`, but
+    may be a custom name like `session` / `stepup`); `carrier` is the AC's
+    `token_kind` (bearer / cookie / api_key), which is what we match the observed
+    discovered session's carrier against. Two declared cookie credentials can
+    share a carrier under *distinct* slots — that is the ambiguous shape.
+    """
+
+    principal_id: str
+    id: AuthContextId
+    slot: str | None
+    carrier: str | None
+
+
+def _walk_baseline_victim_sibling(
+    client: Neo4jClient,
+    *,
+    engagement_id: EngagementId,
+    key_hash: TestCaseKeyHash,
+    observed_auth_context_id: AuthContextId,
+    observed_carrier: str | None,
+) -> AuthContextId | None:
+    """ADR-0052: resolve a live declared sibling for a discovered victim AC.
+
+    Follows the `OF_PRINCIPAL` edge L3 already drew between the discovered HAR
+    session and the declared Principal it converged onto (ADR-0048) — this is
+    *not* a re-run of identity matching. The shared Principal's declared siblings
+    are handed (with the observed carrier) to the pure selector; generation is
+    left to `SlotResolvingSecretStore`'s rotation overlay.
+
+    Returns the resolved declared id, or `None` when the selector declines
+    (no carrier match / ambiguous / no sibling) — leaving the existing
+    un-armable path untouched.
+    """
+
+    # The brief's verbatim walk, plus `decl.token_kind AS carrier`: a declared
+    # cookie credential may carry a custom `slot` (session / stepup), so the
+    # carrier match is on `token_kind` while ambiguity is judged on distinct
+    # `slot`s (the ADR-0049 dedup key).
+    rows = client.execute_read(
+        """
+        MATCH (ac:AuthContext {engagement_id: $eid, id: $victim_ac_id})
+              -[:OF_PRINCIPAL]->(p:Principal)
+        MATCH (p)<-[:OF_PRINCIPAL]-(decl:AuthContext {tier: 'declared'})
+        RETURN p.id AS principal_id, decl.id AS id, decl.slot AS slot,
+               decl.token_kind AS carrier
+        """,
+        eid=str(engagement_id),
+        victim_ac_id=str(observed_auth_context_id),
+    )
+    siblings = [
+        _DeclaredSibling(
+            principal_id=str(r["principal_id"]),
+            id=AuthContextId(str(r["id"])),
+            slot=str(r["slot"]) if r.get("slot") is not None else None,
+            carrier=str(r["carrier"]) if r.get("carrier") is not None else None,
+        )
+        for r in rows
+    ]
+    resolved = _resolve_baseline_victim_sibling(observed_carrier, siblings)
+    if resolved is not None:
+        match = next(s for s in siblings if s.id == resolved)
+        log.info(
+            "dispatch.evidence.baseline_victim_resolved_via_sibling",
+            engagement_id=str(engagement_id),
+            key_hash=key_hash,
+            observed_auth_context_id=str(observed_auth_context_id),
+            resolved_auth_context_id=str(resolved),
+            principal_id=match.principal_id,
+            carrier=observed_carrier,
+            slot=match.slot,
+        )
+    else:
+        # Only a genuine walk attempt (carrier present, siblings existed) is
+        # worth surfacing; a no-sibling discovered AC is the common, expected
+        # un-armable shape (#160) and stays quiet.
+        if observed_carrier is not None and siblings:
+            log.debug(
+                "dispatch.evidence.baseline_victim_sibling_ambiguous",
+                engagement_id=str(engagement_id),
+                key_hash=key_hash,
+                observed_auth_context_id=str(observed_auth_context_id),
+                carrier=observed_carrier,
+                candidate_count=len(siblings),
+            )
+    return resolved
+
+
+def _resolve_baseline_victim_sibling(
+    observed_carrier: str | None,
+    siblings: list[_DeclaredSibling],
+) -> AuthContextId | None:
+    """Pure selector (ADR-0052): pick the live declared sibling to send under.
+
+    The discovered observed AC has `slot=None`, so we match its carrier
+    (`token_kind`: bearer / cookie / api_key) against each declared sibling's
+    carrier (`token_kind`); ambiguity is judged on the sibling's `slot` (the
+    ADR-0049 `(principal_label, slot)` dedup key). Strictly additive — never
+    flips an existing outcome:
+
+    - no carrier / no sibling → None (un-armable, unchanged);
+    - siblings exist but none share the carrier → None (never replay over a
+      different carrier — false-negative risk);
+    - exactly one *distinct slot* among the carrier matches → resolve it;
+      multiple generations of that one slot collapse via the dedup key, and
+      `SlotResolvingSecretStore` picks the latest generation — so we return the
+      first matching id and let the overlay choose;
+    - ≥2 *distinct slots* share the carrier → None (ambiguous, don't guess).
+    """
+
+    if observed_carrier is None or not siblings:
+        return None
+    matches = [s for s in siblings if s.carrier == observed_carrier]
+    if not matches:
+        return None
+    distinct_slots = {s.slot for s in matches}
+    if len(distinct_slots) > 1:
+        return None
+    return matches[0].id
 
 
 def _kv(raw: object) -> dict[str, str]:

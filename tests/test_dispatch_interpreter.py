@@ -82,7 +82,7 @@ def _evidence() -> EvidenceObservation:
         concrete_path="/orders/123",
         path_template="/orders/{order_id}",
         headers={"Authorization": "Bearer victim", "Accept": "application/json"},
-        victim_auth_context_id=AuthContextId("ac-victim"),
+        baseline_victim_auth_context_id=AuthContextId("ac-victim"),
     )
 
 
