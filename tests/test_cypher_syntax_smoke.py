@@ -28,7 +28,6 @@ from neo4j.exceptions import CypherSyntaxError
 
 from doo.infra.neo4j_driver import Neo4jClient
 from doo.ontology.schema import apply_schema
-
 from tests._cypher_registry import REGISTRY, RecordingClient
 
 
