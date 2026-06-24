@@ -82,14 +82,42 @@ _SCOPE_RULES = {
     "required_headers": [],
 }
 
+# A discovered-tier evidence row for `load_evidence`'s first read (#164). Without
+# it that read returns `[]` and `load_evidence` returns early, so the ADR-0052
+# sibling-walk follow-up query (`_walk_baseline_victim_sibling`) never fires and
+# escapes the EXPLAIN net. `victim_ac_tier = "discovered"` drives `load_evidence`
+# into the walk; the fields below are the minimum its `EvidenceObservation`
+# construction reads.
+_EVIDENCE_ROW = {
+    "observation_id": "ro-smoke",
+    "method": "GET",
+    "concrete_path": "/orders/1",
+    "query": [],
+    "headers": [],
+    "cookies": [],
+    "body_blob_key": None,
+    "body_content_type": None,
+    "confidence": 1.0,
+    "path_template": "/orders/{id}",
+    "scheme": "https",
+    "host": "shop.example.com",
+    "port": None,
+    "is_ip": False,
+    "victim_ac_id": "ac-victim-discovered",
+    "victim_ac_tier": "discovered",
+    "victim_ac_carrier": "cookie",
+}
+
 
 class RecordingClient:
     """`Neo4jClient`-shaped double that records every rendered Cypher string.
 
     `execute_read` / `execute_write` append the `cypher` to `self.queries` and
     return canned rows: the Scope-rules row when the scope read fires (so the
-    coverage entrypoints don't raise before emitting their later queries), and
-    `[]` otherwise. Every registered entrypoint either loops over the rows
+    coverage entrypoints don't raise before emitting their later queries), a
+    discovered-tier evidence row for `load_evidence`'s first read (so it proceeds
+    into the ADR-0052 sibling-walk and that query is captured too, #164), and
+    `[]` otherwise. Every other registered entrypoint either loops over the rows
     (empty -> empty result) or already handles a `None`/`[]` result, so an empty
     return never short-circuits the Cypher we want to capture.
     """
@@ -108,6 +136,11 @@ class RecordingClient:
         self.calls.append((cypher, params))
         if "UNDER_SCOPE" in cypher and "Scope" in cypher:
             return [{"rules": json.dumps(_SCOPE_RULES)}]
+        # `load_evidence`'s first read (#164): hand back a discovered-tier row so
+        # the call proceeds into the ADR-0052 sibling-walk and that query is
+        # captured too. `coalesce(rb, re, rp)` is unique to that read.
+        if "coalesce(rb, re, rp)" in cypher:
+            return [dict(_EVIDENCE_ROW)]
         return []
 
     def execute_read(self, cypher: str, **params: Any) -> list[dict[str, Any]]:
