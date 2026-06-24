@@ -85,7 +85,7 @@ from doo.dispatch.ontology import BodyStore, commit_agent_send
 from doo.dispatch.reactive import ReactiveEmitter
 from doo.dispatch.secrets import AuthMaterial, SecretStore, SlotMaterialMissing
 from doo.dispatch.selection import select_testcases
-from doo.events.execution import DispatchStatus
+from doo.events.execution import DISPATCH_STATUSES, DispatchStatus
 from doo.ids import (
     AuthContextId,
     DispatchRunId,
@@ -761,11 +761,15 @@ def _run_interpreter(
         terminated_by=loop_result.terminated_by,
     )
 
-    # The loop's additional sends (excluding the pre-loaded `primary`).
+    # The loop's additional sends (excluding the pre-loaded `primary`). Filter
+    # to real `DispatchStatus` values: `sent_roles` may carry the loop-local
+    # `"unarmable"` sentinel (recorded by the send tool when a baseline could
+    # not be armed — see `_guard_differential_verdict`), which never reached
+    # the wire and is NOT a valid `EXECUTED_AS.dispatch_status` / ledger send.
     extra_sends: list[tuple[RequestRole, DispatchStatus, ObservationId | None]] = [
-        (r.role, r.dispatch_status, r.observation_id)  # type: ignore[misc]
+        (r.role, r.dispatch_status, r.observation_id)
         for role, r in ctx.sent_roles.items()
-        if role != "primary"
+        if role != "primary" and r.dispatch_status in DISPATCH_STATUSES
     ]
     return _InterpreterOutcome(extra_sends=extra_sends, finding=finding_outcome)
 

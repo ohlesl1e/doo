@@ -646,6 +646,19 @@ def test_guard_still_downgrades_when_unarmable_mixed_with_wire_failure() -> None
     assert out.verdict == "inconclusive"
 
 
+def test_unarmable_sentinel_is_not_a_dispatch_status() -> None:
+    """Regression: the `"unarmable"` sentinel the send tool records in
+    `ctx.sent_roles` is loop-local — it must NOT be a valid `DispatchStatus`
+    (else it would leak to `RunOutcome.sends` / `EXECUTED_AS.dispatch_status`
+    via `_run_interpreter`'s `extra_sends` sweep, which filters on
+    `DISPATCH_STATUSES`). If this fails because someone added `unarmable` to
+    the enum, the filter in `_run_interpreter` is now a no-op and the graph
+    will grow `EXECUTED_AS` edges for sends that never reached the wire."""
+    from doo.events.execution import DISPATCH_STATUSES
+
+    assert "unarmable" not in DISPATCH_STATUSES
+
+
 def test_guard_passthrough_on_non_differential_class() -> None:
     """A class not in `ROLES_BY_TEST_CLASS` (or with only `primary`) is untouched."""
     from doo.dispatch.run import _guard_differential_verdict
