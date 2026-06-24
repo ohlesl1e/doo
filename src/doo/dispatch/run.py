@@ -85,7 +85,7 @@ from doo.dispatch.ontology import BodyStore, commit_agent_send
 from doo.dispatch.reactive import ReactiveEmitter
 from doo.dispatch.secrets import AuthMaterial, SecretStore, SlotMaterialMissing
 from doo.dispatch.selection import select_testcases
-from doo.events.execution import DispatchStatus
+from doo.events.execution import DISPATCH_STATUSES, DispatchStatus
 from doo.ids import (
     AuthContextId,
     DispatchRunId,
@@ -551,6 +551,14 @@ def _execute_one(
 _DIFFERENTIAL_CLASSES: frozenset[str] = frozenset(
     cls for cls, roles in ROLES_BY_TEST_CLASS.items() if len(roles) > 1
 )
+#: For each differential class, the non-`primary` roles the guard expects the
+#: confirm loop to have exercised. Keyed `str` (matching the guard's `test_class`
+#: param) so the lookup needs no `TestClass` cast.
+_BASELINE_ROLES_BY_CLASS: dict[str, tuple[RequestRole, ...]] = {
+    cls: tuple(r for r in roles if r != "primary")
+    for cls, roles in ROLES_BY_TEST_CLASS.items()
+    if len(roles) > 1
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -590,6 +598,27 @@ def _guard_differential_verdict(
         for role, r in sent_roles.items()
     )
     if baseline_ok:
+        return verdict
+    # #124 acceptance criterion 2: if the Interpreter attempted EVERY baseline
+    # this class offers and the system could arm none of them
+    # (`dispatch_status="unarmable"` — discovered-tier victim with no live
+    # material, recorded by the send tool before raising `ToolError`), defer to
+    # the LLM verdict. The tool error already steers it toward `inconclusive`
+    # unless the primary body alone is conclusive; that judgment is the floor
+    # here. A baseline that *could* be armed but failed on the wire
+    # (`transport_error` etc.) is NOT this case — that's a re-run, downgrade.
+    expected_baselines = _BASELINE_ROLES_BY_CLASS[test_class]
+    if expected_baselines and all(
+        sent_roles.get(r) is not None
+        and sent_roles[r].dispatch_status == "unarmable"
+        for r in expected_baselines
+    ):
+        log.info(
+            "interpreter.verdict_deferred",
+            test_class=test_class,
+            reason="all baseline roles unarmable; deferring to LLM judgment",
+            baselines=list(expected_baselines),
+        )
         return verdict
     log.warning(
         "interpreter.verdict_downgraded",
@@ -732,11 +761,15 @@ def _run_interpreter(
         terminated_by=loop_result.terminated_by,
     )
 
-    # The loop's additional sends (excluding the pre-loaded `primary`).
+    # The loop's additional sends (excluding the pre-loaded `primary`). Filter
+    # to real `DispatchStatus` values: `sent_roles` may carry the loop-local
+    # `"unarmable"` sentinel (recorded by the send tool when a baseline could
+    # not be armed — see `_guard_differential_verdict`), which never reached
+    # the wire and is NOT a valid `EXECUTED_AS.dispatch_status` / ledger send.
     extra_sends: list[tuple[RequestRole, DispatchStatus, ObservationId | None]] = [
-        (r.role, r.dispatch_status, r.observation_id)  # type: ignore[misc]
+        (r.role, r.dispatch_status, r.observation_id)
         for role, r in ctx.sent_roles.items()
-        if role != "primary"
+        if role != "primary" and r.dispatch_status in DISPATCH_STATUSES
     ]
     return _InterpreterOutcome(extra_sends=extra_sends, finding=finding_outcome)
 
