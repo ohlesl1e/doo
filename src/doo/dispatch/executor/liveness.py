@@ -133,10 +133,12 @@ def infer_self_endpoint(
     rows = client.execute_read(
         f"""
         MATCH (r:RequestObservation)-[:OBSERVED_UNDER]->(ac:AuthContext {{id: $ac_id}})
-        {frag.and_("r.status = 'active'")}
-        WHERE coalesce(r.response_status, 0) >= 200
-          AND coalesce(r.response_status, 0) < 300
-          AND any(s IN $suffixes WHERE toLower(r.concrete_path) ENDS WITH s)
+        {frag.and_(
+            "r.status = 'active' "
+            "AND coalesce(r.response_status, 0) >= 200 "
+            "AND coalesce(r.response_status, 0) < 300 "
+            "AND any(s IN $suffixes WHERE toLower(r.concrete_path) ENDS WITH s)"
+        )}
         RETURN r.method AS method, r.concrete_path AS path
         ORDER BY coalesce(r.confidence, 1.0) DESC, r.last_seen DESC
         LIMIT 1
