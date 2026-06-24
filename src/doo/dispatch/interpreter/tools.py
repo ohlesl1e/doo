@@ -106,7 +106,7 @@ def send_http_request_within_scope(ctx: ToolContext, *, role: str) -> SendToolRe
     # under the attacker's (the TestCase's `auth_context_id`).
     material = ctx.attacker_material
     if typed_role == "baseline_victim":
-        victim_ac = ctx.evidence.victim_auth_context_id
+        victim_ac = ctx.evidence.baseline_victim_auth_context_id
         victim_mat = ctx.secrets.material_for(victim_ac) if victim_ac else None
         if victim_mat is None:
             # Record the attempt BEFORE raising so the differential guard

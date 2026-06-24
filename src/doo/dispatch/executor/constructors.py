@@ -163,9 +163,10 @@ def idor_baseline_victim(
 
     The control the Interpreter diffs the `primary` against (ADR-0043): a
     generic-200 that returns the same body for everyone is NOT an IDOR. `auth`
-    here is the **victim's** material (the evidence's `victim_auth_context_id`,
-    not the TestCase's attacker `auth_context_id`); the run driver looks it up
-    and passes it. This send is *not* a new TestCase (a control, not a
+    here is the **victim's** material (the evidence's
+    `baseline_victim_auth_context_id`, not the TestCase's attacker
+    `auth_context_id`); the run driver looks it up and passes it. This send is
+    *not* a new TestCase (a control, not a
     hypothesis) but it IS a real send through the Dispatcher under the victim's
     auth — so `AuthContext` rotation (ADR-0014) and rate limits apply.
     """
@@ -178,7 +179,7 @@ def idor_baseline_victim(
         session_cookie_name=None,
     )
     # The send is OBSERVED_UNDER the victim's AuthContext, not the TestCase's.
-    victim_ac = evidence.victim_auth_context_id or testcase.auth_context_id
+    victim_ac = evidence.baseline_victim_auth_context_id or testcase.auth_context_id
     return ConcreteRequest(
         method=evidence.method,
         host=evidence.host,
