@@ -109,6 +109,21 @@ def send_http_request_within_scope(ctx: ToolContext, *, role: str) -> SendToolRe
         victim_ac = ctx.evidence.victim_auth_context_id
         victim_mat = ctx.secrets.material_for(victim_ac) if victim_ac else None
         if victim_mat is None:
+            # Record the attempt BEFORE raising so the differential guard
+            # (`_guard_differential_verdict`) can distinguish "Interpreter
+            # never tried a baseline" (the #124 lazy case → downgrade) from
+            # "Interpreter tried, system couldn't arm it" (#124 acceptance
+            # criterion 2 → defer to the LLM's escape-hatch judgment below).
+            # `unarmable` is loop-local — never an `EXECUTED_AS.dispatch_status`.
+            ctx.sent_roles[typed_role] = SendToolResult(
+                role=typed_role,
+                dispatch_status="unarmable",
+                http_status=None,
+                response_size=0,
+                observation_id=None,
+                body_ref=None,
+                note="no live victim material (discovered-tier evidence)",
+            )
             raise ToolError(
                 "baseline_victim requires the victim's live auth material; the "
                 "evidence observation's AuthContext is not a declared principal "

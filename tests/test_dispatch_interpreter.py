@@ -284,6 +284,13 @@ def test_send_tool_baseline_victim_without_victim_material_raises_toolerror() ->
     assert "Emit `inconclusive`" in msg
     assert "bare 200 without a baseline is NOT evidence" in msg
     assert "Judge from primary alone" not in msg
+    # The attempt is recorded with a sentinel `dispatch_status="unarmable"` so
+    # the differential guard can distinguish "Interpreter never tried" from
+    # "Interpreter tried, system couldn't arm it" (#124 acceptance criterion 2).
+    assert "baseline_victim" in ctx.sent_roles
+    rec = ctx.sent_roles["baseline_victim"]
+    assert rec.dispatch_status == "unarmable"
+    assert rec.observation_id is None  # nothing reached the wire
 
 
 # ---------------------------------------------------------------------------
@@ -580,6 +587,63 @@ def test_guard_keeps_vulnerable_when_baseline_anonymous_ok() -> None:
         },
     )
     assert out is v
+
+
+def test_guard_defers_to_llm_when_all_baselines_unarmable() -> None:
+    """#124 acceptance criterion 2: `auth-bypass` with `baseline_victim`
+    un-armable (discovered-tier victim, no live material) and no other baseline
+    role available → the LLM's escape-hatch judgment stands. The Interpreter
+    *did* try; the system couldn't arm it. The tool error already steers toward
+    `inconclusive` unless the primary body alone is conclusive — that judgment
+    is the floor here, not the unconditional downgrade."""
+    from doo.dispatch.run import _guard_differential_verdict
+
+    v = _vuln()
+    out = _guard_differential_verdict(
+        v,
+        test_class="auth-bypass",
+        sent_roles={
+            "primary": _send("primary"),
+            "baseline_victim": _send("baseline_victim", ds="unarmable"),
+        },
+    )
+    assert out is v
+
+
+def test_guard_still_downgrades_when_unarmable_but_other_baseline_unattempted() -> None:
+    """#126 fallback: priv-esc has `baseline_anonymous` available. If
+    `baseline_victim` is un-armable but the Interpreter never tried the
+    anonymous fallback, the guard still downgrades — the loop had a satisfiable
+    baseline and didn't use it (the original #124 lazy-Interpreter case)."""
+    from doo.dispatch.run import _guard_differential_verdict
+
+    out = _guard_differential_verdict(
+        _vuln(),
+        test_class="privilege-escalation",
+        sent_roles={
+            "primary": _send("primary"),
+            "baseline_victim": _send("baseline_victim", ds="unarmable"),
+        },
+    )
+    assert out.verdict == "inconclusive"
+
+
+def test_guard_still_downgrades_when_unarmable_mixed_with_wire_failure() -> None:
+    """`unarmable` is special; `transport_error` is not. A baseline that *could*
+    be armed but failed on the wire is the re-run case — downgrade so C5
+    surfaces it. Only "every baseline is structurally un-armable" defers."""
+    from doo.dispatch.run import _guard_differential_verdict
+
+    out = _guard_differential_verdict(
+        _vuln(),
+        test_class="privilege-escalation",
+        sent_roles={
+            "primary": _send("primary"),
+            "baseline_victim": _send("baseline_victim", ds="unarmable"),
+            "baseline_anonymous": _send("baseline_anonymous", ds="transport_error"),
+        },
+    )
+    assert out.verdict == "inconclusive"
 
 
 def test_guard_passthrough_on_non_differential_class() -> None:
