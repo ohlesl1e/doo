@@ -15,7 +15,13 @@ import pytest
 from pydantic import ValidationError
 
 from doo.canonical.identity import auth_context_id, compute_auth_hash
-from doo.dispatch.auth_helper import AuthHelper, ManagedAuthContext, RateLimiter
+from doo.dispatch.auth_helper import (
+    _RATE_WINDOW_S,
+    AuthHelper,
+    ManagedAuthContext,
+    RateLimiter,
+    RotateOutcome,
+)
 from doo.dispatch.reactive import AUTH_REACTIVE_STREAM, REACTIVE_AUTH_INVALID
 from doo.dispatch.secrets import AuthMaterial, EnvSecretStore
 from doo.ids import AuthContextId, EngagementId
@@ -45,7 +51,14 @@ def _refresh(**kw: Any) -> RefreshConfig:
     return RefreshConfig(**base)
 
 
-def _helper(tmp_path: Path, *, clock_box: dict[str, float], **rc_kw: Any) -> AuthHelper:
+def _helper(
+    tmp_path: Path,
+    *,
+    clock_box: dict[str, float],
+    max_consecutive_dead: int = 3,
+    backoff_reset_s: float = 7200.0,
+    **rc_kw: Any,
+) -> AuthHelper:
     rc = _refresh(**rc_kw)
     helper = AuthHelper(
         engagement_id=ENG,
@@ -59,7 +72,10 @@ def _helper(tmp_path: Path, *, clock_box: dict[str, float], **rc_kw: Any) -> Aut
         id_to_slot={AC: SLOT},
         env={},
         clock=lambda: clock_box["t"],
+        rate_limiter=RateLimiter(clock=lambda: clock_box["t"]),
         mechanisms={"command": lambda rc, env, verify: "NEW-TOKEN"},
+        max_consecutive_dead=max_consecutive_dead,
+        backoff_reset_s=backoff_reset_s,
     )
     helper._schedule_all()
     return helper
@@ -99,7 +115,7 @@ def test_due_proactively_fires_at_exp_minus_margin(tmp_path: Path) -> None:
 def test_rotate_writes_rotation_file_and_graph(tmp_path: Path) -> None:
     box = {"t": 0.0}
     helper = _helper(tmp_path, clock_box=box, validity_window_s=100, max_refreshes_per_hour=2)
-    assert helper.rotate(SLOT, reason="reactive") is True
+    assert helper.rotate(SLOT, reason="reactive") == RotateOutcome.ROTATED
 
     import json
 
@@ -134,7 +150,7 @@ def test_rotate_writes_identity_claims_and_validity_window(tmp_path: Path) -> No
     )
     helper = _helper(tmp_path, clock_box=box)
     helper.mechanisms["command"] = lambda rc, env, verify: rotated
-    assert helper.rotate(SLOT, reason="proactive") is True
+    assert helper.rotate(SLOT, reason="proactive") == RotateOutcome.ROTATED
 
     write = helper.neo4j.writes[0]  # type: ignore[attr-defined]
     import json as _json
@@ -147,7 +163,7 @@ def test_rotate_writes_identity_claims_and_validity_window(tmp_path: Path) -> No
     # Opaque (non-JWT) credential → empty claims, no window; non-fatal.
     helper2 = _helper(tmp_path, clock_box=box)
     helper2.mechanisms["command"] = lambda rc, env, verify: "opaque-not-a-jwt"
-    assert helper2.rotate(SLOT, reason="proactive") is True
+    assert helper2.rotate(SLOT, reason="proactive") == RotateOutcome.ROTATED
     write2 = helper2.neo4j.writes[0]  # type: ignore[attr-defined]
     assert _json.loads(write2["identity_claims"]) == {}
     assert write2["validity_window"] is None
@@ -180,7 +196,7 @@ def test_rotate_quoted_cookie_hashes_canonical_writes_wire_raw(tmp_path: Path) -
         mechanisms={"command": lambda rc, env, verify: wire},
     )
     helper._schedule_all()
-    assert helper.rotate(cookie_slot, reason="reactive") is True
+    assert helper.rotate(cookie_slot, reason="reactive") == RotateOutcome.ROTATED
 
     import json
 
@@ -204,16 +220,16 @@ def test_rotate_threads_tls_verify_to_mechanism(tmp_path: Path) -> None:
     helper = _helper(tmp_path, clock_box=box)
     helper.tls_verify = False
     helper.mechanisms["command"] = _mech
-    assert helper.rotate(SLOT, reason="reactive") is True
+    assert helper.rotate(SLOT, reason="reactive") == RotateOutcome.ROTATED
     assert seen == [False]
 
 
 def test_rotate_respects_rate_limit(tmp_path: Path) -> None:
     box = {"t": 0.0}
     helper = _helper(tmp_path, clock_box=box, max_refreshes_per_hour=2)
-    assert helper.rotate(SLOT, reason="reactive") is True
-    assert helper.rotate(SLOT, reason="reactive") is True
-    assert helper.rotate(SLOT, reason="reactive") is False  # 3rd within the hour blocked
+    assert helper.rotate(SLOT, reason="reactive") == RotateOutcome.ROTATED
+    assert helper.rotate(SLOT, reason="reactive") == RotateOutcome.ROTATED
+    assert helper.rotate(SLOT, reason="reactive") == RotateOutcome.RATE_LIMITED  # 3rd within the hour blocked
 
 
 def test_rotate_failed_mechanism_returns_false(tmp_path: Path) -> None:
@@ -224,7 +240,7 @@ def test_rotate_failed_mechanism_returns_false(tmp_path: Path) -> None:
         raise RuntimeError("idp down")
 
     helper.mechanisms["command"] = boom
-    assert helper.rotate(SLOT, reason="proactive") is False
+    assert helper.rotate(SLOT, reason="proactive") == RotateOutcome.FAILED
     assert not (tmp_path / "rotation.json").exists()  # nothing written on failure
 
 
@@ -400,3 +416,93 @@ def test_unused_stream_constant_importable() -> None:
 
 def test_auth_material_importable() -> None:
     assert AuthMaterial(kind="bearer", raw="x", principal_label="p").tier == "declared"
+
+
+# --- back-off (#169) -------------------------------------------------------
+
+
+def test_rotate_backs_off_after_k_consecutive_dead(tmp_path: Path) -> None:
+    """K reactive rotations (each a dead mint, signalled by the next event) →
+    the slot is `UNRECOVERABLE` and is no longer rotated, even proactively."""
+    box = {"t": 0.0}
+    helper = _helper(
+        tmp_path, clock_box=box, max_consecutive_dead=2, max_refreshes_per_hour=100
+    )
+    assert helper.rotate(SLOT, reason="reactive") == RotateOutcome.ROTATED
+    assert helper.rotate(SLOT, reason="reactive") == RotateOutcome.ROTATED
+    # The (K+1)th attempt: counter is at K → refuse, mark unrecoverable.
+    assert helper.rotate(SLOT, reason="reactive") == RotateOutcome.UNRECOVERABLE
+    assert SLOT in helper._unrecoverable
+    # A dead slot is no longer refreshed by ANY path — including proactive.
+    assert helper.rotate(SLOT, reason="proactive") == RotateOutcome.UNRECOVERABLE
+
+
+def test_backoff_counter_resets_after_quiet_window(tmp_path: Path) -> None:
+    """A trigger long after the last attempt is a fresh problem — the counter
+    resets, so isolated failures never accumulate into `unrecoverable`."""
+    box = {"t": 0.0}
+    helper = _helper(
+        tmp_path,
+        clock_box=box,
+        max_consecutive_dead=3,
+        backoff_reset_s=100.0,
+        max_refreshes_per_hour=100,
+    )
+    box["t"] = 0.0
+    assert helper.rotate(SLOT, reason="reactive") == RotateOutcome.ROTATED
+    box["t"] = 10.0
+    assert helper.rotate(SLOT, reason="reactive") == RotateOutcome.ROTATED
+    assert helper._consecutive_dead[SLOT] == 2
+    # Quiet for > backoff_reset_s → the next reactive trigger starts fresh.
+    box["t"] = 200.0
+    assert helper.rotate(SLOT, reason="reactive") == RotateOutcome.ROTATED
+    assert helper._consecutive_dead[SLOT] == 1
+    assert SLOT not in helper._unrecoverable
+
+
+def test_rate_limited_reactive_is_retried_not_dropped(tmp_path: Path) -> None:
+    """A rate-limited reactive rotation parks the slot for an in-process retry
+    (not silently dropped); the event is still acked, and `process_retries`
+    re-drives it once the window passes (#169)."""
+    box = {"t": 0.0}
+    helper = _helper(tmp_path, clock_box=box, max_refreshes_per_hour=1)
+    # Exhaust the 1/hour budget.
+    assert helper.rotate(SLOT, reason="reactive") == RotateOutcome.ROTATED
+
+    helper.streams = _FakeStream(  # type: ignore[assignment]
+        [
+            (
+                "1-0",
+                {
+                    "kind": REACTIVE_AUTH_INVALID,
+                    "engagement_id": str(ENG),
+                    "auth_context_id": str(AC),
+                },
+            )
+        ]
+    )
+    # The event rotation is rate-limited → 0 rotations, but the slot is parked,
+    # and the Redis event is acked (the in-process queue owns the retry).
+    assert helper.poll_reactive(block_ms=0) == 0
+    assert helper.streams.acked == ["1-0"]  # type: ignore[attr-defined]
+    assert SLOT in helper._retry_due
+
+    # Before the window passes, nothing is due.
+    assert helper.process_retries(now=1.0) == 0
+    # After the window, the budget frees and the parked retry rotates.
+    box["t"] = _RATE_WINDOW_S + 1.0
+    assert helper.process_retries() == 1
+    assert SLOT not in helper._retry_due
+
+
+def test_unrecoverable_slot_drops_pending_retry(tmp_path: Path) -> None:
+    """Hitting the back-off cap clears any parked retry for the slot (#169)."""
+    box = {"t": 0.0}
+    helper = _helper(
+        tmp_path, clock_box=box, max_consecutive_dead=1, max_refreshes_per_hour=100
+    )
+    assert helper.rotate(SLOT, reason="reactive") == RotateOutcome.ROTATED
+    helper._retry_due[SLOT] = 0.0  # a stale parked retry
+    assert helper.rotate(SLOT, reason="reactive") == RotateOutcome.UNRECOVERABLE
+    assert SLOT not in helper._retry_due
+    assert SLOT not in helper._next_refresh_at
