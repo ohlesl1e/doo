@@ -42,6 +42,9 @@ def select_testcases(
     if selection.test_classes:
         predicates.append("t.test_class IN $test_classes")
         params["test_classes"] = list(selection.test_classes)
+    if selection.key_hashes:
+        predicates.append("t.key_hash IN $key_hashes")
+        params["key_hashes"] = [str(k) for k in selection.key_hashes]
     where = frag.and_(" AND ".join(predicates))
     limit = f"LIMIT {int(selection.limit)}" if selection.limit is not None else ""
 

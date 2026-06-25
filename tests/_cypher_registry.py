@@ -44,6 +44,7 @@ from doo.coverage.queries import (
     run_c5b,
 )
 from doo.coverage.reached import reached_by_auth_map, reached_map
+from doo.dispatch.candidates import list_redispatch_candidates
 from doo.dispatch.executor.evidence import DispatchTestCase, load_evidence
 from doo.dispatch.executor.liveness import infer_self_endpoint
 from doo.dispatch.finding import (
@@ -225,6 +226,12 @@ REGISTRY: list[tuple[str, Callable[[RecordingClient], None]]] = [
             principal_label="attacker-b",
             slot="bearer",
         ),
+    ),
+    # dispatch.candidates — the #171 re-dispatch candidate read (EXISTS subqueries,
+    # NOT-EXISTS, two-stage WITH/aggregate + watermark OPTIONAL MATCH).
+    (
+        "dispatch.list_redispatch_candidates",
+        _driver(list_redispatch_candidates, engagement_id=_EID),
     ),
     # dispatch.finding — proposed / reasserted listings + key resolution.
     ("dispatch.list_proposed_findings", _driver(list_proposed_findings, engagement_id=_EID)),

@@ -23,11 +23,12 @@ if TYPE_CHECKING:
     from doo.dispatch.interpreter.loop import MultiTurnLLMCaller
 
 from doo.canonical.identity import auth_context_id, compute_anonymous_auth_hash
+from doo.dispatch.candidates import RedispatchCandidate, list_redispatch_candidates
 from doo.dispatch.executor.dispatcher import OpaClient, RedisLeaseReader, StubOpaClient
 from doo.dispatch.executor.liveness import LivenessPolicy
 from doo.dispatch.executor.send import HttpxSender
 from doo.dispatch.ledger import JsonFileDispatchLedger
-from doo.dispatch.models import DispatchSelection
+from doo.dispatch.models import DispatchRun, DispatchSelection
 from doo.dispatch.ontology import NoopBodyStore
 from doo.dispatch.run import RunDependencies, arm_run, execute_run
 from doo.dispatch.secrets import (
@@ -391,6 +392,27 @@ def run_cmd(
             typer.secho("not armed; aborting.", fg=typer.colors.YELLOW, err=True)
             raise typer.Exit(code=0)
 
+    _execute_and_render(
+        cfg, run, engagement=engagement, model=model, unsafe_stub_opa=unsafe_stub_opa
+    )
+    sys.exit(0)
+
+
+def _execute_and_render(
+    cfg: EngagementConfig,
+    run: DispatchRun,
+    *,
+    engagement: str,
+    model: str | None,
+    unsafe_stub_opa: bool,
+) -> None:
+    """Build run dependencies, drain the (already-armed) run, and render the summary.
+
+    Shared by `doo dispatch run` and `doo dispatch redispatch --rerun` — both drain
+    a `DispatchRun` through the identical gate (lease → OPA → budget → wire), so the
+    rerun path picks up the #170 watermark guard + #168 verify with no special case.
+    """
+
     neo4j = _build_neo4j()
     graph_llm_model, graph_llm_interpreter_model = Neo4jGraphState(
         neo4j
@@ -482,8 +504,6 @@ def run_cmd(
             bold=True,
             err=True,
         )
-
-    sys.exit(0)
 
 
 # ---------------------------------------------------------------------------
@@ -582,6 +602,179 @@ def review_cmd(
             )
         elif o.reason:
             typer.echo(f"      {o.reason}")
+
+
+# ---------------------------------------------------------------------------
+# `doo dispatch redispatch` (ADR-0053, #171) — report stuck candidates + rerun.
+# ---------------------------------------------------------------------------
+
+
+def _echo_candidate(c: RedispatchCandidate) -> None:
+    last = c.last_fail.isoformat() if c.last_fail is not None else "(unknown)"
+    typer.echo(
+        f"    {c.key_hash[:12]}  [{c.test_class}] {c.principal}:{c.slot} "
+        f"failure={c.failure_kind} last_fail={last}"
+    )
+
+
+@dispatch_app.command("redispatch")
+def redispatch_cmd(
+    engagement: str = typer.Option(..., "--engagement", "-e", help="Engagement id."),
+    config: Path | None = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Engagement YAML — REQUIRED with --rerun (environment + ${VAR} tokens).",
+        exists=True,
+        readable=True,
+        resolve_path=True,
+    ),
+    as_json: bool = typer.Option(
+        False, "--json", help="Emit the candidate report as JSON."
+    ),
+    rerun: bool = typer.Option(
+        False,
+        "--rerun",
+        help="Re-dispatch the eligible candidates (needs --config). Default: report only.",
+    ),
+    key_hash: list[str] = typer.Option(
+        [],
+        "--key-hash",
+        help="Narrow the rerun to these key_hash(es)/prefixes (repeatable). "
+        "Default: all eligible.",
+    ),
+    arming: ArmingMode | None = typer.Option(
+        None, "--arming", help="Override dispatch.arming (review|auto)."
+    ),
+    unsafe_stub_opa: bool = typer.Option(
+        False,
+        "--unsafe-stub-opa",
+        help="STAGING ONLY: always-allow OPA stub when `opa` is not on PATH.",
+    ),
+    actor: str = typer.Option(
+        os.environ.get("USER", "unknown"),
+        "--actor",
+        help="Tester identity for the dispatch ledger (stays out of the graph).",
+    ),
+    model: str | None = typer.Option(
+        None, "--model", help="Override the interpreter LLM model id for the rerun."
+    ),
+) -> None:
+    """Report re-dispatch candidates; `--rerun` re-sends the eligible ones.
+
+    A candidate is an approved TestCase that failed `auth_invalid` / `auth_unverified`
+    and never reached a clean `ok` primary (ADR-0053). `eligible` candidates have a
+    credential slot that rotated past the failure (the #170 watermark); the rest are
+    waiting on rotation. `--rerun` drains the eligible set through the SAME gate as
+    `doo dispatch run`, so the #170 guard + #168 verify still apply.
+    """
+
+    import json as _json
+
+    from doo.ids import TestCaseKeyHash
+
+    configure_logging()
+    neo4j = _build_neo4j()
+    candidates = list_redispatch_candidates(
+        neo4j, engagement_id=EngagementId(engagement)
+    )
+    eligible = [c for c in candidates if c.eligible]
+    waiting = [c for c in candidates if not c.eligible]
+
+    if not rerun:
+        if as_json:
+            typer.echo(
+                _json.dumps(
+                    [
+                        {
+                            "key_hash": c.key_hash,
+                            "test_class": c.test_class,
+                            "principal": c.principal,
+                            "slot": c.slot,
+                            "failure_kind": c.failure_kind,
+                            "eligible": c.eligible,
+                            "last_fail": (
+                                c.last_fail.isoformat()
+                                if c.last_fail is not None
+                                else None
+                            ),
+                        }
+                        for c in candidates
+                    ],
+                    indent=2,
+                )
+            )
+            return
+        if not candidates:
+            typer.echo(f"no re-dispatch candidates in engagement {engagement!r}")
+            return
+        typer.echo(
+            f"{len(candidates)} re-dispatch candidate(s) in engagement {engagement!r} "
+            f"({len(eligible)} eligible, {len(waiting)} waiting on rotation):\n"
+        )
+        if eligible:
+            typer.secho(f"  eligible now ({len(eligible)}):", fg=typer.colors.GREEN)
+            for c in eligible:
+                _echo_candidate(c)
+        if waiting:
+            typer.secho(
+                f"  waiting on rotation ({len(waiting)}):", fg=typer.colors.YELLOW
+            )
+            for c in waiting:
+                _echo_candidate(c)
+        if eligible:
+            typer.echo(
+                f"\nrerun: doo dispatch redispatch -e {engagement} -c <config> --rerun"
+            )
+        return
+
+    # --- rerun the eligible set (through the full run gate). ---
+    if config is None:
+        typer.secho("--rerun requires --config", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+    cfg = _load_config(config)
+    if cfg.engagement.id != engagement:
+        typer.secho(
+            f"--engagement {engagement!r} does not match {config}'s engagement.id "
+            f"{cfg.engagement.id!r}",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    want = set(key_hash)
+    chosen = [
+        c for c in eligible if not want or any(c.key_hash.startswith(k) for k in want)
+    ]
+    if not chosen:
+        typer.echo(f"no eligible candidates to re-dispatch in engagement {engagement!r}")
+        raise typer.Exit(code=0)
+    selection = DispatchSelection(
+        key_hashes=tuple(TestCaseKeyHash(c.key_hash) for c in chosen)
+    )
+    try:
+        run = arm_run(config=cfg, selection=selection, actor=actor, arming=arming)
+    except ValueError as exc:
+        typer.secho(f"refused: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=3) from exc
+
+    typer.echo(
+        f"re-dispatching {len(chosen)} eligible candidate(s) on engagement "
+        f"{run.engagement_id} (environment={run.environment}, arming={run.arming})"
+    )
+    if run.arming == "review":
+        typer.secho(
+            "\narming=review: this run will SEND traffic to the target. Proceed?",
+            fg=typer.colors.YELLOW,
+        )
+        if not typer.confirm("arm re-dispatch", default=False):
+            typer.secho("not armed; aborting.", fg=typer.colors.YELLOW, err=True)
+            raise typer.Exit(code=0)
+
+    _execute_and_render(
+        cfg, run, engagement=engagement, model=model, unsafe_stub_opa=unsafe_stub_opa
+    )
+    sys.exit(0)
 
 
 # ---------------------------------------------------------------------------
