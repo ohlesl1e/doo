@@ -31,6 +31,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from types import FrameType
 
@@ -194,6 +195,21 @@ class ManagedAuthContext:
     refresh: RefreshConfig
 
 
+class RotateOutcome(StrEnum):
+    """Typed result of one `rotate()` (ADR-0053, #169) — replaces a bare bool.
+
+    `ROTATED` minted + published a new credential. `RATE_LIMITED` (transient) and
+    `FAILED` (mechanism error) are retried via the in-process retry queue.
+    `UNRECOVERABLE` means the slot hit `max_consecutive_dead` reactive failures and
+    is no longer rotated (`slot unrecoverable — check refresh config`).
+    """
+
+    ROTATED = "rotated"
+    RATE_LIMITED = "rate_limited"
+    FAILED = "failed"
+    UNRECOVERABLE = "unrecoverable"
+
+
 @dataclass
 class RateLimiter:
     """Per-AuthContext rotation rate limiter (ADR-0014)."""
@@ -237,7 +253,18 @@ class AuthHelper:
     # as the dispatcher's wire send.
     tls_verify: bool | str = True
     consumer_group: str = "auth-helper"
+    # Back-off (ADR-0053, #169). K consecutive reactive/retry rotation attempts on
+    # one slot within `backoff_reset_s` → the slot is `unrecoverable` (a refresh
+    # that keeps minting dead tokens must stop storming). The reset window must
+    # exceed the retry interval (`_RATE_WINDOW_S`) so window-spaced retries still
+    # accumulate rather than resetting each time.
+    max_consecutive_dead: int = 3
+    backoff_reset_s: float = _RATE_WINDOW_S * 2
     _next_refresh_at: dict[tuple[str, str], float] = field(default_factory=dict)
+    _consecutive_dead: dict[tuple[str, str], int] = field(default_factory=dict)
+    _last_attempt_at: dict[tuple[str, str], float] = field(default_factory=dict)
+    _retry_due: dict[tuple[str, str], float] = field(default_factory=dict)
+    _unrecoverable: set[tuple[str, str]] = field(default_factory=set)
 
     @classmethod
     def from_config(
@@ -301,11 +328,39 @@ class AuthHelper:
             slot_key for slot_key, at in self._next_refresh_at.items() if at <= t
         ]
 
-    def rotate(self, slot_key: tuple[str, str], *, reason: str) -> bool:
+    def due_retries(self, now: float | None = None) -> list[tuple[str, str]]:
+        """Slots whose deferred retry (after a rate-limit / mechanism failure) is due (#169)."""
+
+        t = now if now is not None else self.clock()
+        return [slot_key for slot_key, at in self._retry_due.items() if at <= t]
+
+    def process_retries(self, now: float | None = None) -> int:
+        """Re-attempt due retries; reschedule still-failing ones, drop resolved ones (#169).
+
+        The in-process replacement for dropping a rate-limited reactive event: a
+        `RATE_LIMITED`/`FAILED` rotation parks the slot in `_retry_due` and this
+        re-drives it once the window passes, so a transient block is never lost.
+        """
+
+        t = now if now is not None else self.clock()
+        rotations = 0
+        for slot_key in self.due_retries(t):
+            outcome = self.rotate(slot_key, reason="retry")
+            if outcome in (RotateOutcome.RATE_LIMITED, RotateOutcome.FAILED):
+                self._retry_due[slot_key] = t + _RATE_WINDOW_S
+            else:  # ROTATED or UNRECOVERABLE — stop retrying.
+                self._retry_due.pop(slot_key, None)
+                if outcome == RotateOutcome.ROTATED:
+                    rotations += 1
+        return rotations
+
+    def rotate(self, slot_key: tuple[str, str], *, reason: str) -> RotateOutcome:
         """Rotate one credential slot: mechanism → new node + rotation-file material.
 
-        Returns True on success, False if rate-limited or the mechanism failed.
-        Reschedules the proactive timer on success.
+        Returns a `RotateOutcome` (ADR-0053, #169). `reactive`/`retry` attempts feed
+        the per-slot back-off counter; once it reaches `max_consecutive_dead` the slot
+        is `UNRECOVERABLE` and no longer rotated (incl. proactively). Reschedules the
+        proactive timer on success.
         """
 
         m = self.managed.get(slot_key)
@@ -316,7 +371,32 @@ class AuthHelper:
                 principal_label=slot_key[0],
                 slot=slot_key[1],
             )
-            return False
+            return RotateOutcome.FAILED
+        if slot_key in self._unrecoverable:
+            return RotateOutcome.UNRECOVERABLE
+
+        counts_backoff = reason in ("reactive", "retry")
+        now = self.clock()
+        if counts_backoff:
+            # Quiet-reset: a trigger long after the last attempt is a fresh problem,
+            # not a continuation of a storm.
+            last = self._last_attempt_at.get(slot_key)
+            if last is not None and now - last > self.backoff_reset_s:
+                self._consecutive_dead[slot_key] = 0
+            if self._consecutive_dead.get(slot_key, 0) >= self.max_consecutive_dead:
+                self._unrecoverable.add(slot_key)
+                self._next_refresh_at.pop(slot_key, None)
+                self._retry_due.pop(slot_key, None)
+                log.warning(
+                    "auth_helper.slot_unrecoverable",
+                    engagement_id=self.engagement_id,
+                    principal_label=m.principal_label,
+                    slot=m.slot,
+                    consecutive_dead=self._consecutive_dead.get(slot_key, 0),
+                    detail="slot unrecoverable — check refresh config",
+                )
+                return RotateOutcome.UNRECOVERABLE
+
         rate_key = f"{slot_key[0]}:{slot_key[1]}"
         if not self.rate_limiter.allow(
             rate_key, max_per_window=m.refresh.max_refreshes_per_hour
@@ -329,7 +409,15 @@ class AuthHelper:
                 reason=reason,
                 max_per_hour=m.refresh.max_refreshes_per_hour,
             )
-            return False
+            return RotateOutcome.RATE_LIMITED
+
+        # A real mechanism attempt — count it toward back-off (a dead mint shows up
+        # as a *later* reactive event, which lands here again and increments anew).
+        if counts_backoff:
+            self._consecutive_dead[slot_key] = (
+                self._consecutive_dead.get(slot_key, 0) + 1
+            )
+            self._last_attempt_at[slot_key] = now
 
         mechanism = self.mechanisms[m.refresh.mechanism]
         try:
@@ -343,7 +431,7 @@ class AuthHelper:
                 mechanism=m.refresh.mechanism,
                 error=str(exc),
             )
-            return False
+            return RotateOutcome.FAILED
 
         self.rate_limiter.record(rate_key)
         # Hash the canonical credential form (#103); `new_raw` itself stays the
@@ -389,7 +477,7 @@ class AuthHelper:
             mechanism=m.refresh.mechanism,
             reason=reason,
         )
-        return True
+        return RotateOutcome.ROTATED
 
     def _rotate_graph(
         self,
@@ -461,8 +549,18 @@ class AuthHelper:
                     log.info(
                         "auth_helper.reactive_unmapped", auth_context_id=str(ac_id)
                     )
-                elif self.rotate(slot_key, reason="reactive"):
-                    rotations += 1
+                else:
+                    outcome = self.rotate(slot_key, reason="reactive")
+                    if outcome == RotateOutcome.ROTATED:
+                        rotations += 1
+                    elif outcome in (
+                        RotateOutcome.RATE_LIMITED,
+                        RotateOutcome.FAILED,
+                    ):
+                        # Not dropped: park for an in-process retry after the window
+                        # (#169 — replaces the silent ack-loss).
+                        self._retry_due[slot_key] = self.clock() + _RATE_WINDOW_S
+            # The Redis event is consumed; the in-process retry queue owns retries.
             self.streams.ack(AUTH_REACTIVE_STREAM, self.consumer_group, msg_id)
         return rotations
 
@@ -493,6 +591,7 @@ class AuthHelper:
         while not stop.is_set():
             for slot_key in self.due_proactively():
                 self.rotate(slot_key, reason="proactive")
+            self.process_retries()
             self.poll_reactive(block_ms=int(tick_s * 1000))
             stop.wait(timeout=tick_s)
         log.info("auth_helper.stopped", engagement_id=self.engagement_id)
@@ -505,4 +604,5 @@ __all__ = [
     "RateLimiter",
     "RefreshError",
     "RefreshMechanismFn",
+    "RotateOutcome",
 ]

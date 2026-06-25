@@ -23,7 +23,7 @@ from doo.canonical.identity import (
     compute_anonymous_auth_hash,
     compute_auth_hash,
 )
-from doo.dispatch.auth_helper import AuthHelper
+from doo.dispatch.auth_helper import AuthHelper, RotateOutcome
 from doo.dispatch.reactive import StreamReactiveEmitter
 from doo.dispatch.secrets import (
     EnvSecretStore,
@@ -166,6 +166,12 @@ def test_auth_helper_reactive_rotation_e2e(
     assert mat is not None and mat.raw == "NEW-ROTATED-TOKEN"
 
     # --- rate limit: a 4th reactive within the hour is refused (max 3). ---
+    # Isolate the rate limiter from the #169 back-off, which would otherwise
+    # intercept at the same count when K == max_refreshes_per_hour.
+    helper.max_consecutive_dead = 1000
     for _ in range(3):
         helper.rotate(("attacker-b", "bearer"), reason="reactive")
-    assert helper.rotate(("attacker-b", "bearer"), reason="reactive") is False
+    assert (
+        helper.rotate(("attacker-b", "bearer"), reason="reactive")
+        == RotateOutcome.RATE_LIMITED
+    )
