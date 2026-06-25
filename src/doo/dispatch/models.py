@@ -290,12 +290,16 @@ class OpaInput(BaseModel):
 # refused the `primary` send upfront; `dispatcher_blocked` ⇒ OPA / lease / budget
 # refused before any send. `constructor_missing` (S1-transient) ⇒ no constructor
 # registered for this `test_class` yet — surfaces in `doo dispatch review` rather
-# than silently skipping.
+# than silently skipping. `auth_unverified` (ADR-0053, #168) ⇒ the credential
+# resolved from the rotation overlay failed its pre-flight liveness probe, so the
+# `primary` was refused without sending (no primary `EXECUTED_AS`); the ADR-0014
+# reactive-refresh event fired so the auth-helper rotates.
 RunOutcomeKind = Literal[
     "executed",
     "hazard_unresolved",
     "dispatcher_blocked",
     "constructor_missing",
+    "auth_unverified",
 ]
 
 

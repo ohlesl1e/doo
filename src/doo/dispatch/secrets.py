@@ -43,6 +43,11 @@ class AuthMaterial:
     raw: str
     principal_label: str
     tier: str = "declared"
+    # ADR-0053 (#168): True when this material was resolved from the rotation
+    # overlay (a freshly-minted, not-yet-proven credential) rather than the
+    # tester-vouched env/seed material. Drives verify-on-first-use: the Executor
+    # probes such material before sending any primary against it.
+    from_rotation: bool = False
 
 
 class SecretStore(Protocol):
@@ -208,6 +213,7 @@ class SlotResolvingSecretStore:
                     kind=entry["kind"],  # type: ignore[arg-type]
                     raw=entry["raw"],
                     principal_label=slot_key[0],
+                    from_rotation=True,
                 )
         # Env-derived id matches (no rotation since plan-time); also covers a
         # declared id the graph_map missed (loader not yet run).

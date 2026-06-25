@@ -20,11 +20,16 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Iterator
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 import redis
 
-from doo.canonical.identity import auth_context_id, compute_auth_hash
+from doo.canonical.identity import (
+    auth_context_id,
+    compute_anonymous_auth_hash,
+    compute_auth_hash,
+)
 from doo.dispatch.executor.dispatcher import RedisLeaseReader, StubOpaClient
 from doo.dispatch.executor.send import HttpResponse, StubSender, TransportError
 from doo.dispatch.finding import (
@@ -39,7 +44,11 @@ from doo.dispatch.ledger import InMemoryDispatchLedger
 from doo.dispatch.models import DispatchSelection
 from doo.dispatch.ontology import NoopBodyStore
 from doo.dispatch.run import RunDependencies, arm_run, execute_run
-from doo.dispatch.secrets import EnvSecretStore
+from doo.dispatch.secrets import (
+    EnvSecretStore,
+    SlotResolvingSecretStore,
+    write_rotation_entry,
+)
 from doo.events.execution import compute_testcase_key_hash
 from doo.ids import EngagementId
 from doo.infra.neo4j_driver import Neo4jClient
@@ -470,6 +479,134 @@ def test_authz_liveness_e2e(
         assert ev["kind"] == "auth_invalid"
         assert ev["auth_context_id"] == attacker_ac_id
         assert ev["principal_label"] == "attacker-b"
+
+
+@pytest.mark.parametrize(
+    "probe_status,expect_refused",
+    [
+        (403, True),  # rotated credential dead → refuse the primary + reactive
+        (200, False),  # rotated credential live → proceed to the primary
+    ],
+)
+def test_verify_on_first_use_e2e(
+    neo4j_client: Neo4jClient,
+    redis_url: str,
+    tmp_path: Path,
+    probe_status: int,
+    expect_refused: bool,
+) -> None:
+    """ADR-0053 (#168): material resolved from the rotation overlay is probed
+    BEFORE the primary. Dead probe → `auth_unverified` refusal (no primary send,
+    no primary `EXECUTED_AS`) + one reactive event. Live probe → the primary
+    proceeds, and the authz-4xx disambiguation reuses the cached verdict, so the
+    `/me` probe is sent exactly once.
+    """
+    from doo.dispatch.executor.liveness import LivenessPolicy
+    from doo.dispatch.reactive import FakeReactiveEmitter
+
+    env = {"E2E_VICTIM": VICTIM_TOKEN, "E2E_ATTACKER": ATTACKER_TOKEN}
+    config = _liveness_config(ENG_LIVE)
+    attacker_ac_id = auth_context_id(
+        EngagementId(ENG_LIVE), compute_auth_hash("bearer", ATTACKER_TOKEN)
+    )
+    victim_ac_id = auth_context_id(
+        EngagementId(ENG_LIVE), compute_auth_hash("bearer", VICTIM_TOKEN)
+    )
+    key_hash = _seed_authz_graph(
+        neo4j_client,
+        eng=ENG_LIVE,
+        attacker_ac_id=attacker_ac_id,
+        victim_ac_id=victim_ac_id,
+    )
+
+    # The attacker's bearer slot is served from the rotation overlay → the
+    # resolved material is `from_rotation`, triggering verify-on-first-use.
+    rot = tmp_path / "rotation.json"
+    write_rotation_entry(
+        rot,
+        principal_label="attacker-b",
+        slot="bearer",
+        raw=ATTACKER_TOKEN,
+        kind="bearer",
+    )
+    slot_map = {attacker_ac_id: ("attacker-b", "bearer")}
+    secrets = SlotResolvingSecretStore(
+        graph_map=slot_map,
+        env=EnvSecretStore.from_config(config, env=env),
+        anon_id=auth_context_id(
+            EngagementId(ENG_LIVE), compute_anonymous_auth_hash()
+        ),
+        rotation_path=rot,
+    )
+
+    rclient = redis.Redis.from_url(redis_url)
+    lease = RedisLease(rclient, EngagementId(ENG_LIVE))
+    lease.set_active(ttl_seconds=60)
+
+    sender = _PathScriptedSender(
+        {
+            "/orders/123": HttpResponse(status=403, body=b'{"error":"forbidden"}'),
+            "/me": HttpResponse(status=probe_status, body=b'{"id":"attacker"}'),
+        }
+    )
+    reactive = FakeReactiveEmitter()
+    run = arm_run(
+        config=config,
+        selection=DispatchSelection(test_classes=("idor",), limit=1),
+        actor="e2e-tester",
+    )
+    deps = RunDependencies(
+        neo4j=neo4j_client,
+        lease=RedisLeaseReader(lease=lease),
+        opa=StubOpaClient(allow=True),
+        sender=sender,  # type: ignore[arg-type]
+        secrets=secrets,
+        bodies=NoopBodyStore(),
+        ledger=InMemoryDispatchLedger(),
+        liveness=LivenessPolicy.from_config(config, graph_map=slot_map),
+        reactive=reactive,
+    )
+    result = execute_run(run, deps)
+
+    paths = [r.path for r in sender.sent]  # type: ignore[attr-defined]
+    rows = neo4j_client.execute_read(
+        """
+        MATCH (t:TestCase {engagement_id: $eid, key_hash: $kh})
+              -[x:EXECUTED_AS {run_id: $rid}]->(:RequestObservation)
+        RETURN x.request_role AS role, x.dispatch_status AS status
+        ORDER BY role
+        """,
+        eid=ENG_LIVE,
+        kh=key_hash,
+        rid=run.run_id,
+    )
+    by_role = {r["role"]: r["status"] for r in rows}
+
+    if expect_refused:
+        # Pre-flight probe (/me) only — the primary is NEVER sent.
+        assert paths == ["/me"]
+        assert result.requests_sent == 1
+        assert result.outcomes[0].outcome == "auth_unverified"
+        # The probe is recorded; there is NO `primary` EXECUTED_AS edge.
+        assert by_role.get("liveness") == "ok"
+        assert "primary" not in by_role
+        # The dead rotated credential fires exactly one reactive refresh.
+        assert len(reactive.events) == 1
+        ev = reactive.events[0]
+        assert ev["kind"] == "auth_invalid"
+        assert ev["auth_context_id"] == attacker_ac_id
+        assert ev["principal_label"] == "attacker-b"
+    else:
+        # Pre-flight probe FIRST, then the primary; the authz-4xx disambiguation
+        # reuses the cached `live` verdict → exactly one `/me` probe.
+        assert paths == ["/me", "/orders/123"]
+        assert paths.count("/me") == 1
+        assert result.requests_sent == 2
+        assert result.outcomes[0].outcome == "executed"
+        # 403 primary + live token + no hazards → boundary genuinely held → ok.
+        assert by_role["primary"] == "ok"
+        assert by_role.get("liveness") == "ok"
+        assert len(reactive.events) == 0
 
 
 ENG_HZ = "eng-dispatch-csrf-e2e"
