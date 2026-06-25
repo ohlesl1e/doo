@@ -406,6 +406,64 @@ def _execute_one(
         evidence = adjusted
     sends.extend(hazard_sends)
 
+    # --- verify-on-first-use (ADR-0053, #168). Material resolved from the
+    # rotation overlay is a freshly-minted, not-yet-proven credential. Probe it
+    # before sending ANY primary against it: a `dead` probe refuses the primary
+    # (don't burn it) and fires the ADR-0014 reactive event so the helper
+    # rotates; `live`/`unknown` fall through. The probe is cached per
+    # (principal, slot), so a later authz-4xx disambiguation reuses this verdict
+    # (no second send). A real probe send is committed as its own `liveness`
+    # observation regardless of the verdict, so no wire send goes unobserved. ---
+    if material.from_rotation and prober is not None:
+        pre = prober.probe(
+            auth_context_id=tc.auth_context_id,
+            material=material,
+            evidence=evidence,
+            test_class=tc.test_class,  # type: ignore[arg-type]
+            now=now,
+        )
+        if (
+            pre.sent
+            and pre.request is not None
+            and pre.dispatch_result is not None
+            and pre.dispatch_result.sent
+        ):
+            pre_obs = commit_agent_send(
+                deps.neo4j,
+                engagement_id=eid,
+                run_id=run.run_id,
+                key_hash=tc.key_hash,
+                request=pre.request,
+                response=pre.dispatch_result.response,
+                dispatch_status="ok",
+                role="liveness",
+                auth_context_id=tc.auth_context_id,
+                bodies=deps.bodies,
+                now=now,
+            )
+            sends.append(
+                _SendRecord(role="liveness", status="ok", observation_id=pre_obs)
+            )
+        if pre.result == "dead":
+            if deps.reactive is not None:
+                deps.reactive.emit_auth_invalid(
+                    engagement_id=eid,
+                    run_id=run.run_id,
+                    auth_context_id=tc.auth_context_id,
+                    principal_label=material.principal_label,
+                    key_hash=tc.key_hash,
+                )
+            return _outcome(
+                tc,
+                run,
+                "auth_unverified",
+                reason="rotated credential failed pre-flight liveness probe",
+                sends=tuple(
+                    (s.role, s.status, s.observation_id) for s in sends
+                ),
+                now=now,
+            )
+
     # --- construct (pure). ---
     request = construct(tc, evidence, material)
 

@@ -98,6 +98,36 @@ def test_rotation_overlay_wins_over_env_by_slot(tmp_path: Path) -> None:
     assert mat.raw == "sid=ROTATED"
     assert mat.kind == "cookie"
     assert mat.principal_label == "alice"
+    # ADR-0053 (#168): overlay material is unproven → flagged for pre-flight verify.
+    assert mat.from_rotation is True
+
+
+def test_from_rotation_provenance(tmp_path: Path) -> None:
+    """ADR-0053 (#168): only rotation-overlay material is `from_rotation`; every
+    tester-vouched path (env-by-id, env-by-slot fallback, anonymous) is not."""
+    rot = tmp_path / "rotation.json"
+    write_rotation_entry(
+        rot, principal_label="alice", slot="cookie", raw="sid=ROTATED", kind="cookie"
+    )
+    fresh = auth_context_id(ENG, compute_auth_hash("cookie", "sid=NEW"))
+    stale = AuthContextId("ac-stale")
+    by_id_mat = AuthMaterial(kind="cookie", raw="sid=NEW", principal_label="alice")
+    slot_mat = AuthMaterial(kind="cookie", raw="sid=OLD", principal_label="alice")
+    store = SlotResolvingSecretStore(
+        graph_map={fresh: ("alice", "cookie"), stale: ("bob", "cookie")},
+        env=_env_store({fresh: by_id_mat}, {("bob", "cookie"): slot_mat}),
+        anon_id=ANON,
+        rotation_path=rot,
+    )
+    # overlay hit (alice/cookie has a rotation entry) → from_rotation True
+    overlay = store.material_for(fresh)
+    assert overlay is not None and overlay.from_rotation is True
+    # env-by-slot fallback (bob/cookie has no rotation entry) → from_rotation False
+    fallback = store.material_for(stale)
+    assert fallback is not None and fallback.from_rotation is False
+    # anonymous placeholder → from_rotation False
+    anon = store.material_for(ANON)
+    assert anon is not None and anon.from_rotation is False
 
 
 def test_slot_store_without_rotation_path_falls_back_to_by_slot() -> None:
