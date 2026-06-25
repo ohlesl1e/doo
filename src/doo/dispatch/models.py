@@ -293,13 +293,17 @@ class OpaInput(BaseModel):
 # than silently skipping. `auth_unverified` (ADR-0053, #168) ⇒ the credential
 # resolved from the rotation overlay failed its pre-flight liveness probe, so the
 # `primary` was refused without sending (no primary `EXECUTED_AS`); the ADR-0014
-# reactive-refresh event fired so the auth-helper rotates.
+# reactive-refresh event fired so the auth-helper rotates. `waiting_on_rotation`
+# (ADR-0053, #170) ⇒ a prior `auth_invalid` `primary` exists and the slot has NOT
+# rotated past it (no `active` declared AuthContext newer than the failure), so
+# re-dispatch is refused without sending — re-runs once the auth-helper rotates.
 RunOutcomeKind = Literal[
     "executed",
     "hazard_unresolved",
     "dispatcher_blocked",
     "constructor_missing",
     "auth_unverified",
+    "waiting_on_rotation",
 ]
 
 

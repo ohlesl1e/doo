@@ -492,7 +492,13 @@ def run_cmd(
 
 # Outcomes worth a human's attention (a refused or blocked test, not an executed one).
 _REVIEWABLE_OUTCOMES = frozenset(
-    {"hazard_unresolved", "dispatcher_blocked", "constructor_missing", "auth_unverified"}
+    {
+        "hazard_unresolved",
+        "dispatcher_blocked",
+        "constructor_missing",
+        "auth_unverified",
+        "waiting_on_rotation",
+    }
 )
 
 

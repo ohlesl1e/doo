@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -607,6 +607,186 @@ def test_verify_on_first_use_e2e(
         assert by_role["primary"] == "ok"
         assert by_role.get("liveness") == "ok"
         assert len(reactive.events) == 0
+
+
+def _seed_watermark_history(
+    neo4j: Neo4jClient,
+    *,
+    eng: str,
+    key_hash: str,
+    generations: list[tuple[datetime, str]],
+    fail_at: datetime,
+) -> None:
+    """Add a Principal `attacker` + AuthContext generations on slot `bearer`
+    (`(first_seen, status)` each) and a prior `auth_invalid` `primary`
+    `EXECUTED_AS{at: fail_at}` on the TestCase — the inputs the #170 watermark reads.
+    """
+    now = datetime.now(UTC)
+    cross = _cross(now)
+    neo4j.execute_write(
+        """
+        MERGE (p:Principal {engagement_id: $eid, label: 'attacker'})
+        ON CREATE SET p.identity_key = 'attacker', p.tier = 'declared', p += $cross
+        """,
+        eid=eng,
+        cross=cross,
+    )
+    for i, (first_seen, status) in enumerate(generations):
+        gen_cross = {
+            **cross,
+            "first_seen": first_seen,
+            "last_seen": first_seen,
+            "ingested_at": first_seen,
+            "status": status,
+        }
+        neo4j.execute_write(
+            """
+            MATCH (p:Principal {engagement_id: $eid, label: 'attacker'})
+            MERGE (ac:AuthContext {engagement_id: $eid, id: $acid})
+            ON CREATE SET ac.auth_hash = $acid, ac.tier = 'declared',
+                          ac.token_kind = 'bearer', ac.slot = 'bearer',
+                          ac.is_anonymous = false, ac += $gen_cross
+            MERGE (ac)-[:OF_PRINCIPAL]->(p)
+            """,
+            eid=eng,
+            acid=f"ac-gen-{i}",
+            gen_cross=gen_cross,
+        )
+    ro_cross = {
+        **cross,
+        "first_seen": fail_at,
+        "last_seen": fail_at,
+        "ingested_at": fail_at,
+        "id": "obs-prior-fail",
+        "observation_id": "obs-prior-fail",
+        "method": "GET",
+        "concrete_path": "/orders/123",
+        "response_status": 403,
+    }
+    edge_cross = {
+        **cross,
+        "first_seen": fail_at,
+        "last_seen": fail_at,
+        "ingested_at": fail_at,
+        "engagement_id": eng,
+        "source_id": "run-prior",
+    }
+    neo4j.execute_write(
+        """
+        MATCH (t:TestCase {engagement_id: $eid, key_hash: $kh})
+        MERGE (r:RequestObservation {engagement_id: $eid, observation_id: 'obs-prior-fail'})
+        ON CREATE SET r += $ro_cross
+        MERGE (t)-[x:EXECUTED_AS {run_id: 'run-prior', request_role: 'primary'}]->(r)
+        ON CREATE SET x.dispatch_status = 'auth_invalid', x.at = $fail_at, x += $edge_cross
+        """,
+        eid=eng,
+        kh=key_hash,
+        fail_at=fail_at,
+        ro_cross=ro_cross,
+        edge_cross=edge_cross,
+    )
+
+
+@pytest.mark.parametrize(
+    "generations_spec,expect_waiting",
+    [
+        ("below", True),  # only an active gen OLDER than the failure → waiting
+        ("above", False),  # a newer active gen exists (rotation cleared it) → proceed
+    ],
+)
+def test_watermark_redispatch_guard_e2e(
+    neo4j_client: Neo4jClient,
+    redis_url: str,
+    generations_spec: str,
+    expect_waiting: bool,
+) -> None:
+    """ADR-0053 (#170): a TestCase that already failed `auth_invalid` is refused
+    (`waiting_on_rotation`, no send) until its slot rotates past the failure. Below
+    the watermark → refused; a newer `active` generation (ignoring `expired` ones)
+    → the re-dispatch proceeds.
+    """
+    from doo.dispatch.executor.liveness import LivenessPolicy
+    from doo.dispatch.reactive import FakeReactiveEmitter
+
+    env = {"E2E_VICTIM": VICTIM_TOKEN, "E2E_ATTACKER": ATTACKER_TOKEN}
+    config = _liveness_config(ENG_LIVE)
+    attacker_ac_id = auth_context_id(
+        EngagementId(ENG_LIVE), compute_auth_hash("bearer", ATTACKER_TOKEN)
+    )
+    victim_ac_id = auth_context_id(
+        EngagementId(ENG_LIVE), compute_auth_hash("bearer", VICTIM_TOKEN)
+    )
+    key_hash = _seed_authz_graph(
+        neo4j_client,
+        eng=ENG_LIVE,
+        attacker_ac_id=attacker_ac_id,
+        victim_ac_id=victim_ac_id,
+    )
+
+    fail_at = datetime(2026, 6, 24, 12, 0, 0, tzinfo=UTC)
+    if generations_spec == "below":
+        gens = [(fail_at - timedelta(hours=1), "active")]
+    else:
+        gens = [
+            (fail_at - timedelta(hours=1), "expired"),
+            (fail_at + timedelta(hours=1), "active"),
+        ]
+    _seed_watermark_history(
+        neo4j_client, eng=ENG_LIVE, key_hash=key_hash, generations=gens, fail_at=fail_at
+    )
+
+    rclient = redis.Redis.from_url(redis_url)
+    lease = RedisLease(rclient, EngagementId(ENG_LIVE))
+    lease.set_active(ttl_seconds=60)
+
+    sender = _PathScriptedSender(
+        {"/orders/123": HttpResponse(status=200, body=b'{"ok":true}')}
+    )
+    reactive = FakeReactiveEmitter()
+    run = arm_run(
+        config=config,
+        selection=DispatchSelection(test_classes=("idor",), limit=1),
+        actor="e2e-tester",
+    )
+    deps = RunDependencies(
+        neo4j=neo4j_client,
+        lease=RedisLeaseReader(lease=lease),
+        opa=StubOpaClient(allow=True),
+        sender=sender,  # type: ignore[arg-type]
+        secrets=EnvSecretStore.from_config(config, env=env),
+        bodies=NoopBodyStore(),
+        ledger=InMemoryDispatchLedger(),
+        liveness=LivenessPolicy.from_config(
+            config, graph_map={attacker_ac_id: ("attacker-b", "bearer")}
+        ),
+        reactive=reactive,
+    )
+    result = execute_run(run, deps)
+
+    new_edges = neo4j_client.execute_read(
+        """
+        MATCH (t:TestCase {engagement_id: $eid, key_hash: $kh})
+              -[x:EXECUTED_AS {run_id: $rid}]->()
+        RETURN x.request_role AS role, x.dispatch_status AS status
+        """,
+        eid=ENG_LIVE,
+        kh=key_hash,
+        rid=run.run_id,
+    )
+
+    if expect_waiting:
+        # Below the watermark: refused upfront — nothing sent, no new edge.
+        assert result.outcomes[0].outcome == "waiting_on_rotation"
+        assert sender.sent == []
+        assert new_edges == []
+        assert reactive.events == []
+    else:
+        # Above the watermark: the re-dispatch proceeds through the normal gate.
+        assert result.outcomes[0].outcome == "executed"
+        paths = [r.path for r in sender.sent]  # type: ignore[attr-defined]
+        assert paths == ["/orders/123"]
+        by_role = {r["role"]: r["status"] for r in new_edges}
+        assert by_role["primary"] == "ok"
 
 
 ENG_HZ = "eng-dispatch-csrf-e2e"

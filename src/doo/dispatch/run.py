@@ -83,6 +83,7 @@ from doo.dispatch.models import (
 )
 from doo.dispatch.ontology import BodyStore, commit_agent_send
 from doo.dispatch.reactive import ReactiveEmitter
+from doo.dispatch.rotation import is_waiting_on_rotation
 from doo.dispatch.secrets import AuthMaterial, SecretStore, SlotMaterialMissing
 from doo.dispatch.selection import select_testcases
 from doo.events.execution import DISPATCH_STATUSES, DispatchStatus
@@ -336,6 +337,34 @@ def _execute_one(
         construct = constructor_for(tc.test_class, "primary")
     except ConstructorMissingError as exc:
         return _outcome(tc, run, "constructor_missing", reason=str(exc), now=now)
+
+    # --- rotation-watermark guard (ADR-0053, #170). A TestCase whose `primary`
+    # already came back `auth_invalid` must NOT be re-dispatched until its slot
+    # has rotated past that failure (an `active` declared AuthContext newer than
+    # the failed edge). Below the watermark, refuse without sending — this is the
+    # anti-storm gate that stops blind re-runs hammering a still-dead slot (#166).
+    # Skipped when the attacker identity is absent (pre-ADR-0049 TestCases). ---
+    if (
+        tc.attacker_principal is not None
+        and tc.attacker_slot is not None
+        and is_waiting_on_rotation(
+            deps.neo4j,
+            engagement_id=eid,
+            key_hash=tc.key_hash,
+            principal_label=tc.attacker_principal,
+            slot=tc.attacker_slot,
+        )
+    ):
+        return _outcome(
+            tc,
+            run,
+            "waiting_on_rotation",
+            reason=(
+                "slot has not rotated since the last auth_invalid; "
+                "re-dispatch refused (waiting on rotation)"
+            ),
+            now=now,
+        )
 
     # --- evidence load. ---
     loader = deps.evidence_loader or (
