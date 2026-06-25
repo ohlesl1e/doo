@@ -91,6 +91,9 @@ class DispatchSelection(BaseModel):
 
     generators: tuple[str, ...] = ()
     test_classes: tuple[TestClass, ...] = ()
+    # ADR-0053 (#171): an exact set of TestCases to (re-)dispatch by content
+    # address — how `doo dispatch redispatch` targets the eligible candidates.
+    key_hashes: tuple[TestCaseKeyHash, ...] = ()
     limit: int | None = Field(default=None, ge=1)
 
     def describe(self) -> str:
@@ -101,6 +104,8 @@ class DispatchSelection(BaseModel):
             parts.append(f"generator∈{{{','.join(self.generators)}}}")
         if self.test_classes:
             parts.append(f"test_class∈{{{','.join(self.test_classes)}}}")
+        if self.key_hashes:
+            parts.append(f"{len(self.key_hashes)} key_hash(es)")
         if not parts:
             parts.append("all approved")
         if self.limit is not None:

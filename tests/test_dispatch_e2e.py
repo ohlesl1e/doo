@@ -30,6 +30,7 @@ from doo.canonical.identity import (
     compute_anonymous_auth_hash,
     compute_auth_hash,
 )
+from doo.dispatch.candidates import list_redispatch_candidates
 from doo.dispatch.executor.dispatcher import RedisLeaseReader, StubOpaClient
 from doo.dispatch.executor.send import HttpResponse, StubSender, TransportError
 from doo.dispatch.finding import (
@@ -49,8 +50,9 @@ from doo.dispatch.secrets import (
     SlotResolvingSecretStore,
     write_rotation_entry,
 )
+from doo.dispatch.selection import select_testcases
 from doo.events.execution import compute_testcase_key_hash
-from doo.ids import EngagementId
+from doo.ids import EngagementId, TestCaseKeyHash
 from doo.infra.neo4j_driver import Neo4jClient
 from doo.infra.redis_lease import RedisLease
 from doo.ontology.graph_state import Neo4jGraphState
@@ -787,6 +789,166 @@ def test_watermark_redispatch_guard_e2e(
         assert paths == ["/orders/123"]
         by_role = {r["role"]: r["status"] for r in new_edges}
         assert by_role["primary"] == "ok"
+
+
+def _seed_principal_gen(
+    neo4j: Neo4jClient, *, eng: str, gens: list[tuple[str, datetime, str]]
+) -> None:
+    """Principal `attacker` + AuthContext generations `(gen_id, first_seen, status)` on slot `bearer`."""
+    base = _cross(datetime.now(UTC))
+    neo4j.execute_write(
+        "MERGE (p:Principal {engagement_id:$eid, label:'attacker'}) "
+        "ON CREATE SET p.identity_key='attacker', p.tier='declared', p += $cross",
+        eid=eng,
+        cross=base,
+    )
+    for gen_id, first_seen, status in gens:
+        gc = {
+            **base,
+            "first_seen": first_seen,
+            "last_seen": first_seen,
+            "ingested_at": first_seen,
+            "status": status,
+        }
+        neo4j.execute_write(
+            """
+            MATCH (p:Principal {engagement_id:$eid, label:'attacker'})
+            MERGE (ac:AuthContext {engagement_id:$eid, id:$gid})
+            ON CREATE SET ac.auth_hash=$gid, ac.tier='declared', ac.token_kind='bearer',
+                          ac.slot='bearer', ac.is_anonymous=false, ac += $gc
+            MERGE (ac)-[:OF_PRINCIPAL]->(p)
+            """,
+            eid=eng,
+            gid=gen_id,
+            gc=gc,
+        )
+
+
+def _seed_tc(
+    neo4j: Neo4jClient, *, eng: str, key_hash: str, test_class: str
+) -> None:
+    """Minimal approved TestCase node (attacker `attacker`:`bearer`) for candidate reads."""
+    cross = _cross(datetime.now(UTC))
+    neo4j.execute_write(
+        """
+        MERGE (t:TestCase {engagement_id:$eid, key_hash:$kh})
+        ON CREATE SET t.test_class=$tc, t.payload_class='auth-token-swap',
+                      t.auth_context_id='ac-x', t.attacker_principal='attacker',
+                      t.attacker_slot='bearer', t.review_status='approved',
+                      t.expected_yield=0.9, t.generator='c2',
+                      t.target_endpoint_id=null, t.target_parameter_id=null,
+                      t.target_trust_boundary_id=null, t.hold=[], t.replay_hazards=[],
+                      t.hazard_source_hints=[], t.confidence=0.99, t += $cross
+        """,
+        eid=eng,
+        kh=key_hash,
+        tc=test_class,
+        cross=cross,
+    )
+
+
+def _exec_edge(
+    neo4j: Neo4jClient,
+    *,
+    eng: str,
+    key_hash: str,
+    role: str,
+    status: str,
+    at: datetime,
+    obs_id: str,
+) -> None:
+    """One `EXECUTED_AS{role, dispatch_status, at}` edge + its RequestObservation."""
+    base = _cross(datetime.now(UTC))
+    ro = {
+        **base,
+        "first_seen": at,
+        "last_seen": at,
+        "ingested_at": at,
+        "id": obs_id,
+        "observation_id": obs_id,
+        "method": "GET",
+        "concrete_path": "/x",
+        "response_status": 200,
+    }
+    edge = {
+        **base,
+        "first_seen": at,
+        "last_seen": at,
+        "ingested_at": at,
+        "engagement_id": eng,
+        "source_id": obs_id,
+    }
+    neo4j.execute_write(
+        """
+        MATCH (t:TestCase {engagement_id:$eid, key_hash:$kh})
+        MERGE (r:RequestObservation {engagement_id:$eid, observation_id:$obs})
+        ON CREATE SET r += $ro
+        MERGE (t)-[x:EXECUTED_AS {run_id:$obs, request_role:$role}]->(r)
+        ON CREATE SET x.dispatch_status=$status, x.at=$at, x += $edge
+        """,
+        eid=eng,
+        kh=key_hash,
+        obs=obs_id,
+        role=role,
+        status=status,
+        at=at,
+        ro=ro,
+        edge=edge,
+    )
+
+
+def test_list_redispatch_candidates_e2e(neo4j_client: Neo4jClient) -> None:
+    """ADR-0053 (#171): both failure shapes surface as candidates, classified by
+    the rotation watermark; a clean (`ok`) TestCase is excluded.
+
+    One `active` generation at T; candidates whose last failure predates T are
+    eligible, those after T wait. `auth_invalid` = primary edge; `auth_unverified`
+    = liveness edge with no primary edge.
+    """
+    eng = "eng-redispatch-cands"
+    t_gen = datetime(2026, 6, 24, 12, 0, 0, tzinfo=UTC)
+    _seed_principal_gen(neo4j_client, eng=eng, gens=[("ac-active", t_gen, "active")])
+    kh_a, kh_b, kh_c, kh_d = ("a" * 64, "b" * 64, "c" * 64, "d" * 64)
+    for kh, tc in [(kh_a, "idor"), (kh_b, "bola"), (kh_c, "auth-bypass"), (kh_d, "idor")]:
+        _seed_tc(neo4j_client, eng=eng, key_hash=kh, test_class=tc)
+    # A: auth_invalid AFTER the active gen → waiting on rotation.
+    _exec_edge(
+        neo4j_client, eng=eng, key_hash=kh_a, role="primary",
+        status="auth_invalid", at=t_gen + timedelta(hours=1), obs_id="o-a",
+    )
+    # B: auth_invalid BEFORE the active gen → eligible.
+    _exec_edge(
+        neo4j_client, eng=eng, key_hash=kh_b, role="primary",
+        status="auth_invalid", at=t_gen - timedelta(hours=1), obs_id="o-b",
+    )
+    # C: liveness-only BEFORE the gen (auth_unverified, #168) → eligible.
+    _exec_edge(
+        neo4j_client, eng=eng, key_hash=kh_c, role="liveness",
+        status="ok", at=t_gen - timedelta(hours=1), obs_id="o-c",
+    )
+    # D: clean ok primary → NOT a candidate.
+    _exec_edge(
+        neo4j_client, eng=eng, key_hash=kh_d, role="primary",
+        status="ok", at=t_gen - timedelta(hours=2), obs_id="o-d",
+    )
+
+    cands = list_redispatch_candidates(
+        neo4j_client, engagement_id=EngagementId(eng)
+    )
+    by_kh = {c.key_hash: c for c in cands}
+    assert set(by_kh) == {kh_a, kh_b, kh_c}
+    assert by_kh[kh_a].eligible is False and by_kh[kh_a].failure_kind == "auth_invalid"
+    assert by_kh[kh_b].eligible is True and by_kh[kh_b].failure_kind == "auth_invalid"
+    assert by_kh[kh_c].eligible is True and by_kh[kh_c].failure_kind == "auth_unverified"
+    assert by_kh[kh_c].principal == "attacker" and by_kh[kh_c].slot == "bearer"
+
+    # The rerun selector targets exactly the chosen key_hash(es).
+    sel = select_testcases(
+        neo4j_client,
+        engagement_id=EngagementId(eng),
+        selection=DispatchSelection(key_hashes=(TestCaseKeyHash(kh_b),)),
+    )
+    assert [t.key_hash for t in sel] == [kh_b]
 
 
 ENG_HZ = "eng-dispatch-csrf-e2e"
