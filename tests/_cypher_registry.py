@@ -53,6 +53,7 @@ from doo.dispatch.finding import (
     resolve_finding_key,
 )
 from doo.dispatch.models import DispatchSelection
+from doo.dispatch.rotation import is_waiting_on_rotation
 from doo.dispatch.selection import select_testcases
 from doo.ids import (
     AuthContextId,
@@ -211,6 +212,18 @@ REGISTRY: list[tuple[str, Callable[[RecordingClient], None]]] = [
             select_testcases,
             engagement_id=_EID,
             selection=DispatchSelection(generators=("c2",), test_classes=(), limit=50),
+        ),
+    ),
+    # dispatch.rotation — the #170 re-dispatch watermark guard (auth_invalid +
+    # OPTIONAL-MATCH double; two-stage WITH/aggregate the EXPLAIN net must parse).
+    (
+        "dispatch.is_waiting_on_rotation",
+        _driver(
+            is_waiting_on_rotation,
+            engagement_id=_EID,
+            key_hash=_KEY,
+            principal_label="attacker-b",
+            slot="bearer",
         ),
     ),
     # dispatch.finding — proposed / reasserted listings + key resolution.
