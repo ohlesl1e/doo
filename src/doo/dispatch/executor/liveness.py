@@ -289,7 +289,10 @@ class LivenessProber:
         # replay of the target (no target query/headers ride along). Only the
         # auth-carrying header/cookie is set, via the shared splice helper.
         headers, cookies = _splice_auth(
-            headers={}, cookies={}, material=material, session_cookie_name=None
+            headers={},
+            cookies={},
+            material=material,
+            session_cookie_names=evidence.session_cookie_names,
         )
         return ConcreteRequest(
             method=endpoint.method,

@@ -63,6 +63,7 @@ def _evidence(**over: object) -> EvidenceObservation:
         ),  # type: ignore[arg-type]
         cookies=dict(over.get("cookies", {})),  # type: ignore[arg-type]
         baseline_victim_auth_context_id=AuthContextId("ac-victim"),
+        session_cookie_names=tuple(over.get("session_cookie_names", ())),  # type: ignore[arg-type]
     )
 
 
@@ -187,7 +188,7 @@ def test_splice_auth_anonymous_strips_and_adds_nothing() -> None:
         material=AuthMaterial(
             kind="anonymous", raw="", principal_label="anonymous"
         ),
-        session_cookie_name="sid",
+        session_cookie_names=("sid",),
     )
     assert "Authorization" not in h
     assert "X-API-Key" not in h
@@ -231,9 +232,71 @@ def test_splice_auth_never_emits_empty_carrier(kind: str) -> None:
         headers={"Authorization": "Bearer evidence-tok"},
         cookies={"sid": "evidence-sess"},
         material=AuthMaterial(kind=kind, raw=raw, principal_label="p"),  # type: ignore[arg-type]
-        session_cookie_name="sid",
+        session_cookie_names=("sid",),
     )
     for v in h.values():
         assert not v.endswith(" "), f"{kind}: header value {v!r} has trailing space"
     for v in c.values():
         assert v != "", f"{kind}: empty cookie value"
+
+
+# ---------------------------------------------------------------------------
+# #176/#177 — cookie credential goes under the engagement's configured name,
+# and every configured session cookie inherited from evidence is stripped.
+# ---------------------------------------------------------------------------
+
+
+def test_splice_auth_cookie_uses_configured_name() -> None:
+    """A `cookie` credential is attached under `session_cookie_names[0]` (#176).
+
+    Regression for the auth_unverified storm: the credential was previously
+    written under the hardcoded `"session"`, so a target authenticating via a
+    `token` cookie never saw it.
+    """
+    _, c = _splice_auth(
+        headers={},
+        cookies={},
+        material=AuthMaterial(kind="cookie", raw="ATK-JWT", principal_label="p"),
+        session_cookie_names=("token",),
+    )
+    assert c == {"token": "ATK-JWT"}
+    assert "session" not in c
+
+
+def test_splice_auth_cookie_falls_back_to_session_when_unconfigured() -> None:
+    """Empty `session_cookie_names` → the legacy `"session"` fallback is retained."""
+    _, c = _splice_auth(
+        headers={},
+        cookies={},
+        material=AuthMaterial(kind="cookie", raw="ATK-JWT", principal_label="p"),
+        session_cookie_names=(),
+    )
+    assert c == {"session": "ATK-JWT"}
+
+
+def test_splice_auth_strips_every_configured_session_cookie() -> None:
+    """All configured names are stripped from inherited evidence; credential lands
+    under the first (#177 hardening — no victim session rides along, even with
+    multiple configured names)."""
+    _, c = _splice_auth(
+        headers={},
+        cookies={"token": "VICTIM-JWT", "sid": "VICTIM-SID", "ui_theme": "dark"},
+        material=AuthMaterial(kind="cookie", raw="ATK-JWT", principal_label="p"),
+        session_cookie_names=("token", "sid"),
+    )
+    assert c["token"] == "ATK-JWT"  # credential under the first configured name
+    assert "VICTIM-JWT" not in c.values()
+    assert "sid" not in c  # the other configured session cookie is stripped too
+    assert c.get("ui_theme") == "dark"  # non-session cookies preserved
+
+
+def test_idor_primary_sends_cookie_credential_under_configured_name() -> None:
+    """End-to-end through `idor_primary`: the evidence's configured cookie name
+    flows from `EvidenceObservation.session_cookie_names` to the wire cookie."""
+    ev = _evidence(session_cookie_names=("token",))
+    req = idor_primary(
+        _testcase(),
+        ev,
+        AuthMaterial(kind="cookie", raw="ATK-JWT", principal_label="user-b"),
+    )
+    assert dict(req.cookies) == {"token": "ATK-JWT"}
