@@ -134,6 +134,10 @@ class RunDependencies:
     liveness: LivenessPolicy | None = None
     reactive: ReactiveEmitter | None = None
     evidence_loader: object = None  # Callable | None; defaults to graph-backed.
+    # The engagement's `auth.session_cookie_names` (ADR-0026), threaded onto every
+    # loaded `EvidenceObservation` so cookie-kind credentials are spliced under the
+    # configured name (#176). Empty → the `_splice_auth` `"session"` fallback.
+    session_cookie_names: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -368,7 +372,12 @@ def _execute_one(
 
     # --- evidence load. ---
     loader = deps.evidence_loader or (
-        lambda t: load_evidence(deps.neo4j, engagement_id=eid, testcase=t)
+        lambda t: load_evidence(
+            deps.neo4j,
+            engagement_id=eid,
+            testcase=t,
+            session_cookie_names=deps.session_cookie_names,
+        )
     )
     evidence: EvidenceObservation | None = loader(tc)  # type: ignore[operator]
     if evidence is None:
@@ -1027,7 +1036,10 @@ def _warmup_request(
     """A standalone `hazard_warmup` GET to the source_hint page under the test's auth."""
 
     headers, cookies = _splice_auth(
-        headers={}, cookies={}, material=material, session_cookie_name=None
+        headers={},
+        cookies={},
+        material=material,
+        session_cookie_names=evidence.session_cookie_names,
     )
     return ConcreteRequest(
         method=method,

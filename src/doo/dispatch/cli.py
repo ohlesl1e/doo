@@ -452,6 +452,9 @@ def _execute_and_render(
         # refresh emitter for a dead token.
         liveness=LivenessPolicy.from_config(cfg, graph_map=graph_map),
         reactive=_build_reactive(),  # type: ignore[arg-type]
+        # ADR-0026 / #176: the configured session-cookie name(s), threaded onto
+        # loaded evidence so cookie credentials are spliced under the right name.
+        session_cookie_names=cfg.auth.session_cookie_names,
     )
 
     result = execute_run(run, deps)

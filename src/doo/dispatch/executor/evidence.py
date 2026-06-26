@@ -65,6 +65,12 @@ class EvidenceObservation:
     body_content_type: str | None = None
     baseline_victim_auth_context_id: AuthContextId | None = None
     confidence: float = 1.0
+    # The engagement's `auth.session_cookie_names` (ADR-0026), carried here so the
+    # request constructors send a `cookie`-kind credential under the configured
+    # name and strip every configured session cookie inherited from the evidence
+    # (#176/#177). Empty → the `_splice_auth` `"session"` fallback (un-configured
+    # engagement).
+    session_cookie_names: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +110,7 @@ def load_evidence(
     *,
     engagement_id: EngagementId,
     testcase: DispatchTestCase,
+    session_cookie_names: tuple[str, ...] = (),
 ) -> EvidenceObservation | None:
     """Resolve the highest-confidence evidencing `RequestObservation` for a TestCase.
 
@@ -210,6 +217,7 @@ def load_evidence(
         body_content_type=row.get("body_content_type"),
         baseline_victim_auth_context_id=baseline_victim_ac,
         confidence=float(row["confidence"]),
+        session_cookie_names=session_cookie_names,
     )
 
 

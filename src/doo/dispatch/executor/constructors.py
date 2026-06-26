@@ -51,7 +51,7 @@ def _splice_auth(
     headers: dict[str, str],
     cookies: dict[str, str],
     material: AuthMaterial,
-    session_cookie_name: str | None,
+    session_cookie_names: tuple[str, ...],
 ) -> tuple[dict[str, str], dict[str, str]]:
     """Swap the auth-carrying header/cookie to `material`; strip other auth.
 
@@ -60,13 +60,22 @@ def _splice_auth(
     **nothing added** (the strip below IS the no-auth send, #135). Any *other*
     auth-shaped header from the evidence is dropped so the victim's credential
     cannot ride along (which would mask an authz hole).
+
+    `session_cookie_names` is the engagement's `auth.session_cookie_names`
+    (ADR-0026). **Every** configured name is stripped from the inherited evidence
+    cookies before the credential is spliced (#176/#177), so no victim session
+    rides along regardless of how many names are configured or which one the
+    credential is written under. An empty tuple → the `"session"` fallback (an
+    un-configured engagement); the credential is written under the first name.
     """
 
     # Strip every auth-carrying header from the evidence first.
     h = {k: v for k, v in headers.items() if k.lower() not in _AUTH_HEADERS}
     c = dict(cookies)
-    if session_cookie_name is not None:
-        c.pop(session_cookie_name, None)
+    # Strip ALL configured session cookies inherited from the evidence so the
+    # victim's session never rides along (#176/#177).
+    for name in session_cookie_names:
+        c.pop(name, None)
 
     if material.kind == "anonymous":
         # No carrier added back — "send as anonymous" means the stripped request.
@@ -81,7 +90,7 @@ def _splice_auth(
     elif material.kind == "api_key":
         h["X-API-Key"] = material.raw
     elif material.kind == "cookie":
-        name = session_cookie_name or "session"
+        name = session_cookie_names[0] if session_cookie_names else "session"
         c[name] = material.raw
     return h, c
 
@@ -126,11 +135,7 @@ def idor_primary(
         headers=evidence.headers,
         cookies=evidence.cookies,
         material=auth,
-        # The session-cookie name is engagement-level; the run driver passes it
-        # via the evidence headers/cookies it loaded. For S1 the bearer path is
-        # the proven one; cookie-auth engagements get the right name in S3 when
-        # the resolver registry takes the `EngagementConfig`.
-        session_cookie_name=None,
+        session_cookie_names=evidence.session_cookie_names,
     )
     return ConcreteRequest(
         method=evidence.method,
@@ -176,7 +181,7 @@ def idor_baseline_victim(
         headers=evidence.headers,
         cookies=evidence.cookies,
         material=auth,
-        session_cookie_name=None,
+        session_cookie_names=evidence.session_cookie_names,
     )
     # The send is OBSERVED_UNDER the victim's AuthContext, not the TestCase's.
     victim_ac = evidence.baseline_victim_auth_context_id or testcase.auth_context_id
@@ -234,7 +239,7 @@ def idor_baseline_negative(
         headers=evidence.headers,
         cookies=evidence.cookies,
         material=auth,
-        session_cookie_name=None,
+        session_cookie_names=evidence.session_cookie_names,
     )
     return ConcreteRequest(
         method=evidence.method,
