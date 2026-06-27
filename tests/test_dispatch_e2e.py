@@ -50,7 +50,7 @@ from doo.dispatch.secrets import (
     SlotResolvingSecretStore,
     write_rotation_entry,
 )
-from doo.dispatch.selection import select_testcases
+from doo.dispatch.selection import count_already_completed, select_testcases
 from doo.events.execution import compute_testcase_key_hash
 from doo.ids import EngagementId, TestCaseKeyHash
 from doo.infra.neo4j_driver import Neo4jClient
@@ -1296,7 +1296,11 @@ def test_dispatch_spine_e2e(
     )
     run3 = arm_run(
         config=engagement_config,
-        selection=DispatchSelection(test_classes=("idor",), limit=1),
+        # #180: run1 already left an `ok` primary on this TestCase, so a
+        # re-dispatch must opt out of the resume-skip default to send again.
+        selection=DispatchSelection(
+            test_classes=("idor",), limit=1, skip_completed=False
+        ),
         actor="e2e-tester",
     )
     deps3 = RunDependencies(
@@ -1383,7 +1387,10 @@ def test_dispatch_spine_e2e(
     # Re-arm with a fresh scripted Interpreter (same `vulnerable` script as run3).
     run4 = arm_run(
         config=engagement_config,
-        selection=DispatchSelection(test_classes=("idor",), limit=1),
+        # #180: re-assert path re-sends the already-completed TestCase.
+        selection=DispatchSelection(
+            test_classes=("idor",), limit=1, skip_completed=False
+        ),
         actor="e2e-tester",
     )
     fake4 = FakeMultiTurnCaller(
@@ -1439,7 +1446,11 @@ def test_dispatch_spine_e2e(
     lease.release()
     run2 = arm_run(
         config=engagement_config,
-        selection=DispatchSelection(test_classes=("idor",), limit=1),
+        # #180: re-attempt the already-completed TestCase to exercise the
+        # kill-switch gate; opt out of resume-skip so it is selected.
+        selection=DispatchSelection(
+            test_classes=("idor",), limit=1, skip_completed=False
+        ),
         actor="e2e-tester",
     )
     result2 = execute_run(run2, deps)
@@ -1448,3 +1459,131 @@ def test_dispatch_spine_e2e(
     assert result2.outcomes[0].reason == "kill_switch"
     # No additional wire send.
     assert len(sender.sent) == 1
+
+
+def test_resumable_dispatch_skip_completed_e2e(
+    neo4j_client: Neo4jClient, redis_url: str, engagement_config: EngagementConfig
+) -> None:
+    """#180: a re-run skips TestCases that already have an `ok` primary; --force re-sends.
+
+    Run once (commit an `ok` primary). Re-run with the default resume semantics →
+    nothing drains, the finished TestCase is counted as skipped, no new wire send.
+    Re-run with `skip_completed=False` → it re-sends. Also assert `--select
+    key_hash=` scopes the selection to the named TestCase.
+    """
+    env = {"E2E_VICTIM": VICTIM_TOKEN, "E2E_ATTACKER": ATTACKER_TOKEN}
+    secrets = EnvSecretStore.from_config(engagement_config, env=env)
+    attacker_ac_id = auth_context_id(
+        EngagementId(ENG), compute_auth_hash("bearer", ATTACKER_TOKEN)
+    )
+    key_hash_a = _seed_graph(neo4j_client, attacker_ac_id=attacker_ac_id)
+    # A second approved IDOR TestCase on the same endpoint (distinct key_hash).
+    cross = _cross(datetime.now(UTC))
+    payload_hash_b = hashlib.sha256(b"second").hexdigest()
+    key_hash_b = compute_testcase_key_hash(
+        engagement_id=EngagementId(ENG),
+        test_class="idor",
+        target_endpoint_id=EP_ID,
+        target_parameter_id=None,
+        target_trust_boundary_id=None,
+        payload_class="auth-token-swap",
+        payload_hash=payload_hash_b,  # type: ignore[arg-type]
+        attacker_principal="attacker",
+        attacker_slot="bearer",
+    )
+    neo4j_client.execute_write(
+        """
+        MATCH (e:Endpoint {engagement_id: $eid, id: $epid})
+        MERGE (t:TestCase {engagement_id: $eid, key_hash: $kh})
+        ON CREATE SET t.test_class = 'idor', t.payload_class = 'auth-token-swap',
+                      t.payload_hash = $ph, t.auth_context_id = $ac_attacker,
+                      t.attacker_principal = 'attacker', t.attacker_slot = 'bearer',
+                      t.target_endpoint_id = $epid,
+                      t.review_status = 'approved', t.expected_yield = 0.8,
+                      t.generator = 'c2', t.hold = ['order_id'],
+                      t.replay_hazards = [], t.source = 'llm-planner',
+                      t.confidence = 0.99, t += $cross
+        MERGE (t)-[:TARGETS_ENDPOINT]->(e)
+        """,
+        eid=ENG,
+        epid=EP_ID,
+        kh=key_hash_b,
+        ph=payload_hash_b,
+        ac_attacker=attacker_ac_id,
+        cross=cross,
+    )
+
+    rclient = redis.Redis.from_url(redis_url)
+    lease = RedisLease(rclient, EngagementId(ENG))
+    lease.set_active(ttl_seconds=60)
+
+    def _deps() -> RunDependencies:
+        return RunDependencies(
+            neo4j=neo4j_client,
+            lease=RedisLeaseReader(lease=lease),
+            opa=StubOpaClient(allow=True),
+            sender=StubSender(
+                response=HttpResponse(
+                    status=200, body=b'{"order_id":123,"owner":"victim"}'
+                )
+            ),
+            secrets=secrets,
+            bodies=NoopBodyStore(),
+            ledger=InMemoryDispatchLedger(),
+        )
+
+    # --- Run 1: drain both → two `ok` primaries committed. ---
+    run1 = arm_run(
+        config=engagement_config,
+        selection=DispatchSelection(test_classes=("idor",)),
+        actor="e2e-tester",
+    )
+    result1 = execute_run(run1, _deps())
+    assert {o.outcome for o in result1.outcomes} == {"executed"}
+    assert len(result1.outcomes) == 2
+    assert result1.skipped_completed == 0
+
+    # --- Run 2: resume (default) → both already done, nothing drains. ---
+    run2 = arm_run(
+        config=engagement_config,
+        selection=DispatchSelection(test_classes=("idor",)),
+        actor="e2e-tester",
+    )
+    deps2 = _deps()
+    result2 = execute_run(run2, deps2)
+    assert result2.outcomes == ()
+    assert result2.skipped_completed == 2
+    assert deps2.sender.sent == []  # type: ignore[attr-defined]
+
+    # --- count_already_completed agrees with the resume skip. ---
+    assert (
+        count_already_completed(
+            neo4j_client,
+            engagement_id=EngagementId(ENG),
+            selection=DispatchSelection(test_classes=("idor",)),
+        )
+        == 2
+    )
+
+    # --- Run 3: --force (skip_completed=False) → both re-sent. ---
+    run3 = arm_run(
+        config=engagement_config,
+        selection=DispatchSelection(test_classes=("idor",), skip_completed=False),
+        actor="e2e-tester",
+    )
+    deps3 = _deps()
+    result3 = execute_run(run3, deps3)
+    assert len(result3.outcomes) == 2
+    assert result3.skipped_completed == 0
+    assert len(deps3.sender.sent) == 2  # type: ignore[attr-defined]
+
+    # --- key_hash scoping: select only one TestCase by content address. ---
+    scoped = select_testcases(
+        neo4j_client,
+        engagement_id=EngagementId(ENG),
+        selection=DispatchSelection(
+            key_hashes=(TestCaseKeyHash(key_hash_a),), skip_completed=False
+        ),
+    )
+    assert [tc.key_hash for tc in scoped] == [key_hash_a]
+    assert key_hash_b not in {tc.key_hash for tc in scoped}

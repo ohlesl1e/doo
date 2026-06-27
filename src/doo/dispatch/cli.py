@@ -276,6 +276,7 @@ def _parse_select(select: list[str]) -> DispatchSelection:
 
     generators: list[str] = []
     test_classes: list[str] = []
+    key_hashes: list[str] = []
     for s in select:
         for pair in s.split(","):
             pair = pair.strip()
@@ -290,12 +291,19 @@ def _parse_select(select: list[str]) -> DispatchSelection:
                 generators.append(v)
             elif k == "test_class":
                 test_classes.append(v)
+            elif k == "key_hash":
+                # #180: scope a run to specific TestCase(s) by content address —
+                # the manual resume path. Reuses `DispatchSelection.key_hashes`.
+                key_hashes.append(v)
             else:
                 raise typer.BadParameter(
-                    f"unknown --select key {k!r} (expected generator|test_class)"
+                    f"unknown --select key {k!r} "
+                    "(expected generator|test_class|key_hash)"
                 )
     return DispatchSelection(
-        generators=tuple(generators), test_classes=tuple(test_classes)  # type: ignore[arg-type]
+        generators=tuple(generators),
+        test_classes=tuple(test_classes),  # type: ignore[arg-type]
+        key_hashes=tuple(key_hashes),  # type: ignore[arg-type]
     )
 
 
@@ -316,10 +324,18 @@ def run_cmd(
     select: list[str] = typer.Option(
         [],
         "--select",
-        help="Selection predicate: key=value (generator=c2, test_class=idor). Repeatable.",
+        help="Selection predicate: key=value (generator=c2, test_class=idor, "
+        "key_hash=<hash>). Repeatable.",
     ),
     limit: int | None = typer.Option(
         None, "--limit", "-n", min=1, help="Top-N by expected_yield."
+    ),
+    no_skip_completed: bool = typer.Option(
+        False,
+        "--no-skip-completed",
+        "--force",
+        help="Re-send every selected TestCase, including ones with an ok primary. "
+        "Default: skip already-completed TestCases (resume an interrupted run).",
     ),
     arming: ArmingMode | None = typer.Option(
         None,
@@ -363,7 +379,9 @@ def run_cmd(
         )
         raise typer.Exit(code=2)
 
-    selection = _parse_select(select).model_copy(update={"limit": limit})
+    selection = _parse_select(select).model_copy(
+        update={"limit": limit, "skip_completed": not no_skip_completed}
+    )
     try:
         run = arm_run(
             config=cfg, selection=selection, actor=actor, arming=arming
@@ -459,10 +477,15 @@ def _execute_and_render(
 
     result = execute_run(run, deps)
 
+    skipped = (
+        f", {result.skipped_completed} already-done TestCase(s) skipped"
+        if result.skipped_completed
+        else ""
+    )
     typer.echo(
         f"\ndispatch run {result.run.run_id} complete: "
         f"{len(result.outcomes)} TestCase(s) drained, "
-        f"{result.requests_sent} request(s) sent."
+        f"{result.requests_sent} request(s) sent{skipped}."
     )
     by_kind: dict[str, int] = {}
     for o in result.outcomes:
@@ -753,7 +776,12 @@ def redispatch_cmd(
         typer.echo(f"no eligible candidates to re-dispatch in engagement {engagement!r}")
         raise typer.Exit(code=0)
     selection = DispatchSelection(
-        key_hashes=tuple(TestCaseKeyHash(c.key_hash) for c in chosen)
+        # #180: an explicit re-dispatch of chosen candidates always re-sends —
+        # never silently skip on the resume predicate. (Candidates lack an `ok`
+        # primary today, so this is belt-and-braces against future eligibility
+        # changes.)
+        key_hashes=tuple(TestCaseKeyHash(c.key_hash) for c in chosen),
+        skip_completed=False,
     )
     try:
         run = arm_run(config=cfg, selection=selection, actor=actor, arming=arming)
