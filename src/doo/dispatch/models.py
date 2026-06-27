@@ -316,6 +316,11 @@ RunOutcomeKind = Literal[
     "constructor_missing",
     "auth_unverified",
     "waiting_on_rotation",
+    # #179: the `primary` send committed `ok`, but the Interpreter confirm-loop
+    # raised (e.g. a 120s LLM timeout). Isolated per-TestCase so one slow/failed
+    # interpretation never aborts the run; surfaced for review, interpretation
+    # deferred (re-drivable later). The committed `ok` primary edge is unchanged.
+    "interpreter_error",
 ]
 
 
