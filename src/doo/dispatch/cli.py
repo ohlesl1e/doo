@@ -30,12 +30,13 @@ from doo.dispatch.executor.send import HttpxSender
 from doo.dispatch.ledger import JsonFileDispatchLedger
 from doo.dispatch.models import DispatchRun, DispatchSelection
 from doo.dispatch.ontology import NoopBodyStore
-from doo.dispatch.run import RunDependencies, arm_run, execute_run
+from doo.dispatch.run import RunDependencies, RunResult, arm_run, execute_run
 from doo.dispatch.secrets import (
     EnvSecretStore,
     SlotResolvingSecretStore,
     build_declared_slot_map,
 )
+from doo.dispatch.selection import count_already_completed, select_testcases
 from doo.ids import EngagementId
 from doo.infra.neo4j_driver import Neo4jClient
 from doo.infra.redis_lease import RedisLease
@@ -359,6 +360,13 @@ def run_cmd(
         help="Override the interpreter LLM model id for this run (ADR-0051: beats "
         "DOO_INTERPRETER_MODEL/DOO_PLANNER_MODEL and the engagement default).",
     ),
+    quiet: bool = typer.Option(
+        False,
+        "--quiet",
+        "-q",
+        help="Suppress the per-send structured log lines (raises log level to "
+        "WARNING). The pre-run line, progress, and summary still print.",
+    ),
 ) -> None:
     """Arm and drain one dispatch run over approved TestCases.
 
@@ -367,7 +375,7 @@ def run_cmd(
     `dispatcher_blocked(kill_switch)`.
     """
 
-    configure_logging()
+    configure_logging(level="WARNING" if quiet else "INFO")
 
     cfg = _load_config(config)
     if cfg.engagement.id != engagement:
@@ -475,18 +483,62 @@ def _execute_and_render(
         session_cookie_names=cfg.auth.session_cookie_names,
     )
 
-    result = execute_run(run, deps)
+    # #181: pre-run visibility — what will be sent vs. what's already finished —
+    # printed BEFORE draining so it survives an interrupt. The selected to-send
+    # list is then injected into `execute_run` (it already honours the resume
+    # filter), so the drain doesn't re-query the selection.
+    to_send = select_testcases(
+        neo4j, engagement_id=run.engagement_id, selection=run.selection
+    )
+    done = count_already_completed(
+        neo4j, engagement_id=run.engagement_id, selection=run.selection
+    )
+    skipped = done if run.selection.skip_completed else 0
+    resume_note = " (resume: skipping done)" if run.selection.skip_completed else ""
+    typer.echo(
+        f"\n{len(to_send)} TestCase(s) to send · {done} already done{resume_note}"
+    )
+
+    def _progress(sent: int, drained: int, total: int) -> None:
+        # Coarse heartbeat for long runs; uses `typer.echo` so it shows even under
+        # `--quiet` (which only raises the structured-log level).
+        typer.echo(f"  … {drained}/{total} drained, {sent} request(s) sent")
+
+    result = execute_run(
+        run,
+        deps,
+        testcases=to_send,
+        skipped_completed=skipped,
+        on_progress=_progress,
+    )
+    render_summary(result, engagement=engagement)
+
+
+def render_summary(result: RunResult, *, engagement: str) -> None:
+    """Render the human run summary: drained/sent counts, per-kind tally, and the
+    refused / re-asserted / liveness advisories.
+
+    Always called — including on an interrupted run (#181) — so a Ctrl-C or an
+    unexpected raise mid-drain still prints what drained instead of losing it.
+    """
 
     skipped = (
         f", {result.skipped_completed} already-done TestCase(s) skipped"
         if result.skipped_completed
         else ""
     )
+    status = "interrupted" if result.interrupted else "complete"
     typer.echo(
-        f"\ndispatch run {result.run.run_id} complete: "
+        f"\ndispatch run {result.run.run_id} {status}: "
         f"{len(result.outcomes)} TestCase(s) drained, "
         f"{result.requests_sent} request(s) sent{skipped}."
     )
+    if result.interrupted:
+        typer.secho(
+            "  run stopped early (Ctrl-C or error); summary is partial — re-run "
+            "to resume the remaining TestCases (resume is the default).",
+            fg=typer.colors.YELLOW,
+        )
     by_kind: dict[str, int] = {}
     for o in result.outcomes:
         by_kind[o.outcome] = by_kind.get(o.outcome, 0) + 1
@@ -685,6 +737,12 @@ def redispatch_cmd(
     model: str | None = typer.Option(
         None, "--model", help="Override the interpreter LLM model id for the rerun."
     ),
+    quiet: bool = typer.Option(
+        False,
+        "--quiet",
+        "-q",
+        help="Suppress per-send structured log lines (raises log level to WARNING).",
+    ),
 ) -> None:
     """Report re-dispatch candidates; `--rerun` re-sends the eligible ones.
 
@@ -699,7 +757,7 @@ def redispatch_cmd(
 
     from doo.ids import TestCaseKeyHash
 
-    configure_logging()
+    configure_logging(level="WARNING" if quiet else "INFO")
     neo4j = _build_neo4j()
     candidates = list_redispatch_candidates(
         neo4j, engagement_id=EngagementId(engagement)

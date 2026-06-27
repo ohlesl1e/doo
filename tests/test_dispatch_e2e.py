@@ -42,7 +42,7 @@ from doo.dispatch.finding import (
 )
 from doo.dispatch.interpreter.loop import FakeMultiTurnCaller
 from doo.dispatch.ledger import InMemoryDispatchLedger
-from doo.dispatch.models import DispatchSelection
+from doo.dispatch.models import DispatchSelection, RunOutcome
 from doo.dispatch.ontology import NoopBodyStore
 from doo.dispatch.run import RunDependencies, arm_run, execute_run
 from doo.dispatch.secrets import (
@@ -1699,3 +1699,172 @@ def test_interpreter_error_isolated_e2e(
     )
     committed = {r["kh"]: r["status"] for r in rows}
     assert committed == {key_hash_a: "ok", key_hash_b: "ok"}
+
+
+def _seed_second_idor_testcase(
+    neo4j: Neo4jClient, *, attacker_ac_id: str, seed: bytes = b"second"
+) -> str:
+    """A second approved IDOR TestCase on the same endpoint (distinct key_hash).
+
+    Used by the resume / interrupt / progress tests that need >1 TestCase in a run
+    against the `_seed_graph` engagement. Returns the new TestCase `key_hash`.
+    """
+    cross = _cross(datetime.now(UTC))
+    payload_hash = hashlib.sha256(seed).hexdigest()
+    key_hash = compute_testcase_key_hash(
+        engagement_id=EngagementId(ENG),
+        test_class="idor",
+        target_endpoint_id=EP_ID,
+        target_parameter_id=None,
+        target_trust_boundary_id=None,
+        payload_class="auth-token-swap",
+        payload_hash=payload_hash,  # type: ignore[arg-type]
+        attacker_principal="attacker",
+        attacker_slot="bearer",
+    )
+    neo4j.execute_write(
+        """
+        MATCH (e:Endpoint {engagement_id: $eid, id: $epid})
+        MERGE (t:TestCase {engagement_id: $eid, key_hash: $kh})
+        ON CREATE SET t.test_class = 'idor', t.payload_class = 'auth-token-swap',
+                      t.payload_hash = $ph, t.auth_context_id = $ac_attacker,
+                      t.attacker_principal = 'attacker', t.attacker_slot = 'bearer',
+                      t.target_endpoint_id = $epid,
+                      t.review_status = 'approved', t.expected_yield = 0.8,
+                      t.generator = 'c2', t.hold = ['order_id'],
+                      t.replay_hazards = [], t.source = 'llm-planner',
+                      t.confidence = 0.99, t += $cross
+        MERGE (t)-[:TARGETS_ENDPOINT]->(e)
+        """,
+        eid=ENG,
+        epid=EP_ID,
+        kh=key_hash,
+        ph=payload_hash,
+        ac_attacker=attacker_ac_id,
+        cross=cross,
+    )
+    return key_hash
+
+
+def _resumable_deps(
+    neo4j: Neo4jClient, lease: RedisLease, secrets: EnvSecretStore
+) -> RunDependencies:
+    """Minimal deps for the #181 drain tests: StubSender 200, in-memory ledger."""
+    return RunDependencies(
+        neo4j=neo4j,
+        lease=RedisLeaseReader(lease=lease),
+        opa=StubOpaClient(allow=True),
+        sender=StubSender(
+            response=HttpResponse(status=200, body=b'{"order_id":123,"owner":"victim"}')
+        ),
+        secrets=secrets,
+        bodies=NoopBodyStore(),
+        ledger=InMemoryDispatchLedger(),
+    )
+
+
+def test_dispatch_run_interrupt_preserves_partial_summary_e2e(
+    neo4j_client: Neo4jClient,
+    redis_url: str,
+    engagement_config: EngagementConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#181: a raise mid-drain returns a partial RunResult (interrupted=True).
+
+    Two TestCases; the second `_execute_one` raises `KeyboardInterrupt`. The run
+    does not propagate — it stops, the first (drained) outcome is preserved, and
+    `interrupted` is set so the CLI still renders the summary.
+    """
+    from doo.dispatch import run as run_module
+
+    env = {"E2E_VICTIM": VICTIM_TOKEN, "E2E_ATTACKER": ATTACKER_TOKEN}
+    secrets = EnvSecretStore.from_config(engagement_config, env=env)
+    attacker_ac_id = auth_context_id(
+        EngagementId(ENG), compute_auth_hash("bearer", ATTACKER_TOKEN)
+    )
+    _seed_graph(neo4j_client, attacker_ac_id=attacker_ac_id)
+    _seed_second_idor_testcase(neo4j_client, attacker_ac_id=attacker_ac_id)
+    lease = RedisLease(redis.Redis.from_url(redis_url), EngagementId(ENG))
+    lease.set_active(ttl_seconds=60)
+
+    real_execute_one = run_module._execute_one
+    calls = {"n": 0}
+
+    def _raise_on_second(*args: object, **kwargs: object) -> RunOutcome:
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise KeyboardInterrupt
+        return real_execute_one(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(run_module, "_execute_one", _raise_on_second)
+
+    run = arm_run(
+        config=engagement_config,
+        # force so both are selected regardless of the (wiped, but explicit) state.
+        selection=DispatchSelection(test_classes=("idor",), skip_completed=False),
+        actor="e2e-tester",
+    )
+    result = execute_run(run, _resumable_deps(neo4j_client, lease, secrets))
+
+    assert result.interrupted is True
+    assert len(result.outcomes) == 1
+    assert result.outcomes[0].outcome == "executed"
+
+
+def test_dispatch_run_progress_and_injected_skip_count_e2e(
+    neo4j_client: Neo4jClient,
+    redis_url: str,
+    engagement_config: EngagementConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#181: `on_progress` fires per TestCase; injected `skipped_completed` flows through.
+
+    With `_PROGRESS_EVERY` forced to 1, the callback sees `(sent, drained, selected)`
+    after each TestCase. Separately, a caller that injects `testcases` (the CLI
+    pre-run path) can pass the resume-skipped count it already computed.
+    """
+    from doo.dispatch import run as run_module
+
+    env = {"E2E_VICTIM": VICTIM_TOKEN, "E2E_ATTACKER": ATTACKER_TOKEN}
+    secrets = EnvSecretStore.from_config(engagement_config, env=env)
+    attacker_ac_id = auth_context_id(
+        EngagementId(ENG), compute_auth_hash("bearer", ATTACKER_TOKEN)
+    )
+    _seed_graph(neo4j_client, attacker_ac_id=attacker_ac_id)
+    _seed_second_idor_testcase(neo4j_client, attacker_ac_id=attacker_ac_id)
+    lease = RedisLease(redis.Redis.from_url(redis_url), EngagementId(ENG))
+    lease.set_active(ttl_seconds=60)
+
+    monkeypatch.setattr(run_module, "_PROGRESS_EVERY", 1)
+    seen: list[tuple[int, int, int]] = []
+
+    run = arm_run(
+        config=engagement_config,
+        selection=DispatchSelection(test_classes=("idor",), skip_completed=False),
+        actor="e2e-tester",
+    )
+    result = execute_run(
+        run,
+        _resumable_deps(neo4j_client, lease, secrets),
+        on_progress=lambda s, d, t: seen.append((s, d, t)),
+    )
+    assert len(result.outcomes) == 2
+    assert result.interrupted is False
+    # key_hash_a (yield 0.9) drains before key_hash_b (0.8); one send each.
+    assert seen == [(1, 1, 2), (2, 2, 2)]
+
+    # Injected `testcases` + `skipped_completed` (the CLI pre-run path): the count
+    # flows onto the result; no graph-backed selection runs.
+    run2 = arm_run(
+        config=engagement_config,
+        selection=DispatchSelection(test_classes=("idor",)),
+        actor="e2e-tester",
+    )
+    result2 = execute_run(
+        run2,
+        _resumable_deps(neo4j_client, lease, secrets),
+        testcases=[],
+        skipped_completed=7,
+    )
+    assert result2.skipped_completed == 7
+    assert result2.outcomes == ()
