@@ -583,6 +583,34 @@ def render_summary(result: RunResult, *, engagement: str) -> None:
             err=True,
         )
 
+    if result.stalled_auth_slots:
+        # #183: auth failures climbing on a slot with no rotation since the run
+        # armed — the auth-helper is likely down or its `refresh:` is broken.
+        # Advisory only (never halts; only the kill-switch halts).
+        typer.secho(
+            "\n⚠ auth failures are climbing with NO rotation happening — the "
+            "auth-helper looks down (not started, or a broken `refresh:`):",
+            fg=typer.colors.YELLOW,
+            bold=True,
+            err=True,
+        )
+        for s in result.stalled_auth_slots:
+            typer.secho(
+                f"  • {s.principal_label}/{s.slot}: {s.auth_failures} auth "
+                "failure(s) this run, no newer credential generation.",
+                fg=typer.colors.YELLOW,
+                err=True,
+            )
+        typer.secho(
+            "  Start/check the auth-helper "
+            f"(`doo engagement keepalive {engagement} --with-auth-helper "
+            "--config <yaml>`, or `doo auth-helper run`), then re-dispatch the "
+            "affected TestCases (`doo dispatch redispatch -e "
+            f"{engagement} -c <yaml> --rerun`, or `--select key_hash=…`).",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+
 
 # ---------------------------------------------------------------------------
 # `doo dispatch review` (S5/#90) — triage refused TestCases + set hazard overrides.

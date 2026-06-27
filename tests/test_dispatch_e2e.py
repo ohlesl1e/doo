@@ -30,8 +30,14 @@ from doo.canonical.identity import (
     compute_anonymous_auth_hash,
     compute_auth_hash,
 )
+from doo.dispatch.auth_alarm import (
+    AUTH_STALL_THRESHOLD,
+    StalledSlot,
+    detect_stalled_auth_slots,
+)
 from doo.dispatch.candidates import list_redispatch_candidates
 from doo.dispatch.executor.dispatcher import RedisLeaseReader, StubOpaClient
+from doo.dispatch.executor.evidence import DispatchTestCase
 from doo.dispatch.executor.send import HttpResponse, StubSender, TransportError
 from doo.dispatch.finding import (
     InMemoryFindingLedger,
@@ -52,7 +58,7 @@ from doo.dispatch.secrets import (
 )
 from doo.dispatch.selection import count_already_completed, select_testcases
 from doo.events.execution import compute_testcase_key_hash
-from doo.ids import EngagementId, TestCaseKeyHash
+from doo.ids import AuthContextId, DispatchRunId, EngagementId, TestCaseKeyHash
 from doo.infra.neo4j_driver import Neo4jClient
 from doo.infra.redis_lease import RedisLease
 from doo.ontology.graph_state import Neo4jGraphState
@@ -1724,3 +1730,164 @@ def test_dispatch_run_progress_and_injected_skip_count_e2e(
     )
     assert result2.skipped_completed == 7
     assert result2.outcomes == ()
+
+
+# --- #183: early warning — auth failures climbing, nothing rotating ----------
+
+ENG_STALL = "eng-dispatch-stall-e2e"
+
+
+def _seed_attacker_principal(
+    neo4j: Neo4jClient, *, eng: str, label: str, slot: str, first_seen: datetime
+) -> None:
+    """Seed a Principal + one `active` `declared` AuthContext on `slot` (the
+    rotation axis `_rotated_since` reads). `first_seen` controls whether it counts
+    as a rotation after the run armed."""
+    cross = _cross(first_seen)
+    neo4j.execute_write(
+        """
+        MERGE (p:Principal {engagement_id: $eid, label: $label})
+        ON CREATE SET p += $cross
+        MERGE (ac:AuthContext {engagement_id: $eid, id: $ac_id})
+        ON CREATE SET ac.tier = 'declared', ac.is_anonymous = false,
+                      ac.token_kind = 'bearer', ac.slot = $slot,
+                      ac.auth_hash = $ac_id, ac += $cross
+        SET ac.first_seen = $first_seen, ac.status = 'active'
+        MERGE (ac)-[:OF_PRINCIPAL]->(p)
+        """,
+        eid=eng,
+        label=label,
+        ac_id=f"ac-{label}-{slot}",
+        slot=slot,
+        first_seen=first_seen,
+        cross=cross,
+    )
+
+
+def _stall_tc(key_hash: str, *, principal: str = "attacker-b", slot: str = "bearer") -> DispatchTestCase:
+    return DispatchTestCase(
+        engagement_id=EngagementId(ENG_STALL),
+        key_hash=TestCaseKeyHash(key_hash),
+        test_class="idor",
+        payload_class="auth-token-swap",
+        auth_context_id=AuthContextId("ac-attacker"),
+        target_endpoint_id="ep-x",
+        target_parameter_id=None,
+        target_trust_boundary_id=None,
+        hold=(),
+        replay_hazards=(),
+        attacker_principal=principal,
+        attacker_slot=slot,
+    )
+
+
+def _auth_fail(key_hash: str, *, via_invalid_send: bool = False) -> RunOutcome:
+    """An auth-failure outcome: an `auth_unverified` refusal, or (when
+    `via_invalid_send`) an `auth_invalid` `primary` send on an `executed` outcome."""
+    if via_invalid_send:
+        return RunOutcome(
+            engagement_id=EngagementId(ENG_STALL),
+            run_id=DispatchRunId("run-stall"),
+            key_hash=TestCaseKeyHash(key_hash),
+            test_class="idor",
+            outcome="executed",
+            sends=(("primary", "auth_invalid", None),),
+            at=datetime.now(UTC),
+        )
+    return RunOutcome(
+        engagement_id=EngagementId(ENG_STALL),
+        run_id=DispatchRunId("run-stall"),
+        key_hash=TestCaseKeyHash(key_hash),
+        test_class="idor",
+        outcome="auth_unverified",
+        at=datetime.now(UTC),
+    )
+
+
+def test_detect_stalled_auth_slots_fires_when_no_rotation_e2e(
+    neo4j_client: Neo4jClient,
+) -> None:
+    """#183: ≥threshold auth failures on a slot with no rotation since armed → stalled."""
+    armed_at = datetime.now(UTC)
+    # Declared creds exist but are STALE (older than the run) — nothing rotated.
+    _seed_attacker_principal(
+        neo4j_client,
+        eng=ENG_STALL,
+        label="attacker-b",
+        slot="bearer",
+        first_seen=armed_at - timedelta(hours=1),
+    )
+    keys = [f"{i:064x}" for i in range(AUTH_STALL_THRESHOLD)]
+    selected = [_stall_tc(k) for k in keys]
+    # Mix the two failure shapes: auth_unverified + an auth_invalid primary send.
+    outcomes = [_auth_fail(keys[0], via_invalid_send=True)] + [
+        _auth_fail(k) for k in keys[1:]
+    ]
+
+    stalled = detect_stalled_auth_slots(
+        neo4j_client,
+        engagement_id=EngagementId(ENG_STALL),
+        armed_at=armed_at,
+        selected=selected,
+        outcomes=outcomes,
+    )
+    assert stalled == (
+        StalledSlot(
+            principal_label="attacker-b",
+            slot="bearer",
+            auth_failures=AUTH_STALL_THRESHOLD,
+        ),
+    )
+
+
+def test_detect_stalled_auth_slots_silent_when_rotated_e2e(
+    neo4j_client: Neo4jClient,
+) -> None:
+    """#183: no alarm when a declared AuthContext rotated AFTER the run armed."""
+    armed_at = datetime.now(UTC)
+    # Helper is up: a fresh generation appeared after the run armed.
+    _seed_attacker_principal(
+        neo4j_client,
+        eng=ENG_STALL,
+        label="attacker-b",
+        slot="bearer",
+        first_seen=armed_at + timedelta(minutes=1),
+    )
+    keys = [f"{i:064x}" for i in range(AUTH_STALL_THRESHOLD)]
+    selected = [_stall_tc(k) for k in keys]
+    outcomes = [_auth_fail(k) for k in keys]
+
+    stalled = detect_stalled_auth_slots(
+        neo4j_client,
+        engagement_id=EngagementId(ENG_STALL),
+        armed_at=armed_at,
+        selected=selected,
+        outcomes=outcomes,
+    )
+    assert stalled == ()
+
+
+def test_detect_stalled_auth_slots_silent_below_threshold_e2e(
+    neo4j_client: Neo4jClient,
+) -> None:
+    """#183: below the threshold, no alarm (a couple of failures is just noise)."""
+    armed_at = datetime.now(UTC)
+    _seed_attacker_principal(
+        neo4j_client,
+        eng=ENG_STALL,
+        label="attacker-b",
+        slot="bearer",
+        first_seen=armed_at - timedelta(hours=1),
+    )
+    keys = [f"{i:064x}" for i in range(AUTH_STALL_THRESHOLD - 1)]
+    selected = [_stall_tc(k) for k in keys]
+    outcomes = [_auth_fail(k) for k in keys]
+
+    stalled = detect_stalled_auth_slots(
+        neo4j_client,
+        engagement_id=EngagementId(ENG_STALL),
+        armed_at=armed_at,
+        selected=selected,
+        outcomes=outcomes,
+    )
+    assert stalled == ()

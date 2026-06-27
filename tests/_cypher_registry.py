@@ -44,6 +44,7 @@ from doo.coverage.queries import (
     run_c5b,
 )
 from doo.coverage.reached import reached_by_auth_map, reached_map
+from doo.dispatch.auth_alarm import detect_stalled_auth_slots
 from doo.dispatch.candidates import list_redispatch_candidates
 from doo.dispatch.executor.evidence import DispatchTestCase, load_evidence
 from doo.dispatch.executor.liveness import infer_self_endpoint
@@ -53,11 +54,12 @@ from doo.dispatch.finding import (
     list_reasserted_findings,
     resolve_finding_key,
 )
-from doo.dispatch.models import DispatchSelection
+from doo.dispatch.models import DispatchSelection, RunOutcome
 from doo.dispatch.rotation import is_waiting_on_rotation
 from doo.dispatch.selection import count_already_completed, select_testcases
 from doo.ids import (
     AuthContextId,
+    DispatchRunId,
     EngagementId,
     TestCaseKeyHash,
 )
@@ -171,6 +173,36 @@ _TESTCASE = DispatchTestCase(
     replay_hazards=(),
 )
 
+# #183: a slot with attacker creds + threshold auth failures, so
+# `detect_stalled_auth_slots` reaches its `_rotated_since` graph read (the Cypher
+# the EXPLAIN net must parse). Three `auth_unverified` outcomes on one key_hash →
+# one slot at the default threshold.
+_STALL_TESTCASE = DispatchTestCase(
+    engagement_id=_EID,
+    key_hash=_KEY,
+    test_class="bypass",
+    payload_class="authz",
+    auth_context_id=_AC,
+    target_endpoint_id="e-smoke",
+    target_parameter_id=None,
+    target_trust_boundary_id=None,
+    hold=(),
+    replay_hazards=(),
+    attacker_principal="attacker-b",
+    attacker_slot="bearer",
+)
+_STALL_OUTCOMES = [
+    RunOutcome(
+        engagement_id=_EID,
+        run_id=DispatchRunId("run-smoke"),
+        key_hash=_KEY,
+        test_class="idor",
+        outcome="auth_unverified",
+        at=_NOW,
+    )
+    for _ in range(3)
+]
+
 
 def _driver(fn: Callable[..., Any], /, **kwargs: Any) -> Callable[[RecordingClient], None]:
     def run(client: RecordingClient) -> None:
@@ -251,6 +283,18 @@ REGISTRY: list[tuple[str, Callable[[RecordingClient], None]]] = [
     (
         "dispatch.list_redispatch_candidates",
         _driver(list_redispatch_candidates, engagement_id=_EID),
+    ),
+    # dispatch.auth_alarm — the #183 stalled-slot rotation-axis read (OPTIONAL MATCH
+    # + coalesce(slot, token_kind) + first_seen watermark).
+    (
+        "dispatch.detect_stalled_auth_slots",
+        _driver(
+            detect_stalled_auth_slots,
+            engagement_id=_EID,
+            armed_at=_NOW,
+            selected=[_STALL_TESTCASE],
+            outcomes=_STALL_OUTCOMES,
+        ),
     ),
     # dispatch.finding — proposed / reasserted listings + key resolution.
     ("dispatch.list_proposed_findings", _driver(list_proposed_findings, engagement_id=_EID)),
