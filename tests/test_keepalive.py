@@ -18,8 +18,10 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
+import typer
 
 from doo.engagement.cli_keepalive import _Neo4jLeaseConfigReader
 from doo.engagement.keepalive import (
@@ -326,3 +328,280 @@ def test_sigkill_lets_lease_expire_within_ttl(redis_url: str) -> None:
         if proc.poll() is None:
             proc.send_signal(signal.SIGKILL)
             proc.wait(timeout=10)
+
+
+# --- #182: co-launched auth-helper child (ADR-0054) --------------------------
+
+
+class _FakeProc:
+    """Duck-typed `subprocess.Popen` for `HelperSupervisor` unit tests."""
+
+    def __init__(self, pid: int = 1000) -> None:
+        self.pid = pid
+        self._rc: int | None = None  # None == alive
+        self.terminated = False
+        self.killed = False
+
+    def set_exit(self, rc: int) -> None:
+        self._rc = rc
+
+    def poll(self) -> int | None:
+        return self._rc
+
+    def terminate(self) -> None:
+        self.terminated = True
+        if self._rc is None:
+            self._rc = 0  # clean exit on SIGTERM
+
+    def kill(self) -> None:
+        self.killed = True
+        self._rc = -9
+
+    def wait(self, timeout: float | None = None) -> int:
+        return self._rc if self._rc is not None else 0
+
+
+class _StubbornProc(_FakeProc):
+    """Ignores `terminate`; only `kill` stops it (drives the stop() escalation)."""
+
+    def terminate(self) -> None:
+        self.terminated = True  # but does not exit
+
+    def wait(self, timeout: float | None = None) -> int:
+        if not self.killed:
+            raise subprocess.TimeoutExpired(cmd="auth-helper", timeout=timeout or 0)
+        return -9
+
+
+class _FakeClock:
+    def __init__(self) -> None:
+        self.t = 0.0
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, dt: float) -> None:
+        self.t += dt
+
+
+def _spawner(procs: list[_FakeProc]):
+    """Return `(spawn_fn, spawned_list)` handing out `procs` in order."""
+    it = iter(procs)
+    spawned: list[_FakeProc] = []
+
+    def spawn(argv: object) -> _FakeProc:
+        p = next(it)
+        spawned.append(p)
+        return p
+
+    return spawn, spawned
+
+
+def test_build_auth_helper_argv_shape() -> None:
+    from doo.engagement.auth_helper_child import build_auth_helper_argv
+
+    argv = build_auth_helper_argv("eng-x", "/tmp/e.yaml")
+    assert argv[:1] == [sys.executable]
+    assert argv[1:] == ["-m", "doo.cli", "auth-helper", "run", "-e", "eng-x", "-c", "/tmp/e.yaml"]
+
+
+def test_supervisor_clean_exit_is_not_restarted() -> None:
+    from doo.engagement.auth_helper_child import HelperSupervisor
+
+    p0 = _FakeProc()
+    spawn, spawned = _spawner([p0])
+    sup = HelperSupervisor(argv=["x"], spawn=spawn, clock=_FakeClock())
+    sup.start()
+    assert len(spawned) == 1
+
+    p0.set_exit(0)
+    sup.poll()
+    # A clean exit is left alone — no respawn, ever.
+    sup.poll()
+    assert len(spawned) == 1
+
+
+def test_supervisor_crash_restarts_within_budget_then_gives_up() -> None:
+    from doo.engagement.auth_helper_child import HelperSupervisor, RestartPolicy
+
+    procs = [_FakeProc(pid=i) for i in range(6)]
+    spawn, spawned = _spawner(procs)
+    clock = _FakeClock()
+    sup = HelperSupervisor(
+        argv=["x"],
+        spawn=spawn,
+        clock=clock,
+        policy=RestartPolicy(max_restarts=3, window_s=600.0, backoff_base_s=1.0),
+    )
+    sup.start()  # spawn procs[0]
+    assert len(spawned) == 1
+
+    # Three crashes → three backed-off restarts (1s, 2s, 4s).
+    for i, backoff in enumerate((1.0, 2.0, 4.0)):
+        procs[i].set_exit(1)
+        sup.poll()  # records the crash + schedules the respawn
+        assert len(spawned) == i + 1, "respawn must wait for the backoff"
+        clock.advance(backoff)
+        sup.poll()  # backoff elapsed → respawn
+        assert len(spawned) == i + 2
+
+    # The 4th crash exceeds the budget: stop respawning, keep quiet about the lease.
+    procs[3].set_exit(1)
+    sup.poll()
+    sup.poll()
+    assert len(spawned) == 4  # 1 initial + 3 restarts, no more
+
+
+def test_supervisor_stop_terminates_child() -> None:
+    from doo.engagement.auth_helper_child import HelperSupervisor
+
+    p0 = _FakeProc()
+    spawn, spawned = _spawner([p0])
+    sup = HelperSupervisor(argv=["x"], spawn=spawn, clock=_FakeClock())
+    sup.start()
+    sup.stop(timeout=1.0)
+    assert p0.terminated is True
+    # A child exit during our own shutdown is not counted as a crash → no respawn.
+    sup.poll()
+    assert len(spawned) == 1
+
+
+def test_supervisor_stop_escalates_to_kill_on_timeout() -> None:
+    from doo.engagement.auth_helper_child import HelperSupervisor
+
+    p0 = _StubbornProc()
+    spawn, _ = _spawner([p0])
+    sup = HelperSupervisor(argv=["x"], spawn=spawn, clock=_FakeClock())
+    sup.start()
+    sup.stop(timeout=0.01)
+    assert p0.terminated is True and p0.killed is True
+
+
+def _make_config(*, with_refresh: bool, eid: str = "eng-x"):
+    from doo.setup.config import EngagementConfig
+
+    ac: dict[str, object] = {"kind": "bearer", "token": "${TOK}"}
+    if with_refresh:
+        ac["refresh"] = {"mechanism": "command", "command": "echo tok"}
+    return EngagementConfig.model_validate(
+        {
+            "engagement": {"id": eid, "name": eid},
+            "environment": "staging",
+            "scope": {
+                "host_patterns": ["h.example.com"],
+                "allowed_methods": ["GET"],
+                "allowed_path_patterns": ["/**"],
+            },
+            "principals": [{"label": "attacker", "auth_contexts": [ac]}],
+        }
+    )
+
+
+def test_has_managed_slots() -> None:
+    from doo.engagement.cli_keepalive import _has_managed_slots
+
+    assert _has_managed_slots(_make_config(with_refresh=True)) is True
+    assert _has_managed_slots(_make_config(with_refresh=False)) is False
+
+
+def test_resolve_child_spawns_when_flag_and_managed(monkeypatch: pytest.MonkeyPatch) -> None:
+    from doo.engagement import cli_keepalive
+    from doo.engagement.auth_helper_child import HelperSupervisor
+
+    monkeypatch.setattr(
+        cli_keepalive, "_load_config", lambda _p: _make_config(with_refresh=True)
+    )
+    child = cli_keepalive._resolve_child(
+        "eng-x", with_auth_helper=True, config_path=Path("e.yaml")
+    )
+    assert isinstance(child, HelperSupervisor)
+    assert child.argv[-4:] == ["-e", "eng-x", "-c", "e.yaml"]
+
+
+def test_resolve_child_lease_only_when_flag_but_no_managed(monkeypatch: pytest.MonkeyPatch) -> None:
+    from doo.engagement import cli_keepalive
+
+    monkeypatch.setattr(
+        cli_keepalive, "_load_config", lambda _p: _make_config(with_refresh=False)
+    )
+    child = cli_keepalive._resolve_child(
+        "eng-x", with_auth_helper=True, config_path=Path("e.yaml")
+    )
+    assert child is None
+
+
+def test_resolve_child_requires_config_with_flag() -> None:
+    from doo.engagement import cli_keepalive
+
+    with pytest.raises(typer.Exit):
+        cli_keepalive._resolve_child("eng-x", with_auth_helper=True, config_path=None)
+
+
+def test_resolve_child_rejects_mismatched_engagement(monkeypatch: pytest.MonkeyPatch) -> None:
+    from doo.engagement import cli_keepalive
+
+    monkeypatch.setattr(
+        cli_keepalive,
+        "_load_config",
+        lambda _p: _make_config(with_refresh=True, eid="other"),
+    )
+    with pytest.raises(typer.Exit):
+        cli_keepalive._resolve_child(
+            "eng-x", with_auth_helper=True, config_path=Path("e.yaml")
+        )
+
+
+def test_resolve_child_none_without_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    from doo.engagement import cli_keepalive
+
+    # No flag, no config → plain lease-only, no child.
+    assert (
+        cli_keepalive._resolve_child("eng-x", with_auth_helper=False, config_path=None)
+        is None
+    )
+    # No flag but a config with managed slots → still None (a hint is printed).
+    monkeypatch.setattr(
+        cli_keepalive, "_load_config", lambda _p: _make_config(with_refresh=True)
+    )
+    assert (
+        cli_keepalive._resolve_child(
+            "eng-x", with_auth_helper=False, config_path=Path("e.yaml")
+        )
+        is None
+    )
+
+
+def test_run_keepalive_starts_and_stops_child_and_releases_lease() -> None:
+    from doo.engagement.auth_helper_child import HelperSupervisor
+
+    fake = FakeRedis()
+    lease = RedisLease(fake, EngagementId("eng-child"))
+    cfg = KeepaliveConfig(
+        EngagementId("eng-child"), lease_ttl_seconds=5, refresh_interval_seconds=1
+    )
+    p0 = _FakeProc()
+    spawn, spawned = _spawner([p0])
+    sup = HelperSupervisor(argv=["x"], spawn=spawn, clock=_FakeClock())
+    stop = threading.Event()
+    key = lease_key(EngagementId("eng-child"))
+
+    def _run() -> None:
+        run_keepalive(
+            cfg, lease, stop_event=stop, install_signal_handlers=False, child=sup
+        )
+
+    t = threading.Thread(target=_run)
+    t.start()
+    # Child spawned at startup; lease present.
+    deadline = time.time() + 2.0
+    while time.time() < deadline and not spawned:
+        time.sleep(0.01)
+    assert len(spawned) == 1
+    assert fake.store.get(key) == LEASE_VALUE_ACTIVE
+
+    stop.set()
+    t.join(timeout=5)
+    assert not t.is_alive()
+    # Child stopped on shutdown; lease released after.
+    assert p0.terminated is True
+    assert key not in fake.store

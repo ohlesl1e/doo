@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from types import FrameType
 from typing import Protocol
 
+from doo.engagement.auth_helper_child import HelperSupervisor
 from doo.ids import EngagementId
 from doo.infra.redis_lease import RedisLease
 from doo.observability.logging import get_logger
@@ -103,6 +104,7 @@ def run_keepalive(
     *,
     stop_event: threading.Event | None = None,
     install_signal_handlers: bool = True,
+    child: HelperSupervisor | None = None,
 ) -> int:
     """Run the keepalive loop until SIGTERM (or `stop_event`); return exit code.
 
@@ -114,6 +116,11 @@ def run_keepalive(
     `stop_event` is injectable so integration tests can drive shutdown without a
     real signal; `install_signal_handlers=False` lets tests run the loop on a
     non-main thread (where `signal.signal` is illegal).
+
+    `child` (ADR-0054, #182) is an optional co-launched auth-helper supervisor:
+    started before the loop, `poll()`ed each tick (a crash is restarted within a
+    bounded budget — never touching the lease), and `stop()`ped in the `finally`
+    before the lease is released. The lease-only core is unchanged when `None`.
     """
 
     stop = stop_event if stop_event is not None else threading.Event()
@@ -143,7 +150,13 @@ def run_keepalive(
         lease_key=lease.key,
         lease_ttl_seconds=config.lease_ttl_seconds,
         refresh_interval_seconds=config.refresh_interval_seconds,
+        with_auth_helper=child is not None,
     )
+
+    # ADR-0054: spawn the co-launched helper before the loop. A failure to spawn
+    # must not take down the lease — the heartbeat is the safety primitive.
+    if child is not None:
+        child.start()
 
     try:
         # Wait up to the refresh interval; `Event.wait` returns True if the
@@ -156,9 +169,15 @@ def run_keepalive(
                 engagement_id=config.engagement_id,
                 lease_key=lease.key,
             )
+            # Check the child after the refresh so a flapping helper can never
+            # delay the lease write (poll is non-blocking; backoff is deferred).
+            if child is not None:
+                child.poll()
     finally:
-        # Clean-shutdown path: release the lease instantly. On SIGKILL this code
-        # never runs and the lease expires within the TTL instead.
+        # Stop the child first (so it is not orphaned), THEN release the lease.
+        # On SIGKILL of the parent neither runs and the lease expires via TTL.
+        if child is not None:
+            child.stop()
         lease.release()
         log.info(
             "keepalive.stopped",
