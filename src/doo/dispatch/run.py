@@ -85,7 +85,7 @@ from doo.dispatch.ontology import BodyStore, commit_agent_send
 from doo.dispatch.reactive import ReactiveEmitter
 from doo.dispatch.rotation import is_waiting_on_rotation
 from doo.dispatch.secrets import AuthMaterial, SecretStore, SlotMaterialMissing
-from doo.dispatch.selection import select_testcases
+from doo.dispatch.selection import count_already_completed, select_testcases
 from doo.events.execution import DISPATCH_STATUSES, DispatchStatus
 from doo.ids import (
     AuthContextId,
@@ -150,6 +150,10 @@ class RunResult:
     # ADR-0044: True iff ≥1 authz 4xx fell back to `ok` because no liveness
     # endpoint was resolvable for its AuthContext (the negatives are unverified).
     liveness_unverified: bool = False
+    # #180: TestCases skipped because they already had an `ok` primary (resume
+    # semantics). Only meaningful on the graph-backed selection path with
+    # `selection.skip_completed`; 0 when forced or when `testcases` was injected.
+    skipped_completed: int = 0
 
 
 @dataclass
@@ -237,13 +241,19 @@ def execute_run(
         request_budget=run.budget.request_budget,
     )
 
-    selected = (
-        testcases
-        if testcases is not None
-        else select_testcases(
+    # #180: on the graph-backed path, the count of finished TestCases the resume
+    # filter excluded (0 when forced or when `testcases` was injected for a test).
+    skipped_completed = 0
+    if testcases is not None:
+        selected = testcases
+    else:
+        selected = select_testcases(
             deps.neo4j, engagement_id=run.engagement_id, selection=run.selection
         )
-    )
+        if run.selection.skip_completed:
+            skipped_completed = count_already_completed(
+                deps.neo4j, engagement_id=run.engagement_id, selection=run.selection
+            )
     tracker = BudgetTracker(run.budget)
     dispatcher = Dispatcher(
         run=run, lease=deps.lease, opa=deps.opa, budget=tracker, sender=deps.sender
@@ -312,6 +322,7 @@ def execute_run(
         outcomes=tuple(outcomes),
         requests_sent=tracker.sent,
         liveness_unverified=liveness_unverified,
+        skipped_completed=skipped_completed,
     )
 
 

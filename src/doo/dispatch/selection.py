@@ -16,21 +16,29 @@ from doo.dispatch.executor.evidence import DispatchTestCase
 from doo.dispatch.models import DispatchSelection
 from doo.ids import AuthContextId, EngagementId, TestCaseKeyHash
 from doo.infra.neo4j_driver import Neo4jClient
-from doo.ontology.queries import for_engagement
+from doo.ontology.queries import CypherFragment, for_engagement
+
+# #180: the "already done" predicate — a TestCase with an `ok` `primary`
+# `EXECUTED_AS` edge. Lifted verbatim from `candidates.py` so resume-skip and the
+# re-dispatch candidate view share one definition of "finished" (graph-only, no
+# stored state).
+_HAS_OK_PRIMARY = """EXISTS {
+            MATCH (t)-[ok:EXECUTED_AS {request_role: 'primary'}]->()
+            WHERE ok.dispatch_status = 'ok'
+          }"""
 
 
-def select_testcases(
-    client: Neo4jClient,
-    *,
+def _selection_where(
     engagement_id: EngagementId,
     selection: DispatchSelection,
-) -> list[DispatchTestCase]:
-    """Load the `approved` `TestCase`s matching `selection`, ordered by `expected_yield`.
+    *,
+    skip_completed: bool,
+) -> tuple[CypherFragment, str, dict[str, object]]:
+    """Build the shared `(fragment, where_clause, params)` for the selection filter.
 
-    Only `review_status = approved` (ADR-0040: approval is "cleared for dispatch
-    *consideration*"; this run is the fresh consent). `status = active` (retracted
-    nodes excluded). The `generator` / `test_class` filters are AND-composed when
-    both set; empty tuples mean "no filter."
+    `skip_completed` appends the `_HAS_OK_PRIMARY` negation so a finished TestCase
+    is excluded (resume semantics, #180). Shared by `select_testcases` (the drain)
+    and `count_already_completed` (the pre-run "already done" count).
     """
 
     frag = for_engagement(engagement_id, var="t")
@@ -45,7 +53,56 @@ def select_testcases(
     if selection.key_hashes:
         predicates.append("t.key_hash IN $key_hashes")
         params["key_hashes"] = [str(k) for k in selection.key_hashes]
-    where = frag.and_(" AND ".join(predicates))
+    if skip_completed:
+        predicates.append(f"NOT {_HAS_OK_PRIMARY}")
+    return frag, frag.and_(" AND ".join(predicates)), params
+
+
+def count_already_completed(
+    client: Neo4jClient,
+    *,
+    engagement_id: EngagementId,
+    selection: DispatchSelection,
+) -> int:
+    """Count approved TestCases matching `selection` that already have an `ok` primary.
+
+    The complement of what `select_testcases` drains under resume semantics — the
+    "already done" figure for the pre-run summary (#181). Ignores `selection.limit`
+    (a count of finished work, not a top-N) and the `skip_completed` flag.
+    """
+
+    _frag, where, params = _selection_where(
+        engagement_id, selection, skip_completed=False
+    )
+    rows = client.execute_read(
+        f"""
+        MATCH (t:TestCase)
+        {where} AND {_HAS_OK_PRIMARY}
+        RETURN count(t) AS done
+        """,
+        **params,
+    )
+    return int(rows[0]["done"]) if rows else 0
+
+
+def select_testcases(
+    client: Neo4jClient,
+    *,
+    engagement_id: EngagementId,
+    selection: DispatchSelection,
+) -> list[DispatchTestCase]:
+    """Load the `approved` `TestCase`s matching `selection`, ordered by `expected_yield`.
+
+    Only `review_status = approved` (ADR-0040: approval is "cleared for dispatch
+    *consideration*"; this run is the fresh consent). `status = active` (retracted
+    nodes excluded). The `generator` / `test_class` filters are AND-composed when
+    both set; empty tuples mean "no filter." When `selection.skip_completed`
+    (default), TestCases with an `ok` `primary` edge are excluded (resume, #180).
+    """
+
+    _frag, where, params = _selection_where(
+        engagement_id, selection, skip_completed=selection.skip_completed
+    )
     limit = f"LIMIT {int(selection.limit)}" if selection.limit is not None else ""
 
     rows = client.execute_read(

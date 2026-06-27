@@ -95,6 +95,12 @@ class DispatchSelection(BaseModel):
     # address — how `doo dispatch redispatch` targets the eligible candidates.
     key_hashes: tuple[TestCaseKeyHash, ...] = ()
     limit: int | None = Field(default=None, ge=1)
+    # #180: resume semantics. When True (default), a TestCase that already has an
+    # `ok` `primary` `EXECUTED_AS` edge is skipped — an interrupted/partial run
+    # can be re-run to completion without re-sending finished work. `--force` /
+    # `--no-skip-completed` sets this False to re-send everything (the old
+    # behaviour). A graph predicate, no stored state (mirrors `candidates.py`).
+    skip_completed: bool = True
 
     def describe(self) -> str:
         """Human-readable summary for the arm prompt + ledger."""
@@ -110,6 +116,7 @@ class DispatchSelection(BaseModel):
             parts.append("all approved")
         if self.limit is not None:
             parts.append(f"top-{self.limit} by expected_yield")
+        parts.append("resume" if self.skip_completed else "force re-send")
         return ", ".join(parts)
 
 

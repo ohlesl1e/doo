@@ -55,7 +55,7 @@ from doo.dispatch.finding import (
 )
 from doo.dispatch.models import DispatchSelection
 from doo.dispatch.rotation import is_waiting_on_rotation
-from doo.dispatch.selection import select_testcases
+from doo.dispatch.selection import count_already_completed, select_testcases
 from doo.ids import (
     AuthContextId,
     EngagementId,
@@ -206,13 +206,32 @@ REGISTRY: list[tuple[str, Callable[[RecordingClient], None]]] = [
         "dispatch.load_evidence",
         _driver(load_evidence, engagement_id=_EID, testcase=_TESTCASE),
     ),
-    # dispatch.selection — dynamic AND-join + interpolated LIMIT.
+    # dispatch.selection — dynamic AND-join + interpolated LIMIT. Default
+    # `skip_completed=True` exercises the #180 NOT EXISTS resume predicate.
     (
         "dispatch.select_testcases",
         _driver(
             select_testcases,
             engagement_id=_EID,
             selection=DispatchSelection(generators=("c2",), test_classes=(), limit=50),
+        ),
+    ),
+    # #180: the forced (no-skip) + key_hash-scoped selection path.
+    (
+        "dispatch.select_testcases.force_key_hash",
+        _driver(
+            select_testcases,
+            engagement_id=_EID,
+            selection=DispatchSelection(key_hashes=(_KEY,), skip_completed=False),
+        ),
+    ),
+    # #180: the pre-run "already done" count (NOT EXISTS complement).
+    (
+        "dispatch.count_already_completed",
+        _driver(
+            count_already_completed,
+            engagement_id=_EID,
+            selection=DispatchSelection(generators=("c2",)),
         ),
     ),
     # dispatch.rotation — the #170 re-dispatch watermark guard (auth_invalid +
