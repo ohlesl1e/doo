@@ -16,6 +16,7 @@ unit-tested module it composes.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -101,6 +102,10 @@ from doo.setup.config import ArmingMode, EngagementConfig, InterpreterMode
 
 log = get_logger(__name__)
 
+# #181: how often `execute_run` fires `on_progress` while draining — a coarse
+# "still working" heartbeat for long runs, not a per-send line.
+_PROGRESS_EVERY = 10
+
 
 def new_run_id() -> DispatchRunId:
     """A fresh dispatch-run id (`run-<12hex>`)."""
@@ -154,6 +159,10 @@ class RunResult:
     # semantics). Only meaningful on the graph-backed selection path with
     # `selection.skip_completed`; 0 when forced or when `testcases` was injected.
     skipped_completed: int = 0
+    # #181: the drain stopped early on a Ctrl-C or an unexpected per-TestCase
+    # raise — `outcomes` is whatever drained before the stop. The summary is still
+    # rendered (and noted as partial) instead of being lost with the run.
+    interrupted: bool = False
 
 
 @dataclass
@@ -218,13 +227,24 @@ def execute_run(
     deps: RunDependencies,
     *,
     testcases: list[DispatchTestCase] | None = None,
+    skipped_completed: int | None = None,
+    on_progress: Callable[[int, int, int], None] | None = None,
 ) -> RunResult:
     """Drain a dispatch run: select → per-TestCase (construct → dispatch → record).
 
-    `testcases` is injectable for tests; when `None`, the graph-backed selection
-    runs. The run is recorded in the dispatch ledger (`armed` row first, then a
+    `testcases` is injectable for tests and for the CLI's pre-run path (which has
+    already selected the to-send list); when `None`, the graph-backed selection
+    runs. `skipped_completed` lets that caller pass the resume-skipped count it
+    already computed (ignored on the graph-backed path, which computes its own).
+    `on_progress(sent, drained, selected)` is invoked every `_PROGRESS_EVERY`
+    TestCases for a coarse progress line (the CLI prints one even under `--quiet`).
+
+    The run is recorded in the dispatch ledger (`armed` row first, then a
     `RunOutcome` per TestCase). The Dispatcher's budget tracker is shared across
-    every TestCase so the run-wide `request_budget` is a true ceiling.
+    every TestCase so the run-wide `request_budget` is a true ceiling. A Ctrl-C or
+    an unexpected per-TestCase raise stops the drain but still returns a
+    `RunResult` (`interrupted=True`) with whatever drained — the summary is never
+    lost (#181).
     """
 
     bind_correlation(trace_id=run.trace_id, engagement_id=run.engagement_id)
@@ -242,18 +262,22 @@ def execute_run(
     )
 
     # #180: on the graph-backed path, the count of finished TestCases the resume
-    # filter excluded (0 when forced or when `testcases` was injected for a test).
-    skipped_completed = 0
+    # filter excluded. When `testcases` is injected, honour the caller's
+    # pre-computed count (the CLI pre-run path) and default to 0 otherwise.
     if testcases is not None:
         selected = testcases
+        skipped = skipped_completed or 0
     else:
         selected = select_testcases(
             deps.neo4j, engagement_id=run.engagement_id, selection=run.selection
         )
-        if run.selection.skip_completed:
-            skipped_completed = count_already_completed(
+        skipped = (
+            count_already_completed(
                 deps.neo4j, engagement_id=run.engagement_id, selection=run.selection
             )
+            if run.selection.skip_completed
+            else 0
+        )
     tracker = BudgetTracker(run.budget)
     dispatcher = Dispatcher(
         run=run, lease=deps.lease, opa=deps.opa, budget=tracker, sender=deps.sender
@@ -276,30 +300,59 @@ def execute_run(
     overrides = resolve_overrides(deps.ledger, run.engagement_id)
 
     outcomes: list[RunOutcome] = []
-    for tc in selected:
-        outcome = _execute_one(
-            tc,
-            run=run,
-            deps=deps,
-            dispatcher=dispatcher,
-            prober=prober,
-            overrides=overrides,
-            now=datetime.now(UTC),
-        )
-        record_outcome(deps.ledger, outcome)
-        outcomes.append(outcome)
-        # Stop draining once the budget is exhausted: subsequent TestCases would
-        # all be `dispatcher_blocked(request_budget_exhausted)`, which is noise.
-        if tracker.request_budget_exhausted() or tracker.wallclock_exceeded():
-            log.info(
-                "dispatch.run.budget_exhausted",
-                engagement_id=run.engagement_id,
-                run_id=run.run_id,
-                sent=tracker.sent,
-                drained=len(outcomes),
-                selected=len(selected),
+    interrupted = False
+    # #181: a Ctrl-C or an unexpected per-TestCase raise stops the drain but still
+    # returns a `RunResult` from whatever drained, so the human summary (and the
+    # already-committed `EXECUTED_AS` edges) are never lost with the run.
+    try:
+        for tc in selected:
+            outcome = _execute_one(
+                tc,
+                run=run,
+                deps=deps,
+                dispatcher=dispatcher,
+                prober=prober,
+                overrides=overrides,
+                now=datetime.now(UTC),
             )
-            break
+            record_outcome(deps.ledger, outcome)
+            outcomes.append(outcome)
+            if on_progress is not None and len(outcomes) % _PROGRESS_EVERY == 0:
+                on_progress(tracker.sent, len(outcomes), len(selected))
+            # Stop draining once the budget is exhausted: subsequent TestCases would
+            # all be `dispatcher_blocked(request_budget_exhausted)`, which is noise.
+            if tracker.request_budget_exhausted() or tracker.wallclock_exceeded():
+                log.info(
+                    "dispatch.run.budget_exhausted",
+                    engagement_id=run.engagement_id,
+                    run_id=run.run_id,
+                    sent=tracker.sent,
+                    drained=len(outcomes),
+                    selected=len(selected),
+                )
+                break
+    except KeyboardInterrupt:
+        interrupted = True
+        log.warning(
+            "dispatch.run.interrupted",
+            engagement_id=run.engagement_id,
+            run_id=run.run_id,
+            drained=len(outcomes),
+            selected=len(selected),
+        )
+    except Exception as exc:
+        # An unexpected raise inside a TestCase (not the Interpreter, which is
+        # isolated per-TestCase by #179). Preserve the partial run + summary
+        # instead of losing it; the traceback rides the structured log.
+        interrupted = True
+        log.warning(
+            "dispatch.run.aborted",
+            engagement_id=run.engagement_id,
+            run_id=run.run_id,
+            drained=len(outcomes),
+            selected=len(selected),
+            error=f"{type(exc).__name__}: {exc}",
+        )
 
     log.info(
         "dispatch.run.complete",
@@ -308,6 +361,7 @@ def execute_run(
         selected=len(selected),
         drained=len(outcomes),
         requests_sent=tracker.sent,
+        interrupted=interrupted,
     )
     liveness_unverified = prober is not None and bool(prober.acs_without_endpoint)
     if liveness_unverified:
@@ -322,7 +376,8 @@ def execute_run(
         outcomes=tuple(outcomes),
         requests_sent=tracker.sent,
         liveness_unverified=liveness_unverified,
-        skipped_completed=skipped_completed,
+        skipped_completed=skipped,
+        interrupted=interrupted,
     )
 
 
