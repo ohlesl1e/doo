@@ -27,3 +27,7 @@ Triggers are **proactive** (helper polls `AuthContext.validity_window`, refreshe
 ## Amendment (ADR-0049) — helper manages credential *slots*, seeded from the graph
 
 The helper's `managed` set and the rotation file are keyed on `(principal_label, slot)`, not `auth_context_id`. At start the helper seeds `managed` by querying the graph for every `tier='declared'` AuthContext on the engagement (grouped by slot) — not by re-hashing its own env — so its reactive `auth_invalid → rotate` path covers ids minted before the helper ran. On rotation it writes **one** slot-keyed entry to the rotation file (the old↔new dual-write is removed) and copies `slot` to the new `AuthContext` node. The dispatcher's `SlotResolvingSecretStore` (ADR-0049) is the primary resolution path, so dispatch is correct whether or not the helper is up; the helper's role stays *refresh*, not *resolution*.
+
+## Amendment (ADR-0054) — the keepalive may co-launch the helper as a child process
+
+A sibling need not be its own process: the trust boundary is **agent vs. rest**, not sibling vs. sibling. `doo engagement keepalive --with-auth-helper` may co-launch the auth-helper as an **isolated child subprocess** (opt-in, only when managed slots exist), collapsing the dispatch workflow from three terminals to two. The subprocess keeps the lease heartbeat physically immune to refresh work and scopes refresh creds to the child; helper death never touches the lease (bounded restart → fail-loud), and only the kill-switch may halt dispatch. See ADR-0054.
