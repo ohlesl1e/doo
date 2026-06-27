@@ -20,6 +20,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from doo.dispatch.auth_alarm import StalledSlot, detect_stalled_auth_slots
 from doo.dispatch.executor.classify import (
     LivenessResult,
     classify,
@@ -163,6 +164,10 @@ class RunResult:
     # raise — `outcomes` is whatever drained before the stop. The summary is still
     # rendered (and noted as partial) instead of being lost with the run.
     interrupted: bool = False
+    # #183: attacker credential slots whose auth failures climbed this run with no
+    # rotation since the run armed — the auth-helper looks down. Advisory only
+    # (never halts; only the kill-switch halts). Surfaced loudly in the summary.
+    stalled_auth_slots: tuple[StalledSlot, ...] = ()
 
 
 @dataclass
@@ -371,6 +376,15 @@ def execute_run(
             run_id=run.run_id,
             auth_contexts=sorted(prober.acs_without_endpoint),  # type: ignore[union-attr]
         )
+    # #183: advisory — slots whose auth failures climbed this run with no rotation
+    # since it armed (the auth-helper looks down). Never halts the run.
+    stalled_auth_slots = detect_stalled_auth_slots(
+        deps.neo4j,
+        engagement_id=run.engagement_id,
+        armed_at=run.armed_at,
+        selected=selected,
+        outcomes=outcomes,
+    )
     return RunResult(
         run=run,
         outcomes=tuple(outcomes),
@@ -378,6 +392,7 @@ def execute_run(
         liveness_unverified=liveness_unverified,
         skipped_completed=skipped,
         interrupted=interrupted,
+        stalled_auth_slots=stalled_auth_slots,
     )
 
 
