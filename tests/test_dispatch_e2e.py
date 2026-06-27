@@ -1587,3 +1587,115 @@ def test_resumable_dispatch_skip_completed_e2e(
     )
     assert [tc.key_hash for tc in scoped] == [key_hash_a]
     assert key_hash_b not in {tc.key_hash for tc in scoped}
+
+
+class _RaisingMultiTurnCaller:
+    """A `MultiTurnLLMCaller` whose `turn()` raises — simulates the 120s LLM timeout."""
+
+    def turn(
+        self, messages: list[dict[str, object]], tools: list[dict[str, object]]
+    ) -> object:
+        raise TimeoutError("simulated 120s interpreter LLM timeout")
+
+
+def test_interpreter_error_isolated_e2e(
+    neo4j_client: Neo4jClient, redis_url: str, engagement_config: EngagementConfig
+) -> None:
+    """#179: an Interpreter that raises is isolated per-TestCase; the run continues.
+
+    Two approved IDOR TestCases on the same endpoint, both reaching an `ok`
+    primary. The Interpreter raises on every turn. Assert: `execute_run` returns
+    normally, BOTH TestCases drain (the raise on the first did not abort the run),
+    each gets `interpreter_error` with its `ok` primary send intact, and the
+    committed `EXECUTED_AS(primary, ok)` edges are unchanged.
+    """
+    env = {"E2E_VICTIM": VICTIM_TOKEN, "E2E_ATTACKER": ATTACKER_TOKEN}
+    secrets = EnvSecretStore.from_config(engagement_config, env=env)
+    attacker_ac_id = auth_context_id(
+        EngagementId(ENG), compute_auth_hash("bearer", ATTACKER_TOKEN)
+    )
+    key_hash_a = _seed_graph(neo4j_client, attacker_ac_id=attacker_ac_id)
+    # A second approved IDOR TestCase on the SAME endpoint (distinct payload_hash
+    # → distinct key_hash) so the run drains two and we can prove it continued.
+    cross = _cross(datetime.now(UTC))
+    payload_hash_b = hashlib.sha256(b"second").hexdigest()
+    key_hash_b = compute_testcase_key_hash(
+        engagement_id=EngagementId(ENG),
+        test_class="idor",
+        target_endpoint_id=EP_ID,
+        target_parameter_id=None,
+        target_trust_boundary_id=None,
+        payload_class="auth-token-swap",
+        payload_hash=payload_hash_b,  # type: ignore[arg-type]
+        attacker_principal="attacker",
+        attacker_slot="bearer",
+    )
+    neo4j_client.execute_write(
+        """
+        MATCH (e:Endpoint {engagement_id: $eid, id: $epid})
+        MERGE (t:TestCase {engagement_id: $eid, key_hash: $kh})
+        ON CREATE SET t.test_class = 'idor', t.payload_class = 'auth-token-swap',
+                      t.payload_hash = $ph, t.auth_context_id = $ac_attacker,
+                      t.attacker_principal = 'attacker', t.attacker_slot = 'bearer',
+                      t.target_endpoint_id = $epid,
+                      t.review_status = 'approved', t.expected_yield = 0.8,
+                      t.generator = 'c2', t.hold = ['order_id'],
+                      t.replay_hazards = [], t.source = 'llm-planner',
+                      t.confidence = 0.99, t += $cross
+        MERGE (t)-[:TARGETS_ENDPOINT]->(e)
+        """,
+        eid=ENG,
+        epid=EP_ID,
+        kh=key_hash_b,
+        ph=payload_hash_b,
+        ac_attacker=attacker_ac_id,
+        cross=cross,
+    )
+
+    rclient = redis.Redis.from_url(redis_url)
+    lease = RedisLease(rclient, EngagementId(ENG))
+    lease.set_active(ttl_seconds=60)
+
+    sender = StubSender(
+        response=HttpResponse(status=200, body=b'{"order_id":123,"owner":"victim"}')
+    )
+    run = arm_run(
+        config=engagement_config,
+        selection=DispatchSelection(test_classes=("idor",)),
+        actor="e2e-tester",
+    )
+    deps = RunDependencies(
+        neo4j=neo4j_client,
+        lease=RedisLeaseReader(lease=lease),
+        opa=StubOpaClient(allow=True),
+        sender=sender,
+        secrets=secrets,
+        bodies=NoopBodyStore(),
+        ledger=InMemoryDispatchLedger(),
+        interpreter=_RaisingMultiTurnCaller(),
+    )
+
+    # The run completes (does NOT raise) despite the interpreter blowing up.
+    result = execute_run(run, deps)
+
+    # Both TestCases drained — the raise on the first did not abort the loop.
+    assert len(result.outcomes) == 2
+    by_kh = {o.key_hash: o for o in result.outcomes}
+    assert set(by_kh) == {key_hash_a, key_hash_b}
+    for o in result.outcomes:
+        assert o.outcome == "interpreter_error"
+        # The committed `ok` primary send is preserved on the outcome.
+        assert ("primary", "ok") in {(r, s) for (r, s, _obs) in o.sends}
+    # Both primaries reached the wire and were committed `ok` in the graph.
+    assert len(sender.sent) == 2
+    rows = neo4j_client.execute_read(
+        """
+        MATCH (t:TestCase {engagement_id: $eid})
+              -[x:EXECUTED_AS {request_role: 'primary', run_id: $rid}]->()
+        RETURN t.key_hash AS kh, x.dispatch_status AS status
+        """,
+        eid=ENG,
+        rid=run.run_id,
+    )
+    committed = {r["kh"]: r["status"] for r in rows}
+    assert committed == {key_hash_a: "ok", key_hash_b: "ok"}

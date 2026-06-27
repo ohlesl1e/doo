@@ -615,17 +615,42 @@ def _execute_one(
     # run-wide budget + lease + OPA gate apply identically. ---
     finding_reasserted: tuple[str, str] | None = None
     if deps.interpreter is not None and final_status == "ok":
-        loop = _run_interpreter(
-            tc,
-            run=run,
-            deps=deps,
-            dispatcher=dispatcher,
-            evidence=evidence,
-            attacker_material=material,
-            primary_obs_id=obs_id,
-            primary_response=result.response,
-            now=now,
-        )
+        # #179: isolate the Interpreter per-TestCase. The `ok` primary edge is
+        # already committed above; a confirm-loop raise (e.g. the 120s LLM
+        # timeout) must NOT propagate out of `execute_run` and abort the rest of
+        # the run. On failure the interpretation is deferred (re-drivable) and
+        # the TestCase surfaces as `interpreter_error` in `doo dispatch review`.
+        try:
+            loop = _run_interpreter(
+                tc,
+                run=run,
+                deps=deps,
+                dispatcher=dispatcher,
+                evidence=evidence,
+                attacker_material=material,
+                primary_obs_id=obs_id,
+                primary_response=result.response,
+                now=now,
+            )
+        except Exception as exc:  # noqa: BLE001 - advisory step, never fatal to the run
+            log.warning(
+                "dispatch.run.interpreter_error",
+                engagement_id=eid,
+                run_id=run.run_id,
+                key_hash=tc.key_hash,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            return _outcome(
+                tc,
+                run,
+                "interpreter_error",
+                reason=(
+                    f"interpreter raised after an ok primary; interpretation "
+                    f"deferred ({type(exc).__name__}: {exc})"
+                ),
+                sends=tuple((s.role, s.status, s.observation_id) for s in sends),
+                now=now,
+            )
         sends.extend(
             _SendRecord(role=r, status=s, observation_id=o)
             for (r, s, o) in loop.extra_sends

@@ -75,6 +75,10 @@ _Avoid_: Session, Credential, Token (those are kinds of AuthContext, not the con
 A rotation-stable, tester-declared handle for one of a Principal's declared credentials — *"`admin`'s session cookie"*, *"`admin`'s read-only API key"*. Every declared `AuthContext` carries a `slot` label (persisted on the node; copied forward by the auth-helper on rotation); it defaults to the `token_kind` when a Principal declares ≤1 AuthContext of that kind. The Executor's secrets lookup resolves a TestCase's `auth_context_id` via the graph to `(principal_label, slot)` and returns the **current** live material for that slot — so an authz test proposed against a since-rotated cookie still executes with today's cookie. Distinct from `tier` (which is `declared`/`discovered` provenance) and from capability tier (which is inferred, ADR-0039).
 _Avoid_: tier (overloaded), role.
 
+**Sibling process (the trust split)**:
+A tester-started process that holds an authority the agent must never have: the **keepalive** holds the kill-switch lease, and the **auth-helper** mints/rotates credential material. The agent (planner/dispatcher/executor/interpreter) only *reads* their outputs — lease state read-only, rotated material via the rotation file — and can neither suppress the kill-switch nor mint credentials. Co-launching the two in one process (`keepalive --with-auth-helper`) keeps both powers out of the *agent*, which is the boundary that matters — not out of each other.
+_Avoid_: calling the agent a sibling, or "supervisor" as a domain term (it's only the CLI mode).
+
 **Tenant**:
 An inferred multi-tenancy unit — an organisation, workspace, or account namespace — that a Principal belongs to. Evidenced by URL positions (`/orgs/{org_id}`), headers (`X-Org-Id`), JWT claims on the AuthContext, response-body fields. An inference-layer node like `Asset`/`TrustBoundary`, with `DERIVED_FROM` edges to its evidence and the standard cross-cutting fields.
 _Avoid_: Organization, Workspace, Account (those are domain-specific spellings; `Tenant` is the canonical abstract term).
